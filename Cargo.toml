@@ -1,0 +1,27 @@
+[package]
+name = "za"
+description = "🛠️ Zero-to-All — scan your workspace and generate an opinionated CONTEXT.md so AI, code-reviewers and newcomers always have the full picture."
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["lvillis<lvillis@outlook.com>"]
+repository = "https://github.com/lvillis/za"
+homepage = "https://github.com/lvillis/za"
+documentation = "https://github.com/lvillis/za/blob/main/README.md"
+exclude = [
+    "/docs/",
+    "/tests/",
+    "/.config/",
+    "/.github/",
+    "/.justfile",
+    "/rust-toolchain.toml",
+    "/.gitignore",
+]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+ignore = "0.4"
+indicatif = "0.17"
+humantime = "2.2.0"
+hex = "0.4.3"
