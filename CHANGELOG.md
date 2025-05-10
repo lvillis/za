@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 ### ⚙️ Miscellaneous Tasks
 
 - Add docker image
+- Release za version 0.1.2
 
 ## [0.1.1] - 2025-05-07
 

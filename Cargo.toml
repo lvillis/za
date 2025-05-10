@@ -1,7 +1,7 @@
 [package]
 name = "za"
 description = "🛠️ Zero-to-All — scan your workspace and generate an opinionated CONTEXT.md so AI, code-reviewers and newcomers always have the full picture."
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 license = "MIT"
 authors = ["lvillis<lvillis@outlook.com>"]
