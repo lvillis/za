@@ -56,10 +56,32 @@ fn snippet(lines: &[String], max: usize) -> String {
     if lines.len() <= max {
         return lines.join("\n");
     }
-    let half = max / 2;
+
+    let front = (max + 1) / 2;
+    let back = max - front;
+
     format!(
         "{}\n⋯(truncated)\n{}",
-        lines[..half].join("\n"),
-        lines[lines.len() - half..].join("\n")
+        lines[..front].join("\n"),
+        lines[lines.len().saturating_sub(back)..].join("\n")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snippet;
+
+    #[test]
+    fn snippet_preserves_odd_max_lines() {
+        let lines: Vec<String> = (1..=10).map(|i| format!("line{}", i)).collect();
+        let out = snippet(&lines, 5);
+        assert_eq!(out, "line1\nline2\nline3\n⋯(truncated)\nline9\nline10");
+    }
+
+    #[test]
+    fn snippet_preserves_even_max_lines() {
+        let lines: Vec<String> = (1..=10).map(|i| format!("line{}", i)).collect();
+        let out = snippet(&lines, 4);
+        assert_eq!(out, "line1\nline2\n⋯(truncated)\nline9\nline10");
+    }
 }
