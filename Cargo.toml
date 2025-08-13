@@ -20,7 +20,7 @@ exclude = [
 
 [dependencies]
 anyhow = "1.0.98"
-clap = { version = "4.5.43", features = ["derive"] }
+clap = { version = "4.5.45", features = ["derive"] }
 ignore = { version = "0.4" }
 indicatif = { version = "0.18" }
 humantime = { version = "2.2.0" }
