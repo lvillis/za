@@ -24,7 +24,7 @@ clap = { version = "4.5.43", features = ["derive"] }
 ignore = { version = "0.4" }
 indicatif = { version = "0.18" }
 humantime = { version = "2.2.0" }
-regex = { version = "1.11.1" }
+regex = { version = "1.11.2" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.142" }
 git2 = { version = "0.20.2", optional = true, default-features = false, features = ["vendored-libgit2"] }
