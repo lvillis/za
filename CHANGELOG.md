@@ -1,3 +1,13 @@
+## [0.1.6] - 2025-09-17
+
+### ⚙️ Miscellaneous Tasks
+
+- Update ci
+## [0.1.5] - 2025-09-17
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.5
 ## [0.1.4] - 2025-09-17
 
 ### 🚀 Features
