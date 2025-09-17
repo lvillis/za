@@ -3,6 +3,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Update ci
+- Release za version 0.1.6
 ## [0.1.5] - 2025-09-17
 
 ### ⚙️ Miscellaneous Tasks
