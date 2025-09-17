@@ -3,6 +3,10 @@
 ### 🚀 Features
 
 - Add some sub command
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.4
 ## [0.1.3] - 2025-05-10
 
 ### ⚙️ Miscellaneous Tasks
