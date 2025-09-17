@@ -40,6 +40,16 @@ gix = { version = "0.73.0", default-features = false, features = [
 [features]
 default = []
 
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = 1
+
 [package.metadata.release]
 tag-prefix = ""
 tag-name = "{{prefix}}{{version}}"
