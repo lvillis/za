@@ -1,8 +1,14 @@
+## [0.1.9] - 2025-09-17
+
+### ⚙️ Miscellaneous Tasks
+
+- Update Cargo.toml
 ## [0.1.8] - 2025-09-17
 
 ### ⚙️ Miscellaneous Tasks
 
 - Update ci
+- Release za version 0.1.8
 ## [0.1.7] - 2025-09-17
 
 ### ⚙️ Miscellaneous Tasks
