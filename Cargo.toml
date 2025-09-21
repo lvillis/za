@@ -19,7 +19,7 @@ exclude = [
 ]
 
 [dependencies]
-anyhow = { version = "1.0.99" }
+anyhow = { version = "1.0.100" }
 clap = { version = "4.5.47", features = ["derive"] }
 ignore = { version = "0.4.23" }
 indicatif = { version = "0.18.0" }
