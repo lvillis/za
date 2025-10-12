@@ -24,7 +24,7 @@ clap = { version = "4.5.47", features = ["derive"] }
 ignore = { version = "0.4.23" }
 indicatif = { version = "0.18.0" }
 humantime = { version = "2.3.0" }
-regex = { version = "1.11.2" }
+regex = { version = "1.12.1" }
 serde = { version = "1.0.225", features = ["derive"] }
 serde_json = { version = "1.0.145" }
 is-terminal = { version = "0.4.16" }
