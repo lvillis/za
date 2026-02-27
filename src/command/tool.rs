@@ -127,8 +127,12 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
     };
 
     match cmd {
-        ToolCommands::Install { spec } => install(&home, &spec, ToolAction::Install)?,
-        ToolCommands::Update { spec } => install(&home, &spec, ToolAction::Update)?,
+        ToolCommands::Install { spec } => {
+            let _ = install(&home, &spec, ToolAction::Install, false)?;
+        }
+        ToolCommands::Update { spec } => {
+            let _ = install(&home, &spec, ToolAction::Update, true)?;
+        }
         ToolCommands::Sync { file } => sync_manifest(&home, &file)?,
         ToolCommands::Use { image } => use_tool(&home, &image)?,
         ToolCommands::Uninstall { spec } => uninstall(&home, &spec)?,
@@ -138,12 +142,171 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
     Ok(0)
 }
 
-pub fn update_self(user: bool, version: Option<String>) -> Result<i32> {
-    let spec = match version {
-        Some(version) => format!("za:{version}"),
-        None => "za".to_string(),
+pub fn update_self(user: bool, check: bool, version: Option<String>) -> Result<i32> {
+    let scope = ToolScope::from_flags(user);
+    let home = ToolHome::detect(scope)?;
+
+    if check {
+        return check_self_update(&version);
+    }
+
+    if let Err(err) = home.ensure_layout() {
+        if scope == ToolScope::Global {
+            return Err(err).with_context(|| {
+                "cannot initialize global tool directories. retry with `za update --user` or run with elevated privileges"
+                    .to_string()
+            });
+        }
+        return Err(err);
+    }
+    let _lock = match ToolLock::acquire(&home) {
+        Ok(lock) => lock,
+        Err(err) if scope == ToolScope::Global => {
+            return Err(err).with_context(|| {
+                "cannot acquire global tool lock. retry with `za update --user` or run with elevated privileges"
+                    .to_string()
+            });
+        }
+        Err(err) => return Err(err),
     };
-    run(ToolCommands::Update { spec }, user)
+
+    let requested = version.as_deref();
+    let target_version = resolve_requested_version("za", requested)?;
+    let target_spec = format!("za:{target_version}");
+    let previous_active = read_current_version(&home, "za")?;
+    let backup = backup_existing_self_binary(&home)?;
+
+    let installed = install(&home, &target_spec, ToolAction::Update, false)?;
+    if let Err(err) = verify_self_update(&home, &installed) {
+        let rollback_res =
+            rollback_self_update(&home, previous_active.as_deref(), backup.as_deref());
+        if let Some(path) = backup.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+        return match rollback_res {
+            Ok(()) => Err(err.context("self-update health check failed; rollback applied")),
+            Err(rollback_err) => Err(err.context(format!(
+                "self-update health check failed; rollback also failed: {rollback_err:#}"
+            ))),
+        };
+    }
+
+    if let Some(path) = backup.as_ref() {
+        let _ = fs::remove_file(path);
+    }
+    let removed = prune_non_active_versions(&home, &installed)?;
+    if !removed.is_empty() {
+        println!("🧹 Removed old versions for `za`: {}", removed.join(", "));
+    }
+    println!("✅ Self-update complete: {}", installed.image());
+    Ok(0)
+}
+
+fn check_self_update(requested_version: &Option<String>) -> Result<i32> {
+    let current = normalize_version(env!("CARGO_PKG_VERSION"));
+    let target = resolve_requested_version("za", requested_version.as_deref())?;
+
+    println!("Current za: {current}");
+    if requested_version.is_some() {
+        println!("Requested za: {target}");
+    } else {
+        println!("Latest za: {target}");
+    }
+
+    if current == target {
+        println!("✅ za is up-to-date");
+    } else {
+        println!("⬆️  Update available: {current} -> {target}");
+    }
+    Ok(0)
+}
+
+fn backup_existing_self_binary(home: &ToolHome) -> Result<Option<PathBuf>> {
+    let bin = home.bin_path("za");
+    if !bin.exists() {
+        return Ok(None);
+    }
+
+    fs::create_dir_all(&home.current_dir)?;
+    let backup = home
+        .current_dir
+        .join(format!("za-self-backup-{}", std::process::id()));
+    fs::copy(&bin, &backup).with_context(|| {
+        format!(
+            "backup current za binary {} -> {}",
+            bin.display(),
+            backup.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        let mode = fs::metadata(&bin)?.permissions().mode();
+        fs::set_permissions(&backup, fs::Permissions::from_mode(mode))?;
+    }
+
+    Ok(Some(backup))
+}
+
+fn verify_self_update(home: &ToolHome, installed: &ToolRef) -> Result<()> {
+    let bin = home.bin_path("za");
+    let output = Command::new(&bin)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("run self-update health check {}", bin.display()))?;
+    if !output.status.success() {
+        bail!(
+            "self-update health check failed: `{}` exited with status {}",
+            bin.display(),
+            output.status
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let merged = format!("{stdout}\n{stderr}");
+    let Some(actual) = extract_version_from_text(&merged) else {
+        bail!("self-update health check failed: cannot parse version from `--version` output");
+    };
+    if normalize_version(&actual) != normalize_version(&installed.version) {
+        bail!(
+            "self-update health check failed: expected {}, got {}",
+            installed.version,
+            actual
+        );
+    }
+
+    Ok(())
+}
+
+fn rollback_self_update(
+    home: &ToolHome,
+    previous_active_version: Option<&str>,
+    backup_path: Option<&Path>,
+) -> Result<()> {
+    if let Some(previous) = previous_active_version {
+        let previous_tool = ToolRef {
+            name: "za".to_string(),
+            version: previous.to_string(),
+        };
+        if home.install_path(&previous_tool).exists() {
+            activate_tool(home, &previous_tool)?;
+            println!(
+                "↩️  Rolled back to managed version {}",
+                previous_tool.image()
+            );
+            return Ok(());
+        }
+    }
+
+    if let Some(backup) = backup_path {
+        copy_executable(backup, &home.bin_path("za"))?;
+        remove_file_if_exists(&home.current_file("za"))?;
+        println!("↩️  Rolled back to previous unmanaged za binary");
+        return Ok(());
+    }
+
+    bail!("no rollback target available")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,7 +555,12 @@ impl Drop for ToolLock {
     }
 }
 
-fn install(home: &ToolHome, spec: &str, action: ToolAction) -> Result<()> {
+fn install(
+    home: &ToolHome,
+    spec: &str,
+    action: ToolAction,
+    prune_after_update_activation: bool,
+) -> Result<ToolRef> {
     let mut requested = ToolSpec::parse(spec)?;
     requested.name = canonical_tool_name(&requested.name);
     let adoption = if action == ToolAction::Update {
@@ -475,7 +643,7 @@ fn install(home: &ToolHome, spec: &str, action: ToolAction) -> Result<()> {
             tool.image(),
             home.bin_path(&tool.name).display()
         );
-        if action == ToolAction::Update {
+        if action == ToolAction::Update && prune_after_update_activation {
             let removed = prune_non_active_versions(home, &tool)?;
             if !removed.is_empty() {
                 println!(
@@ -489,7 +657,7 @@ fn install(home: &ToolHome, spec: &str, action: ToolAction) -> Result<()> {
         println!("ℹ️  Run `za tool use {}` to activate it.", tool.image());
     }
 
-    Ok(())
+    Ok(tool)
 }
 
 fn sync_manifest(home: &ToolHome, file: &Path) -> Result<()> {
@@ -499,7 +667,7 @@ fn sync_manifest(home: &ToolHome, file: &Path) -> Result<()> {
     let mut failures = Vec::new();
     for (idx, spec) in specs.iter().enumerate() {
         println!("➡️  [{}/{}] {}", idx + 1, specs.len(), spec);
-        if let Err(err) = install(home, spec, ToolAction::Update) {
+        if let Err(err) = install(home, spec, ToolAction::Update, true) {
             failures.push(format!("{spec}: {err:#}"));
         }
     }

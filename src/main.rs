@@ -46,8 +46,12 @@ fn main() -> Result<()> {
             let exit_code = command::run::run(&tool, &args)?;
             std::process::exit(exit_code);
         }
-        cli::Commands::Update { user, version } => {
-            let exit_code = command::tool::update_self(user, version)?;
+        cli::Commands::Update {
+            user,
+            check,
+            version,
+        } => {
+            let exit_code = command::tool::update_self(user, check, version)?;
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }

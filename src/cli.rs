@@ -75,6 +75,9 @@ pub enum Commands {
         /// Install to user-level paths (`~/.local/...`) instead of system-level paths.
         #[arg(long)]
         user: bool,
+        /// Only check whether an update is available.
+        #[arg(long)]
+        check: bool,
         /// Target version (defaults to latest release).
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
