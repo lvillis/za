@@ -1,7 +1,7 @@
 use super::{
     LatestCheck, ToolHome, ToolRef, ToolScope, ToolSpec, canonical_tool_name, command_candidates,
-    extract_version_from_text, find_tool_policy, list_update_status, normalize_version,
-    prune_non_active_versions, source, supported_tool_names_csv,
+    extract_version_from_text, find_tool_policy, list_update_status, load_sync_specs_from_manifest,
+    normalize_version, prune_non_active_versions, source, supported_tool_names_csv,
 };
 use std::{fs, time::Duration};
 
@@ -62,6 +62,58 @@ fn parse_tool_spec_supports_optional_version() {
     let s2 = ToolSpec::parse("codex:0.104.0").expect("valid spec");
     assert_eq!(s2.name, "codex");
     assert_eq!(s2.version.as_deref(), Some("0.104.0"));
+}
+
+#[test]
+fn load_sync_specs_normalizes_and_deduplicates() {
+    let root = std::env::temp_dir().join(format!(
+        "za-test-sync-manifest-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("create temp root");
+    let manifest_path = root.join("za.tools.toml");
+    fs::write(
+        &manifest_path,
+        r#"
+tools = [
+  "codex-cli",
+  "codex",
+  "ripgrep",
+  "rg",
+  "docker-compose:v5.1.0",
+]
+"#,
+    )
+    .expect("write manifest");
+
+    let specs = load_sync_specs_from_manifest(&manifest_path).expect("parse manifest");
+    assert_eq!(specs, vec!["codex", "rg", "docker-compose:5.1.0"]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn load_sync_specs_rejects_empty_tools() {
+    let root = std::env::temp_dir().join(format!(
+        "za-test-sync-manifest-empty-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("create temp root");
+    let manifest_path = root.join("za.tools.toml");
+    fs::write(&manifest_path, "tools = []\n").expect("write manifest");
+
+    let err = load_sync_specs_from_manifest(&manifest_path).expect_err("must fail");
+    assert!(err.to_string().contains("has no tools"));
+
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]

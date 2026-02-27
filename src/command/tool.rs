@@ -15,7 +15,7 @@ use reqx::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     fs::{self, File, OpenOptions},
     io::{self, IsTerminal, Read, Write},
@@ -129,6 +129,7 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
     match cmd {
         ToolCommands::Install { spec } => install(&home, &spec, ToolAction::Install)?,
         ToolCommands::Update { spec } => install(&home, &spec, ToolAction::Update)?,
+        ToolCommands::Sync { file } => sync_manifest(&home, &file)?,
         ToolCommands::Use { image } => use_tool(&home, &image)?,
         ToolCommands::Uninstall { spec } => uninstall(&home, &spec)?,
         ToolCommands::List { .. } => unreachable!("list handled before mutable operations"),
@@ -198,6 +199,11 @@ struct ToolManifest {
     source_detail: String,
     sha256: String,
     size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ToolSyncManifest {
+    tools: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -484,6 +490,74 @@ fn install(home: &ToolHome, spec: &str, action: ToolAction) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn sync_manifest(home: &ToolHome, file: &Path) -> Result<()> {
+    let specs = load_sync_specs_from_manifest(file)?;
+    println!("🔄 Syncing {} tool(s) from {}", specs.len(), file.display());
+
+    let mut failures = Vec::new();
+    for (idx, spec) in specs.iter().enumerate() {
+        println!("➡️  [{}/{}] {}", idx + 1, specs.len(), spec);
+        if let Err(err) = install(home, spec, ToolAction::Update) {
+            failures.push(format!("{spec}: {err:#}"));
+        }
+    }
+
+    if failures.is_empty() {
+        println!("✅ Sync complete: {} tool(s) are up-to-date", specs.len());
+        return Ok(());
+    }
+
+    bail!(
+        "sync completed with {} failure(s):\n- {}",
+        failures.len(),
+        failures.join("\n- ")
+    )
+}
+
+pub(super) fn load_sync_specs_from_manifest(file: &Path) -> Result<Vec<String>> {
+    let raw = fs::read_to_string(file)
+        .with_context(|| format!("read sync manifest {}", file.display()))?;
+    let manifest = toml::from_str::<ToolSyncManifest>(&raw)
+        .with_context(|| format!("parse sync manifest {}", file.display()))?;
+    if manifest.tools.is_empty() {
+        bail!(
+            "sync manifest {} has no tools; expected `tools = [\"codex\", \"docker-compose\"]`",
+            file.display()
+        );
+    }
+
+    let mut specs = Vec::new();
+    let mut seen = HashSet::new();
+    for raw_spec in manifest.tools {
+        let trimmed = raw_spec.trim();
+        if trimmed.is_empty() {
+            bail!(
+                "sync manifest {} contains an empty tool spec",
+                file.display()
+            );
+        }
+
+        let mut parsed = ToolSpec::parse(trimmed)
+            .with_context(|| format!("invalid tool spec `{trimmed}` in {}", file.display()))?;
+        parsed.name = canonical_tool_name(&parsed.name);
+        let normalized = match parsed.version {
+            Some(version) => format!("{}:{}", parsed.name, normalize_version(&version)),
+            None => parsed.name,
+        };
+        if seen.insert(normalized.clone()) {
+            specs.push(normalized);
+        }
+    }
+
+    if specs.is_empty() {
+        bail!(
+            "sync manifest {} has no valid tools after normalization",
+            file.display()
+        );
+    }
+    Ok(specs)
 }
 
 fn normalize_version(version: &str) -> String {

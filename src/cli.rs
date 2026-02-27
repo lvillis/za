@@ -117,6 +117,12 @@ pub enum ToolCommands {
         #[arg(long)]
         fail_on_check_errors: bool,
     },
+    /// Sync tools from a manifest file (`za.tools.toml`)
+    Sync {
+        /// Manifest path.
+        #[arg(long, value_name = "PATH", default_value = "za.tools.toml")]
+        file: PathBuf,
+    },
     /// Select the active tool version, e.g. `codex:0.104.0`
     Use {
         /// Tool reference in `name:version` format.
