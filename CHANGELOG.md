@@ -3,6 +3,10 @@
 ### 🚀 Features
 
 - [**breaking**] Redesign CLI around
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.10
 ## [0.1.9] - 2025-09-17
 
 ### ⚙️ Miscellaneous Tasks
