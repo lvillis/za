@@ -1,8 +1,14 @@
+## [0.1.10] - 2026-02-27
+
+### 🚀 Features
+
+- [**breaking**] Redesign CLI around
 ## [0.1.9] - 2025-09-17
 
 ### ⚙️ Miscellaneous Tasks
 
 - Update Cargo.toml
+- Release za version 0.1.9
 ## [0.1.8] - 2025-09-17
 
 ### ⚙️ Miscellaneous Tasks
@@ -13,19 +19,10 @@
 
 ### ⚙️ Miscellaneous Tasks
 
-- Release za version 0.1.7
-## [0.1.6] - 2025-09-17
-
-### ⚙️ Miscellaneous Tasks
-
 - Update ci
 - Release za version 0.1.6
+- Release za version 0.1.7
 ## [0.1.5] - 2025-09-17
-
-### ⚙️ Miscellaneous Tasks
-
-- Release za version 0.1.5
-## [0.1.4] - 2025-09-17
 
 ### 🚀 Features
 
@@ -34,6 +31,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Release za version 0.1.4
+- Release za version 0.1.5
 ## [0.1.3] - 2025-05-10
 
 ### ⚙️ Miscellaneous Tasks
