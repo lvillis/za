@@ -46,6 +46,13 @@ fn main() -> Result<()> {
             let exit_code = command::run::run(&tool, &args)?;
             std::process::exit(exit_code);
         }
+        cli::Commands::Update { user, version } => {
+            let exit_code = command::tool::update_self(user, version)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         cli::Commands::Config { cmd } => command::za_config::run(cmd),
     }
 }

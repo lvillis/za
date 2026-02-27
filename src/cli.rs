@@ -70,6 +70,15 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Update za itself from GitHub releases
+    Update {
+        /// Install to user-level paths (`~/.local/...`) instead of system-level paths.
+        #[arg(long)]
+        user: bool,
+        /// Target version (defaults to latest release).
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+    },
     /// Manage persisted za configuration values
     Config {
         #[command(subcommand)]

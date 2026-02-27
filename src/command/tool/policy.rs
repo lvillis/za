@@ -4,6 +4,9 @@ use std::env;
 const CODEX_GITHUB_OWNER: &str = "openai";
 const CODEX_GITHUB_REPO: &str = "codex";
 const CODEX_GITHUB_TAG_PREFIX: &str = "rust-v";
+const ZA_GITHUB_OWNER: &str = "lvillis";
+const ZA_GITHUB_REPO: &str = "za";
+const ZA_GITHUB_TAG_PREFIX: &str = "";
 const DOCKER_COMPOSE_GITHUB_OWNER: &str = "docker";
 const DOCKER_COMPOSE_GITHUB_REPO: &str = "compose";
 const DOCKER_COMPOSE_GITHUB_TAG_PREFIX: &str = "v";
@@ -53,7 +56,20 @@ impl ToolPolicy {
     }
 }
 
-const TOOL_POLICIES: [ToolPolicy; 7] = [
+const TOOL_POLICIES: [ToolPolicy; 8] = [
+    ToolPolicy {
+        canonical_name: "za",
+        aliases: &[],
+        source_label: "GitHub Release (SHA-256 verified)",
+        github_release: Some(GithubReleasePolicy {
+            project_label: "za",
+            owner: ZA_GITHUB_OWNER,
+            repo: ZA_GITHUB_REPO,
+            tag_prefix: ZA_GITHUB_TAG_PREFIX,
+            expected_asset_name: za_expected_asset_name,
+        }),
+        cargo_fallback_package: None,
+    },
     ToolPolicy {
         canonical_name: "codex",
         aliases: &["codex-cli"],
@@ -176,6 +192,10 @@ fn codex_expected_asset_name(_version: &str) -> Result<String> {
     Ok(format!("codex-{}.tar.gz", codex_target_triple()?))
 }
 
+fn za_expected_asset_name(version: &str) -> Result<String> {
+    Ok(format!("za-{version}-{}.tar.gz", za_target_triple()?))
+}
+
 fn docker_compose_expected_asset_name(_version: &str) -> Result<String> {
     Ok(format!("docker-compose-{}", docker_compose_target()?))
 }
@@ -214,6 +234,19 @@ fn codex_target_triple() -> Result<&'static str> {
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
         _ => bail!(
             "unsupported platform for codex release asset: {}-{}",
+            env::consts::ARCH,
+            env::consts::OS
+        ),
+    }
+}
+
+fn za_target_triple() -> Result<&'static str> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
+        _ => bail!(
+            "unsupported platform for za release asset: {}-{}",
             env::consts::ARCH,
             env::consts::OS
         ),

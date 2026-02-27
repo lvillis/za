@@ -164,6 +164,8 @@ fn render_download_progress_without_total_omits_percentage() {
 
 #[test]
 fn tool_policy_matches_alias_and_canonical() {
+    let za = find_tool_policy("za").expect("canonical policy");
+    assert_eq!(za.canonical_name, "za");
     let codex_alias = find_tool_policy("codex-cli").expect("alias policy");
     let codex = find_tool_policy("codex").expect("canonical policy");
     assert_eq!(codex_alias.canonical_name, "codex");
@@ -197,6 +199,7 @@ fn canonical_tool_name_resolves_aliases() {
 #[test]
 fn supported_tool_names_csv_contains_all_aliases() {
     let csv = supported_tool_names_csv();
+    assert!(csv.contains("za"));
     assert!(csv.contains("codex"));
     assert!(csv.contains("codex-cli"));
     assert!(csv.contains("docker-compose"));

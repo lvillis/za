@@ -137,6 +137,14 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
     Ok(0)
 }
 
+pub fn update_self(user: bool, version: Option<String>) -> Result<i32> {
+    let spec = match version {
+        Some(version) => format!("za:{version}"),
+        None => "za".to_string(),
+    };
+    run(ToolCommands::Update { spec }, user)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolAction {
     Install,
