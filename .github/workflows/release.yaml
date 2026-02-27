@@ -39,14 +39,8 @@ jobs:
           - os: ubuntu-latest
             target: armv7-unknown-linux-gnueabihf
             use-cross: true
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            use-cross: false
-          - os: macos-latest
+          - os: macos-14
             target: aarch64-apple-darwin
-            use-cross: false
-          - os: windows-latest
-            target: x86_64-pc-windows-gnu
             use-cross: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -79,7 +73,10 @@ jobs:
       - name: Setup native compilation
         if: ${{ matrix.use-cross == false }}
         shell: bash
-        run: echo "CARGO=cargo" >> "$GITHUB_ENV"
+        run: |
+          rustup target add ${{ matrix.target }}
+          rustup target list --installed
+          echo "CARGO=cargo" >> "$GITHUB_ENV"
 
       - name: Setup cross compilation
         if: ${{ matrix.use-cross == true }}
