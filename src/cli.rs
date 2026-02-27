@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 /// Top-level CLI parser
@@ -20,53 +20,142 @@ pub enum Commands {
         output: PathBuf,
         #[arg(long)]
         include_binary: bool,
-
-        /// (Optional) Git repo URL to clone and scan, e.g. https://github.com/owner/repo.git
+        /// Optional GitHub repository URL, e.g. https://github.com/owner/repo
         #[arg(long)]
         repo: Option<String>,
-        /// (Optional) Rev to checkout: commit/tag/branch; defaults to remote HEAD
-        #[arg(long)]
-        rev: Option<String>,
-        /// (Optional) Subdirectory inside the repo to scan, e.g. crates/abc
+        /// Optional ref for remote snapshot (branch/tag/commit). Defaults to `HEAD`.
+        #[arg(long, value_name = "REF")]
+        r#ref: Option<String>,
+    },
+    /// Audit Rust dependency maintenance signals (crates.io + GitHub)
+    Deps {
+        /// Optional path to Cargo.toml (defaults to current workspace root).
         #[arg(long, value_name = "PATH")]
-        repo_subdir: Option<PathBuf>,
-        /// Keep the cloned directory instead of cleaning it up
+        manifest_path: Option<PathBuf>,
+        /// Optional GitHub token override for this run.
+        #[arg(long, value_name = "TOKEN")]
+        github_token: Option<String>,
+        /// Number of concurrent workers for API queries (default: auto, based on CPU count).
+        #[arg(long, value_name = "JOBS")]
+        jobs: Option<usize>,
+        /// Include dev-dependencies in audit.
         #[arg(long)]
-        keep_clone: bool,
-    },
-    /// Generate `STATS.md` / `stats.json`
-    Stats {
-        #[arg(long, default_value_t = crate::command::STAT_TOP_N)]
-        top: usize,
-        #[arg(long, default_value_t = crate::command::STAT_RECENT_DAYS)]
-        days: u32,
+        include_dev: bool,
+        /// Include build-dependencies in audit.
         #[arg(long)]
+        include_build: bool,
+        /// Include optional dependencies in audit.
+        #[arg(long)]
+        include_optional: bool,
+        /// Write full audit report to JSON.
+        #[arg(long, value_name = "PATH")]
         json: Option<PathBuf>,
-        #[arg(long, default_value = "STATS.md")]
-        output: PathBuf,
+        /// Exit with non-zero status when any high-risk dependency is found.
+        #[arg(long)]
+        fail_on_high: bool,
     },
-    /// CI quality gate: enforce repository thresholds and rules
-    Gate {
-        /// Fail if total binary size exceeds this (MiB)
+    /// Manage versioned CLI tools
+    Tool {
+        /// Use user-level paths (`~/.local/...`) instead of system-level paths.
         #[arg(long)]
-        max_binary_mib: Option<f64>,
-        /// Fail if any single file exceeds this size (MiB)
-        #[arg(long)]
-        max_file_size_mib: Option<f64>,
-        /// Fail if naive complexity score exceeds this value
-        #[arg(long)]
-        max_complexity: Option<usize>,
-        /// Deny files matching these globs (comma-separated or repeated)
-        #[arg(long, value_delimiter = ',')]
-        deny_glob: Vec<String>,
-        /// Treat any detected secret as an error (otherwise only warn)
-        #[arg(long)]
-        strict_secrets: bool,
-        /// Write detected secrets to a JSON report
-        #[arg(long)]
-        secrets_json: Option<PathBuf>,
-        /// Allow secrets under these globs (comma-separated or repeated)
-        #[arg(long, value_delimiter = ',')]
-        allow_secrets_in: Vec<String>,
+        user: bool,
+        #[command(subcommand)]
+        cmd: ToolCommands,
     },
+    /// Run a tool with proxy environment normalization
+    Run {
+        /// Tool name, e.g. `codex`
+        tool: String,
+        /// Arguments passed through to the tool
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Manage persisted za configuration values
+    Config {
+        #[command(subcommand)]
+        cmd: Option<ConfigCommands>,
+    },
+}
+
+/// `za tool` sub-commands
+#[derive(Subcommand)]
+pub enum ToolCommands {
+    /// Install a tool, e.g. `codex` or `codex:0.104.0`
+    Install {
+        /// Tool spec in `name[:version]` format.
+        spec: String,
+    },
+    /// Update a tool to latest or a target version
+    Update {
+        /// Tool spec in `name[:version]` format.
+        spec: String,
+    },
+    /// List tools and installed versions
+    List {
+        /// Show built-in supported tools and source policies.
+        #[arg(long)]
+        supported: bool,
+        /// Query upstream releases and show whether updates are available.
+        #[arg(long)]
+        updates: bool,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+        /// Return non-zero when updates are available (requires `--updates`).
+        #[arg(long)]
+        fail_on_updates: bool,
+        /// Return non-zero when update checks fail (requires `--updates`).
+        #[arg(long)]
+        fail_on_check_errors: bool,
+    },
+    /// Select the active tool version, e.g. `codex:0.104.0`
+    Use {
+        /// Tool reference in `name:version` format.
+        image: String,
+    },
+    /// Uninstall a tool version or all versions, e.g. `codex:0.104.0` or `codex`
+    Uninstall {
+        /// Tool spec in `name[:version]` format.
+        spec: String,
+    },
+}
+
+/// `za config` sub-commands
+#[derive(Subcommand)]
+pub enum ConfigCommands {
+    /// Show active config file path
+    Path,
+    /// Set a config value
+    Set {
+        #[arg(value_enum)]
+        key: ConfigKey,
+        value: String,
+    },
+    /// Get a config value
+    Get {
+        #[arg(value_enum)]
+        key: ConfigKey,
+        /// Print raw value (for scripting). Use with care.
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Remove a config value
+    Unset {
+        #[arg(value_enum)]
+        key: ConfigKey,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ConfigKey {
+    #[value(name = "github-token")]
+    GithubToken,
+    #[value(name = "run-http-proxy")]
+    RunHttpProxy,
+    #[value(name = "run-https-proxy")]
+    RunHttpsProxy,
+    #[value(name = "run-all-proxy")]
+    RunAllProxy,
+    #[value(name = "run-no-proxy")]
+    RunNoProxy,
 }

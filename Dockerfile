@@ -1,4 +1,4 @@
-FROM rust:1.89.0-alpine3.20 AS builder
+FROM rust:1.93.1-alpine3.23 AS builder
 
 RUN set -ex \
         \

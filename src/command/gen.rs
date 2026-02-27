@@ -1,28 +1,32 @@
 //! Implementation for `za gen`.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
+use flate2::read::GzDecoder;
+use reqx::{
+    RedirectPolicy, RetryPolicy,
+    blocking::{Client, ClientBuilder},
+};
 use std::{
+    env,
     fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::atomic::AtomicBool,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tar::Archive;
 
-use crate::command::{lang_of, md_header, walk_workspace, BinaryFile, TextFile};
+use crate::command::{BinaryFile, TextFile, lang_of, md_header, walk_workspace};
+
+const HTTP_TIMEOUT_SECS: u64 = 180;
+const HTTP_USER_AGENT: &str = "za-gen/0.1";
 
 /// Entry for `za gen`
-/// If `repo` is provided, clone into a temp dir with gix (rustls), optionally checkout `rev`,
-/// and (optionally) descend into `repo_subdir` to scan. The output path is resolved *before* changing
-/// directories so it's written to the original CWD.
 pub fn run(
     max_lines: usize,
     output: PathBuf,
     include_binary: bool,
     repo: Option<String>,
-    rev: Option<String>,
-    repo_subdir: Option<PathBuf>,
-    keep_clone: bool,
+    r#ref: Option<String>,
 ) -> Result<()> {
     // Resolve output to absolute path to avoid being affected by cwd changes.
     let output_abs = if output.is_absolute() {
@@ -33,41 +37,22 @@ pub fn run(
 
     match repo {
         None => {
-            // Local mode (existing behavior)
             let (texts, bins) = walk_workspace(include_binary)?;
             write_context_md(&texts, &bins, max_lines, &output_abs)?;
             println!("✅ Generated {}", output_abs.display());
         }
-        Some(url) => {
-            // Remote mode via gix (pure Rust, rustls)
-            let clone_dir = clone_and_prepare_gix(&url, rev.as_deref())?;
-            let scan_root = if let Some(sub) = repo_subdir {
-                let p = clone_dir.join(sub);
-                if !p.exists() {
-                    return Err(anyhow!("repo-subdir not found in clone: {}", p.display()));
-                }
-                p
-            } else {
-                clone_dir.clone()
-            };
-
-            // Switch cwd to scan root for walking
+        Some(repo_url) => {
+            let snapshot = download_github_snapshot(&repo_url, r#ref.as_deref())?;
             {
-                let _cwd = CwdGuard::push(&scan_root)?;
+                let _cwd = CwdGuard::push(&snapshot.scan_root)?;
                 let (texts, bins) = walk_workspace(include_binary)?;
                 write_context_md(&texts, &bins, max_lines, &output_abs)?;
-            } // restore cwd here
-
-            println!("✅ Generated {} (from repo {})", output_abs.display(), url);
-
-            if !keep_clone {
-                // Best-effort cleanup; ignore errors to avoid masking success.
-                if let Err(e) = fs::remove_dir_all(&clone_dir) {
-                    eprintln!("⚠️  Failed to remove temp clone {}: {e}", clone_dir.display());
-                }
-            } else {
-                println!("ℹ️  Clone kept at: {}", clone_dir.display());
             }
+            println!(
+                "✅ Generated {} (from repo {})",
+                output_abs.display(),
+                repo_url
+            );
         }
     }
 
@@ -122,7 +107,7 @@ fn snippet(lines: &[String], max: usize) -> String {
         return lines.join("\n");
     }
     // Split budget roughly half-half for head and tail.
-    let front = (max + 1) / 2;
+    let front = max.div_ceil(2);
     let back = max - front;
 
     format!(
@@ -142,6 +127,289 @@ fn pick_fence(content: &str) -> String {
     fence
 }
 
+#[derive(Debug)]
+struct SnapshotWorkspace {
+    scan_root: PathBuf,
+    cleanup_root: PathBuf,
+}
+
+impl Drop for SnapshotWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.cleanup_root);
+    }
+}
+
+fn download_github_snapshot(
+    repo_url: &str,
+    requested_ref: Option<&str>,
+) -> Result<SnapshotWorkspace> {
+    let (owner, repo) = parse_github_repo(repo_url).ok_or_else(|| {
+        anyhow!("unsupported repo URL `{repo_url}`: only GitHub URLs are supported")
+    })?;
+
+    let ref_name = requested_ref
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("HEAD");
+    let encoded_ref = percent_encode_path_segment(ref_name);
+    let archive_url = format!("https://github.com/{owner}/{repo}/archive/{encoded_ref}.tar.gz");
+
+    let root = unique_temp_dir("za-repo-snapshot")?;
+    let archive_path = root.join("repo.tar.gz");
+    download_to_path(&archive_url, &archive_path)
+        .with_context(|| format!("download repository archive `{archive_url}`"))?;
+
+    let unpack_dir = root.join("unpack");
+    fs::create_dir_all(&unpack_dir)
+        .with_context(|| format!("create unpack directory {}", unpack_dir.display()))?;
+    let scan_root = extract_tar_gz_archive(&archive_path, &unpack_dir)
+        .context("extract downloaded repository archive")?;
+
+    Ok(SnapshotWorkspace {
+        scan_root,
+        cleanup_root: root,
+    })
+}
+
+fn parse_github_repo(url: &str) -> Option<(String, String)> {
+    let trimmed = url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(path) = trimmed.strip_prefix("git@github.com:") {
+        return parse_owner_repo(path);
+    }
+    if let Some((_, path)) = trimmed.split_once("github.com/") {
+        return parse_owner_repo(path);
+    }
+    None
+}
+
+fn parse_owner_repo(path: &str) -> Option<(String, String)> {
+    let clean = path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .split('#')
+        .next()
+        .unwrap_or(path)
+        .trim_matches('/');
+
+    let mut parts = clean.split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim().trim_end_matches(".git");
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner.to_string(), repo.to_string()))
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        let keep = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
+        if keep {
+            out.push(char::from(b));
+        } else {
+            out.push('%');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
+}
+
+fn extract_tar_gz_archive(archive_path: &Path, out_dir: &Path) -> Result<PathBuf> {
+    let file = File::open(archive_path)
+        .with_context(|| format!("open archive {}", archive_path.display()))?;
+    let gz = GzDecoder::new(file);
+    let mut archive = Archive::new(gz);
+    archive
+        .unpack(out_dir)
+        .with_context(|| format!("unpack archive {}", archive_path.display()))?;
+
+    let mut top_dirs = Vec::new();
+    for entry in fs::read_dir(out_dir).with_context(|| format!("read {}", out_dir.display()))? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            top_dirs.push(entry.path());
+        }
+    }
+    top_dirs.sort();
+
+    match top_dirs.len() {
+        0 => bail!("archive did not contain a top-level directory"),
+        1 => Ok(top_dirs.remove(0)),
+        _ => bail!(
+            "archive contains multiple top-level directories; cannot determine scan root in {}",
+            out_dir.display()
+        ),
+    }
+}
+
+fn download_to_path(url: &str, dst: &Path) -> Result<()> {
+    let url_parts = parse_url_parts(url)?;
+    let client = build_http_client(&url_parts.base_url, "za-gen", true)?;
+
+    let mut req = client.get(url_parts.path_and_query);
+    req = req
+        .try_header("user-agent", HTTP_USER_AGENT)
+        .context("set download user-agent")?;
+    let mut resp = req
+        .send_stream()
+        .with_context(|| format!("download `{url}`"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("download `{url}` failed with status {status}");
+    }
+
+    if let Some(parent) = dst.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create directory {}", parent.display()))?;
+    }
+
+    let mut out = File::create(dst).with_context(|| format!("create {}", dst.display()))?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = resp
+            .read_chunk(&mut buf)
+            .with_context(|| format!("read bytes from `{url}`"))?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n])
+            .with_context(|| format!("write {}", dst.display()))?;
+    }
+    out.flush()
+        .with_context(|| format!("flush {}", dst.display()))?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct UrlParts {
+    base_url: String,
+    path_and_query: String,
+}
+
+fn parse_url_parts(url: &str) -> Result<UrlParts> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| anyhow!("invalid URL `{url}`: missing scheme"))?;
+    if scheme != "http" && scheme != "https" {
+        bail!("unsupported URL scheme `{scheme}` in `{url}`");
+    }
+
+    let slash_idx = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..slash_idx];
+    if authority.is_empty() {
+        bail!("invalid URL `{url}`: missing host");
+    }
+
+    let path_with_query_and_fragment = if slash_idx < rest.len() {
+        &rest[slash_idx..]
+    } else {
+        "/"
+    };
+    let path_and_query = path_with_query_and_fragment
+        .split('#')
+        .next()
+        .unwrap_or(path_with_query_and_fragment)
+        .to_string();
+
+    Ok(UrlParts {
+        base_url: format!("{scheme}://{authority}"),
+        path_and_query: if path_and_query.is_empty() {
+            "/".to_string()
+        } else {
+            path_and_query
+        },
+    })
+}
+
+const HTTPS_PROXY_ENV_KEYS: [&str; 6] = [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+];
+const HTTP_PROXY_ENV_KEYS: [&str; 4] = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
+
+fn proxy_env_keys_for_scheme(scheme: &str) -> &'static [&'static str] {
+    if scheme.eq_ignore_ascii_case("https") {
+        &HTTPS_PROXY_ENV_KEYS
+    } else {
+        &HTTP_PROXY_ENV_KEYS
+    }
+}
+
+fn first_env_value(names: &[&str]) -> Option<(String, String)> {
+    for name in names {
+        let Ok(value) = env::var(name) else {
+            continue;
+        };
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(((*name).to_string(), value.to_string()));
+        }
+    }
+    None
+}
+
+fn split_no_proxy_rules(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn apply_proxy_from_env(mut builder: ClientBuilder, scheme: &str) -> Result<ClientBuilder> {
+    let Some((proxy_var, proxy_value)) = first_env_value(proxy_env_keys_for_scheme(scheme)) else {
+        return Ok(builder);
+    };
+
+    let proxy_uri = proxy_value
+        .parse()
+        .with_context(|| format!("invalid proxy URI in `{proxy_var}`"))?;
+    builder = builder.http_proxy(proxy_uri);
+
+    if let Some((_, no_proxy_raw)) = first_env_value(&["NO_PROXY", "no_proxy"]) {
+        let rules = split_no_proxy_rules(&no_proxy_raw);
+        if !rules.is_empty() {
+            builder = builder
+                .try_no_proxy(rules)
+                .context("invalid `NO_PROXY`/`no_proxy` rules")?;
+        }
+    }
+
+    Ok(builder)
+}
+
+fn build_http_client(base_url: &str, client_name: &str, follow_redirects: bool) -> Result<Client> {
+    let mut builder = Client::builder(base_url)
+        .request_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .total_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .retry_policy(RetryPolicy::disabled())
+        .client_name(client_name);
+    if follow_redirects {
+        builder = builder.redirect_policy(RedirectPolicy::follow());
+    }
+    let scheme = base_url
+        .split_once("://")
+        .map(|(s, _)| s)
+        .unwrap_or("https");
+    builder = apply_proxy_from_env(builder, scheme)
+        .with_context(|| format!("configure HTTP client proxy for `{base_url}`"))?;
+    builder
+        .build()
+        .with_context(|| format!("build HTTP client for `{base_url}`"))
+}
+
 /// RAII guard for temporarily changing current working directory.
 struct CwdGuard {
     prev: PathBuf,
@@ -159,7 +427,6 @@ impl Drop for CwdGuard {
     }
 }
 
-/// Create a unique temp directory under the system temp path.
 fn unique_temp_dir(prefix: &str) -> Result<PathBuf> {
     let base = std::env::temp_dir();
     let ts = SystemTime::now()
@@ -172,50 +439,9 @@ fn unique_temp_dir(prefix: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Heuristic: looks like a commit SHA (7~40 hex)
-fn is_likely_commit_sha(s: &str) -> bool {
-    let len = s.len();
-    (7..=40).contains(&len) && s.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-/// Clone via gix (pure Rust, rustls HTTP/S), optionally check out `rev`.
-/// - If `rev` looks like branch/tag/ref name, use `with_ref_name()` then fetch+checkout;
-/// - If `rev` looks like a commit SHA，当前版本优雅降级为检出默认分支 HEAD（打印提示，不报错）。
-fn clone_and_prepare_gix(url: &str, rev: Option<&str>) -> Result<PathBuf> {
-    let clone_dir = unique_temp_dir("za-clone")?;
-
-    // Prepare clone
-    let mut prep = gix::prepare_clone(url, &clone_dir)
-        .with_context(|| format!("prepare clone for {url} -> {}", clone_dir.display()))?;
-
-    if let Some(name) = rev {
-        if is_likely_commit_sha(name) {
-            eprintln!("⚠️  `--rev` looks like a commit SHA. Falling back to default HEAD checkout (pure gix path).");
-        } else {
-            // Treat as branch/tag/ref name
-            prep = prep
-                .with_ref_name(Some(name))
-                .with_context(|| format!("set ref name '{name}'"))?;
-        }
-    }
-
-    // Fetch + checkout with blocking client
-    let cancel = AtomicBool::new(false);
-    let (mut checkout, _outcome) = prep
-        .fetch_then_checkout(gix::progress::Discard, &cancel)
-        .context("fetch_then_checkout")?;
-
-    // Materialize main worktree
-    let (_repo, _worktree) = checkout
-        .main_worktree(gix::progress::Discard, &cancel)
-        .context("checkout main worktree")?;
-
-    Ok(clone_dir)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::snippet;
+    use super::{parse_github_repo, percent_encode_path_segment, snippet};
 
     #[test]
     fn snippet_preserves_odd_max_lines() {
@@ -229,5 +455,25 @@ mod tests {
         let lines: Vec<String> = (1..=10).map(|i| format!("line{}", i)).collect();
         let out = snippet(&lines, 4);
         assert_eq!(out, "line1\nline2\n⋯(truncated)\nline9\nline10");
+    }
+
+    #[test]
+    fn parse_github_repo_supports_https_and_ssh() {
+        assert_eq!(
+            parse_github_repo("https://github.com/openai/codex"),
+            Some(("openai".to_string(), "codex".to_string()))
+        );
+        assert_eq!(
+            parse_github_repo("git@github.com:openai/codex.git"),
+            Some(("openai".to_string(), "codex".to_string()))
+        );
+    }
+
+    #[test]
+    fn encode_ref_escapes_slashes() {
+        assert_eq!(
+            percent_encode_path_segment("feature/x"),
+            "feature%2Fx".to_string()
+        );
     }
 }

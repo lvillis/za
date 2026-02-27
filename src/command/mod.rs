@@ -1,40 +1,34 @@
 //! Shared helpers and constants for all sub-commands.
 
+pub mod deps;
 pub mod r#gen;
-pub mod stats;
-pub mod gate;      // NEW: CI gate
-mod secrets;       // NEW: secrets scanner (internal)
+pub mod run;
+pub mod tool;
+pub mod za_config;
 
 use anyhow::Result;
 use humantime::format_rfc3339_seconds;
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use is_terminal::IsTerminal;
 use std::{
     ffi::OsStr,
     fs::{self, File},
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
 /// ---------- constants ----------
 pub const DEFAULT_MAX_LINES_PER_FILE: usize = 400;
-pub const STAT_TOP_N: usize = 10;
-pub const STAT_RECENT_DAYS: u32 = 30;
 
 /// Files to skip regardless of ignore settings.
-const SKIP_BASENAMES: &[&str] = &[
-    ".gitignore", ".aiignore",
-    "CONTEXT.md", "STATS.md", "stats.json",
-];
+const SKIP_BASENAMES: &[&str] = &[".gitignore", ".aiignore", "CONTEXT.md"];
 
 /// ---------- data structs ----------
 #[derive(Clone)]
 pub struct TextFile {
     pub rel: PathBuf,
     pub lines: Vec<String>,
-    pub bytes: usize, // size from metadata for gate checks
 }
 
 #[derive(Clone)]
@@ -55,7 +49,7 @@ pub fn walk_workspace(include_binary: bool) -> Result<(Vec<TextFile>, Vec<Binary
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::with_template("{spinner} {wide_msg}")?
-            .tick_strings(&["⣾","⣽","⣻","⢿","⡿","⣟","⣯","⣷"]),
+            .tick_strings(&["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]),
     );
     pb.enable_steady_tick(Duration::from_millis(80));
     if !std::io::stderr().is_terminal() {
@@ -93,7 +87,6 @@ pub fn walk_workspace(include_binary: bool) -> Result<(Vec<TextFile>, Vec<Binary
                 texts.push(TextFile {
                     rel: p.strip_prefix(&root)?.to_path_buf(),
                     lines: txt.lines().map(|s| s.to_owned()).collect(),
-                    bytes: meta.len() as usize,
                 });
             }
             Err(_) if include_binary => {

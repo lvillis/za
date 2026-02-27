@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="320" viewBox="0 0 1200 320" role="img" aria-labelledby="title desc">
+  <title id="title">za logo</title>
+  <desc id="desc">za logo with adaptive dark and light theme colors. AI-native CLI for context, tools, and dependency health.</desc>
+  <style>
+    :root {
+      --bg: #f8fafc;
+      --panel: #ffffff;
+      --stroke: #d0d7de;
+      --text: #0f172a;
+      --muted: #475569;
+      --blue: #0ea5e9;
+      --green: #22c55e;
+      --amber: #f59e0b;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0b1220;
+        --panel: #111827;
+        --stroke: #253349;
+        --text: #e5edf7;
+        --muted: #9fb0c3;
+        --blue: #38bdf8;
+        --green: #4ade80;
+        --amber: #fbbf24;
+      }
+    }
+
+    .word {
+      font-family: "JetBrains Mono", "Fira Code", "SFMono-Regular", Menlo, Consolas, monospace;
+      font-weight: 800;
+      letter-spacing: -0.04em;
+      fill: var(--text);
+    }
+
+    .tagline {
+      font-family: "Inter", "Segoe UI", Helvetica, Arial, sans-serif;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      fill: var(--muted);
+    }
+  </style>
+
+  <rect x="0" y="0" width="1200" height="320" rx="28" fill="var(--bg)"/>
+
+  <g transform="translate(42 40)">
+    <rect x="0" y="0" width="240" height="240" rx="44" fill="var(--panel)" stroke="var(--stroke)" stroke-width="3"/>
+
+    <rect x="34" y="34" width="172" height="172" rx="30" fill="none" stroke="var(--stroke)" stroke-width="2"/>
+
+    <circle cx="58" cy="58" r="12" fill="var(--blue)"/>
+    <circle cx="182" cy="58" r="12" fill="var(--green)"/>
+    <circle cx="120" cy="182" r="12" fill="var(--amber)"/>
+
+    <path d="M71 150 L143 84 H75" fill="none" stroke="var(--text)" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M149 150 L178 97 L207 150 M160 129 H196" fill="none" stroke="var(--text)" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <text x="330" y="145" font-size="118" class="word">za</text>
+  <text x="338" y="205" font-size="35" class="tagline">AI-native CLI</text>
+  <text x="338" y="246" font-size="25" class="tagline">context, tools, dependency health</text>
+</svg>
