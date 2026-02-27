@@ -1,8 +1,14 @@
+## [0.1.13] - 2026-02-27
+
+### ⚙️ Miscellaneous Tasks
+
+- Update ci
 ## [0.1.12] - 2026-02-27
 
 ### ⚙️ Miscellaneous Tasks
 
 - Update ci
+- Release za version 0.1.12
 ## [0.1.11] - 2026-02-27
 
 ### ⚙️ Miscellaneous Tasks
