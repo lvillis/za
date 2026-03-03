@@ -1,3 +1,8 @@
+## [0.1.15] - 2026-03-03
+
+### 🚀 Features
+
+- Harden tool update interruption cleanup and signal handling
 ## [0.1.14] - 2026-02-27
 
 ### 🚀 Features
@@ -5,6 +10,10 @@
 - Add za update
 - *(tool)* Add manifest-based za tool sync for batch updates
 - Harden self-update and fix Docker multi-arch build
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.14
 ## [0.1.13] - 2026-02-27
 
 ### ⚙️ Miscellaneous Tasks
