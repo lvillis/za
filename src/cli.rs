@@ -168,12 +168,36 @@ pub enum ConfigCommands {
 pub enum ConfigKey {
     #[value(name = "github-token")]
     GithubToken,
-    #[value(name = "run-http-proxy")]
-    RunHttpProxy,
-    #[value(name = "run-https-proxy")]
-    RunHttpsProxy,
-    #[value(name = "run-all-proxy")]
-    RunAllProxy,
+    #[value(name = "proxy-http")]
+    ProxyHttp,
+    #[value(name = "proxy-https")]
+    ProxyHttps,
+    #[value(name = "proxy-all")]
+    ProxyAll,
+    #[value(name = "proxy-no-proxy")]
+    ProxyNoProxy,
+    #[value(name = "run-http")]
+    RunHttp,
+    #[value(name = "run-https")]
+    RunHttps,
+    #[value(name = "run-all")]
+    RunAll,
     #[value(name = "run-no-proxy")]
     RunNoProxy,
+    #[value(name = "tool-http")]
+    ToolHttp,
+    #[value(name = "tool-https")]
+    ToolHttps,
+    #[value(name = "tool-all")]
+    ToolAll,
+    #[value(name = "tool-no-proxy")]
+    ToolNoProxy,
+    #[value(name = "update-http")]
+    UpdateHttp,
+    #[value(name = "update-https")]
+    UpdateHttps,
+    #[value(name = "update-all")]
+    UpdateAll,
+    #[value(name = "update-no-proxy")]
+    UpdateNoProxy,
 }

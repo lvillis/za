@@ -5,14 +5,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
+    style::available_color_count,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Terminal,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -25,7 +27,15 @@ use std::{
 const CONFIG_DIR_NAME: &str = "za";
 const CONFIG_FILE_NAME: &str = "config.toml";
 
-const CONFIG_ITEMS: [ConfigItem; 5] = [
+const CONFIG_MODULES: [ConfigModule; 5] = [
+    ConfigModule::Auth,
+    ConfigModule::Proxy,
+    ConfigModule::Run,
+    ConfigModule::Tool,
+    ConfigModule::Update,
+];
+
+const CONFIG_ITEMS: [ConfigItem; 17] = [
     ConfigItem {
         key: ConfigKey::GithubToken,
         module: ConfigModule::Auth,
@@ -33,19 +43,43 @@ const CONFIG_ITEMS: [ConfigItem; 5] = [
         secret: true,
     },
     ConfigItem {
-        key: ConfigKey::RunHttpProxy,
+        key: ConfigKey::ProxyHttp,
+        module: ConfigModule::Proxy,
+        label: "http-proxy",
+        secret: false,
+    },
+    ConfigItem {
+        key: ConfigKey::ProxyHttps,
+        module: ConfigModule::Proxy,
+        label: "https-proxy",
+        secret: false,
+    },
+    ConfigItem {
+        key: ConfigKey::ProxyAll,
+        module: ConfigModule::Proxy,
+        label: "all-proxy",
+        secret: false,
+    },
+    ConfigItem {
+        key: ConfigKey::ProxyNoProxy,
+        module: ConfigModule::Proxy,
+        label: "no-proxy",
+        secret: false,
+    },
+    ConfigItem {
+        key: ConfigKey::RunHttp,
         module: ConfigModule::Run,
         label: "http-proxy",
         secret: false,
     },
     ConfigItem {
-        key: ConfigKey::RunHttpsProxy,
+        key: ConfigKey::RunHttps,
         module: ConfigModule::Run,
         label: "https-proxy",
         secret: false,
     },
     ConfigItem {
-        key: ConfigKey::RunAllProxy,
+        key: ConfigKey::RunAll,
         module: ConfigModule::Run,
         label: "all-proxy",
         secret: false,
@@ -53,6 +87,54 @@ const CONFIG_ITEMS: [ConfigItem; 5] = [
     ConfigItem {
         key: ConfigKey::RunNoProxy,
         module: ConfigModule::Run,
+        label: "no-proxy",
+        secret: false,
+    },
+    ConfigItem {
+        key: ConfigKey::ToolHttp,
+        module: ConfigModule::Tool,
+        label: "http-proxy",
+        secret: false,
+    },
+    ConfigItem {
+        key: ConfigKey::ToolHttps,
+        module: ConfigModule::Tool,
+        label: "https-proxy",
+        secret: false,
+    },
+    ConfigItem {
+        key: ConfigKey::ToolAll,
+        module: ConfigModule::Tool,
+        label: "all-proxy",
+        secret: false,
+    },
+    ConfigItem {
+        key: ConfigKey::ToolNoProxy,
+        module: ConfigModule::Tool,
+        label: "no-proxy",
+        secret: false,
+    },
+    ConfigItem {
+        key: ConfigKey::UpdateHttp,
+        module: ConfigModule::Update,
+        label: "http-proxy",
+        secret: false,
+    },
+    ConfigItem {
+        key: ConfigKey::UpdateHttps,
+        module: ConfigModule::Update,
+        label: "https-proxy",
+        secret: false,
+    },
+    ConfigItem {
+        key: ConfigKey::UpdateAll,
+        module: ConfigModule::Update,
+        label: "all-proxy",
+        secret: false,
+    },
+    ConfigItem {
+        key: ConfigKey::UpdateNoProxy,
+        module: ConfigModule::Update,
         label: "no-proxy",
         secret: false,
     },
@@ -69,14 +151,91 @@ struct ConfigItem {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ConfigModule {
     Auth,
+    Proxy,
     Run,
+    Tool,
+    Update,
 }
 
 #[derive(Default)]
 struct ConfigTuiState {
     selected: usize,
+    scroll_offset: usize,
+    viewport_rows: usize,
     input: Option<String>,
     message: Option<String>,
+    show_help: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TuiDensity {
+    Compact,
+    Comfortable,
+}
+
+#[derive(Clone, Copy)]
+struct TuiTheme {
+    title: Style,
+    module: Style,
+    key: Style,
+    value: Style,
+    selected: Style,
+    scrollbar_thumb: Style,
+    scrollbar_track: Style,
+    highlight_symbol: &'static str,
+    scrollbar_thumb_symbol: &'static str,
+    scrollbar_track_symbol: Option<&'static str>,
+    scrollbar_begin_symbol: Option<&'static str>,
+    scrollbar_end_symbol: Option<&'static str>,
+}
+
+impl TuiTheme {
+    fn detect() -> Self {
+        let no_color = env::var_os("NO_COLOR").is_some()
+            || matches!(env::var("CLICOLOR").ok().as_deref(), Some("0"))
+            || matches!(env::var("TERM").ok().as_deref(), Some("dumb"));
+        let supports_color = available_color_count() >= 8;
+
+        if no_color || !supports_color {
+            return Self {
+                title: Style::default().add_modifier(Modifier::BOLD),
+                module: Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                key: Style::default().add_modifier(Modifier::BOLD),
+                value: Style::default().add_modifier(Modifier::DIM),
+                selected: Style::default().add_modifier(Modifier::REVERSED),
+                scrollbar_thumb: Style::default().add_modifier(Modifier::BOLD),
+                scrollbar_track: Style::default().add_modifier(Modifier::DIM),
+                highlight_symbol: "> ",
+                scrollbar_thumb_symbol: "#",
+                scrollbar_track_symbol: Some("|"),
+                scrollbar_begin_symbol: Some("^"),
+                scrollbar_end_symbol: Some("v"),
+            };
+        }
+
+        Self {
+            title: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            module: Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            key: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            value: Style::default().add_modifier(Modifier::DIM),
+            selected: Style::default().add_modifier(Modifier::REVERSED),
+            scrollbar_thumb: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            scrollbar_track: Style::default().fg(Color::DarkGray),
+            highlight_symbol: ">> ",
+            scrollbar_thumb_symbol: "#",
+            scrollbar_track_symbol: Some("|"),
+            scrollbar_begin_symbol: Some("^"),
+            scrollbar_end_symbol: Some("v"),
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -84,7 +243,13 @@ struct ZaConfig {
     #[serde(default)]
     auth: AuthConfig,
     #[serde(default)]
-    run: RunConfig,
+    proxy: ProxyConfig,
+    #[serde(default)]
+    run: ProxyConfig,
+    #[serde(default)]
+    tool: ProxyConfig,
+    #[serde(default)]
+    update: ProxyConfig,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -94,7 +259,7 @@ struct AuthConfig {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct RunConfig {
+struct ProxyConfig {
     #[serde(default)]
     http_proxy: Option<String>,
     #[serde(default)]
@@ -106,11 +271,20 @@ struct RunConfig {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct RunProxyOverrides {
+pub struct ProxyOverrides {
     pub http_proxy: Option<String>,
     pub https_proxy: Option<String>,
     pub all_proxy: Option<String>,
     pub no_proxy: Option<String>,
+}
+
+pub type RunProxyOverrides = ProxyOverrides;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProxyScope {
+    Run,
+    Tool,
+    Update,
 }
 
 pub fn run(cmd: Option<ConfigCommands>) -> Result<()> {
@@ -136,16 +310,21 @@ pub fn load_github_token() -> Result<Option<String>> {
 }
 
 pub fn load_run_proxy_overrides() -> Result<RunProxyOverrides> {
+    load_proxy_overrides(ProxyScope::Run)
+}
+
+pub fn load_proxy_overrides(scope: ProxyScope) -> Result<ProxyOverrides> {
     let Some(path) = maybe_config_path() else {
-        return Ok(RunProxyOverrides::default());
+        return Ok(ProxyOverrides::default());
     };
     let cfg = read_config(&path)?;
-    Ok(RunProxyOverrides {
-        http_proxy: cfg.run.http_proxy.and_then(normalize_value),
-        https_proxy: cfg.run.https_proxy.and_then(normalize_value),
-        all_proxy: cfg.run.all_proxy.and_then(normalize_value),
-        no_proxy: cfg.run.no_proxy.and_then(normalize_value),
-    })
+    let global = normalize_proxy_config(&cfg.proxy);
+    let scoped = match scope {
+        ProxyScope::Run => normalize_proxy_config(&cfg.run),
+        ProxyScope::Tool => normalize_proxy_config(&cfg.tool),
+        ProxyScope::Update => normalize_proxy_config(&cfg.update),
+    };
+    Ok(merge_proxy_overrides(&global, &scoped))
 }
 
 fn set_value(key: ConfigKey, value: String) -> Result<()> {
@@ -158,10 +337,22 @@ fn get_value(key: ConfigKey, raw: bool) -> Result<()> {
     let cfg = read_config(&path)?;
     let value = match key {
         ConfigKey::GithubToken => cfg.auth.github_token,
-        ConfigKey::RunHttpProxy => cfg.run.http_proxy,
-        ConfigKey::RunHttpsProxy => cfg.run.https_proxy,
-        ConfigKey::RunAllProxy => cfg.run.all_proxy,
+        ConfigKey::ProxyHttp => cfg.proxy.http_proxy,
+        ConfigKey::ProxyHttps => cfg.proxy.https_proxy,
+        ConfigKey::ProxyAll => cfg.proxy.all_proxy,
+        ConfigKey::ProxyNoProxy => cfg.proxy.no_proxy,
+        ConfigKey::RunHttp => cfg.run.http_proxy,
+        ConfigKey::RunHttps => cfg.run.https_proxy,
+        ConfigKey::RunAll => cfg.run.all_proxy,
         ConfigKey::RunNoProxy => cfg.run.no_proxy,
+        ConfigKey::ToolHttp => cfg.tool.http_proxy,
+        ConfigKey::ToolHttps => cfg.tool.https_proxy,
+        ConfigKey::ToolAll => cfg.tool.all_proxy,
+        ConfigKey::ToolNoProxy => cfg.tool.no_proxy,
+        ConfigKey::UpdateHttp => cfg.update.http_proxy,
+        ConfigKey::UpdateHttps => cfg.update.https_proxy,
+        ConfigKey::UpdateAll => cfg.update.all_proxy,
+        ConfigKey::UpdateNoProxy => cfg.update.no_proxy,
     }
     .and_then(normalize_value);
 
@@ -185,10 +376,22 @@ fn set_value_impl(key: ConfigKey, value: String, print_result: bool) -> Result<(
     let mut cfg = read_config(&path)?;
     match key {
         ConfigKey::GithubToken => cfg.auth.github_token = Some(normalized),
-        ConfigKey::RunHttpProxy => cfg.run.http_proxy = Some(normalized),
-        ConfigKey::RunHttpsProxy => cfg.run.https_proxy = Some(normalized),
-        ConfigKey::RunAllProxy => cfg.run.all_proxy = Some(normalized),
+        ConfigKey::ProxyHttp => cfg.proxy.http_proxy = Some(normalized),
+        ConfigKey::ProxyHttps => cfg.proxy.https_proxy = Some(normalized),
+        ConfigKey::ProxyAll => cfg.proxy.all_proxy = Some(normalized),
+        ConfigKey::ProxyNoProxy => cfg.proxy.no_proxy = Some(normalized),
+        ConfigKey::RunHttp => cfg.run.http_proxy = Some(normalized),
+        ConfigKey::RunHttps => cfg.run.https_proxy = Some(normalized),
+        ConfigKey::RunAll => cfg.run.all_proxy = Some(normalized),
         ConfigKey::RunNoProxy => cfg.run.no_proxy = Some(normalized),
+        ConfigKey::ToolHttp => cfg.tool.http_proxy = Some(normalized),
+        ConfigKey::ToolHttps => cfg.tool.https_proxy = Some(normalized),
+        ConfigKey::ToolAll => cfg.tool.all_proxy = Some(normalized),
+        ConfigKey::ToolNoProxy => cfg.tool.no_proxy = Some(normalized),
+        ConfigKey::UpdateHttp => cfg.update.http_proxy = Some(normalized),
+        ConfigKey::UpdateHttps => cfg.update.https_proxy = Some(normalized),
+        ConfigKey::UpdateAll => cfg.update.all_proxy = Some(normalized),
+        ConfigKey::UpdateNoProxy => cfg.update.no_proxy = Some(normalized),
     }
     write_config(&path, &cfg)?;
     if print_result {
@@ -202,10 +405,22 @@ fn unset_value_impl(key: ConfigKey, print_result: bool) -> Result<()> {
     let mut cfg = read_config(&path)?;
     match key {
         ConfigKey::GithubToken => cfg.auth.github_token = None,
-        ConfigKey::RunHttpProxy => cfg.run.http_proxy = None,
-        ConfigKey::RunHttpsProxy => cfg.run.https_proxy = None,
-        ConfigKey::RunAllProxy => cfg.run.all_proxy = None,
+        ConfigKey::ProxyHttp => cfg.proxy.http_proxy = None,
+        ConfigKey::ProxyHttps => cfg.proxy.https_proxy = None,
+        ConfigKey::ProxyAll => cfg.proxy.all_proxy = None,
+        ConfigKey::ProxyNoProxy => cfg.proxy.no_proxy = None,
+        ConfigKey::RunHttp => cfg.run.http_proxy = None,
+        ConfigKey::RunHttps => cfg.run.https_proxy = None,
+        ConfigKey::RunAll => cfg.run.all_proxy = None,
         ConfigKey::RunNoProxy => cfg.run.no_proxy = None,
+        ConfigKey::ToolHttp => cfg.tool.http_proxy = None,
+        ConfigKey::ToolHttps => cfg.tool.https_proxy = None,
+        ConfigKey::ToolAll => cfg.tool.all_proxy = None,
+        ConfigKey::ToolNoProxy => cfg.tool.no_proxy = None,
+        ConfigKey::UpdateHttp => cfg.update.http_proxy = None,
+        ConfigKey::UpdateHttps => cfg.update.https_proxy = None,
+        ConfigKey::UpdateAll => cfg.update.all_proxy = None,
+        ConfigKey::UpdateNoProxy => cfg.update.no_proxy = None,
     }
     write_config(&path, &cfg)?;
     if print_result {
@@ -217,10 +432,22 @@ fn unset_value_impl(key: ConfigKey, print_result: bool) -> Result<()> {
 fn key_label(key: ConfigKey) -> &'static str {
     match key {
         ConfigKey::GithubToken => "github-token",
-        ConfigKey::RunHttpProxy => "run-http-proxy",
-        ConfigKey::RunHttpsProxy => "run-https-proxy",
-        ConfigKey::RunAllProxy => "run-all-proxy",
+        ConfigKey::ProxyHttp => "proxy-http",
+        ConfigKey::ProxyHttps => "proxy-https",
+        ConfigKey::ProxyAll => "proxy-all",
+        ConfigKey::ProxyNoProxy => "proxy-no-proxy",
+        ConfigKey::RunHttp => "run-http",
+        ConfigKey::RunHttps => "run-https",
+        ConfigKey::RunAll => "run-all",
         ConfigKey::RunNoProxy => "run-no-proxy",
+        ConfigKey::ToolHttp => "tool-http",
+        ConfigKey::ToolHttps => "tool-https",
+        ConfigKey::ToolAll => "tool-all",
+        ConfigKey::ToolNoProxy => "tool-no-proxy",
+        ConfigKey::UpdateHttp => "update-http",
+        ConfigKey::UpdateHttps => "update-https",
+        ConfigKey::UpdateAll => "update-all",
+        ConfigKey::UpdateNoProxy => "update-no-proxy",
     }
 }
 
@@ -231,7 +458,10 @@ fn config_item_label(item: &ConfigItem) -> String {
 fn module_label(module: ConfigModule) -> &'static str {
     match module {
         ConfigModule::Auth => "auth",
+        ConfigModule::Proxy => "proxy",
         ConfigModule::Run => "run",
+        ConfigModule::Tool => "tool",
+        ConfigModule::Update => "update",
     }
 }
 
@@ -287,15 +517,17 @@ fn run_tui_loop(
     terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
 ) -> Result<()> {
     let mut state = ConfigTuiState::default();
+    let theme = TuiTheme::detect();
     loop {
         let path = config_path()?;
         let cfg = read_config(&path)?;
-        if state.selected >= CONFIG_ITEMS.len() {
-            state.selected = CONFIG_ITEMS.len().saturating_sub(1);
+        let display_order = display_order_indices();
+        if state.selected >= display_order.len() {
+            state.selected = display_order.len().saturating_sub(1);
         }
 
         terminal
-            .draw(|frame| draw_tui(frame, &cfg, &path, &state))
+            .draw(|frame| draw_tui(frame, &cfg, &path, &mut state, &display_order, &theme))
             .context("draw config tui")?;
 
         if !event::poll(Duration::from_millis(120)).context("poll keyboard events")? {
@@ -315,7 +547,11 @@ fn run_tui_loop(
                     state.message = Some("edit canceled".to_string());
                 }
                 KeyCode::Enter => {
-                    let Some(item) = CONFIG_ITEMS.get(state.selected) else {
+                    let Some(selected_idx) = display_order.get(state.selected).copied() else {
+                        state.input = None;
+                        continue;
+                    };
+                    let Some(item) = CONFIG_ITEMS.get(selected_idx) else {
                         state.input = None;
                         continue;
                     };
@@ -354,15 +590,58 @@ fn run_tui_loop(
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
             KeyCode::Down | KeyCode::Char('j') => {
-                if state.selected + 1 < CONFIG_ITEMS.len() {
+                if state.selected + 1 < display_order.len() {
                     state.selected += 1;
+                    state.message = None;
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                let before = state.selected;
                 state.selected = state.selected.saturating_sub(1);
+                if state.selected != before {
+                    state.message = None;
+                }
+            }
+            KeyCode::Home => {
+                if !display_order.is_empty() {
+                    state.selected = 0;
+                    state.message = None;
+                }
+            }
+            KeyCode::End => {
+                if !display_order.is_empty() {
+                    state.selected = display_order.len().saturating_sub(1);
+                    state.message = None;
+                }
+            }
+            KeyCode::PageDown => {
+                if !display_order.is_empty() {
+                    let step = state.viewport_rows.saturating_sub(1).max(1);
+                    let max = display_order.len().saturating_sub(1);
+                    state.selected = state.selected.saturating_add(step).min(max);
+                    state.message = None;
+                }
+            }
+            KeyCode::PageUp => {
+                if !display_order.is_empty() {
+                    let step = state.viewport_rows.saturating_sub(1).max(1);
+                    state.selected = state.selected.saturating_sub(step);
+                    state.message = None;
+                }
+            }
+            KeyCode::Char('?') | KeyCode::F(1) => {
+                state.show_help = !state.show_help;
+                state.message = Some(if state.show_help {
+                    "help panel shown".to_string()
+                } else {
+                    "help panel hidden".to_string()
+                });
             }
             KeyCode::Enter | KeyCode::Char('e') => {
-                let Some(item) = CONFIG_ITEMS.get(state.selected) else {
+                let Some(selected_idx) = display_order.get(state.selected).copied() else {
+                    continue;
+                };
+                let Some(item) = CONFIG_ITEMS.get(selected_idx) else {
                     continue;
                 };
                 let current = config_value_by_key(&cfg, item.key)
@@ -372,7 +651,10 @@ fn run_tui_loop(
                 state.message = Some(format!("editing {}", config_item_label(item)));
             }
             KeyCode::Char('u') => {
-                let Some(item) = CONFIG_ITEMS.get(state.selected) else {
+                let Some(selected_idx) = display_order.get(state.selected).copied() else {
+                    continue;
+                };
+                let Some(item) = CONFIG_ITEMS.get(selected_idx) else {
                     continue;
                 };
                 match unset_value_impl(item.key, false) {
@@ -385,63 +667,168 @@ fn run_tui_loop(
     }
 }
 
-fn draw_tui(frame: &mut ratatui::Frame<'_>, cfg: &ZaConfig, path: &Path, state: &ConfigTuiState) {
+fn draw_tui(
+    frame: &mut ratatui::Frame<'_>,
+    cfg: &ZaConfig,
+    path: &Path,
+    state: &mut ConfigTuiState,
+    display_order: &[usize],
+    theme: &TuiTheme,
+) {
+    let density = resolve_tui_density(frame.area());
+    let status_height = 4;
+    let help_height = if state.show_help {
+        match density {
+            TuiDensity::Compact => 5,
+            TuiDensity::Comfortable => 7,
+        }
+    } else {
+        0
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(3),
+            Constraint::Length(4),
+            Constraint::Min(6),
+            Constraint::Length(status_height + help_height),
         ])
         .split(frame.area());
 
+    let title_width = usize::from(chunks[0].width.saturating_sub(2)).max(1);
+    let path_raw = path.display().to_string();
+    let mode_label = match density {
+        TuiDensity::Compact => "compact",
+        TuiDensity::Comfortable => "comfortable",
+    };
+    let title_sub = match density {
+        TuiDensity::Compact => format!(
+            "mode: {mode_label} | help: {}",
+            if state.show_help { "on" } else { "off" }
+        ),
+        TuiDensity::Comfortable => format!("path: {path_raw}"),
+    };
     let title = Paragraph::new(vec![
+        Line::from(Span::styled("za config", theme.title)),
         Line::from(Span::styled(
-            "za config",
-            Style::default().add_modifier(Modifier::BOLD),
+            truncate_middle(&title_sub, title_width),
+            theme.value,
         )),
-        Line::from(Span::raw(format!("path: {}", path.display()))),
     ])
     .alignment(Alignment::Left)
     .block(Block::default().borders(Borders::ALL).title("Overview"));
     frame.render_widget(title, chunks[0]);
 
-    let body_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(8)])
-        .split(chunks[1]);
+    let selected_item_index = display_order.get(state.selected).copied();
+    let block = Block::default().borders(Borders::ALL).title("Config");
+    let inner = block.inner(chunks[1]);
+    frame.render_widget(block, chunks[1]);
 
-    render_module_list(
-        frame,
-        body_chunks[0],
-        "auth",
-        ConfigModule::Auth,
-        cfg,
-        state.selected,
-    );
-    render_module_list(
-        frame,
-        body_chunks[1],
-        "run",
-        ConfigModule::Run,
-        cfg,
-        state.selected,
-    );
+    let (rows, row_item_indices) = build_config_rows(cfg, density, *theme, inner.width);
+    let selected_row = row_item_indices
+        .iter()
+        .position(|idx| *idx == selected_item_index)
+        .unwrap_or_default();
 
+    let mut list_state = ListState::default()
+        .with_offset(state.scroll_offset)
+        .with_selected(Some(selected_row));
+
+    let list = List::new(rows)
+        .highlight_style(theme.selected)
+        .highlight_symbol(theme.highlight_symbol);
+    frame.render_stateful_widget(list, inner, &mut list_state);
+
+    let row_count = row_item_indices.len();
+    let viewport_len = usize::from(inner.height.max(1));
+    state.viewport_rows = viewport_len;
+    state.scroll_offset = list_state.offset().min(row_count.saturating_sub(1));
+
+    let mut scrollbar_state = ScrollbarState::new(row_count)
+        .position(list_state.offset())
+        .viewport_content_length(viewport_len);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .thumb_symbol(theme.scrollbar_thumb_symbol)
+        .track_symbol(theme.scrollbar_track_symbol)
+        .begin_symbol(theme.scrollbar_begin_symbol)
+        .end_symbol(theme.scrollbar_end_symbol)
+        .thumb_style(theme.scrollbar_thumb)
+        .track_style(theme.scrollbar_track)
+        .begin_style(theme.scrollbar_track)
+        .end_style(theme.scrollbar_track);
+    frame.render_stateful_widget(scrollbar, inner, &mut scrollbar_state);
+
+    let visible_start = state.scroll_offset.saturating_add(1).min(row_count.max(1));
+    let visible_end = state
+        .scroll_offset
+        .saturating_add(viewport_len)
+        .min(row_count.max(1));
+    let selected_label = selected_item_index
+        .and_then(|idx| CONFIG_ITEMS.get(idx))
+        .map(config_item_label)
+        .unwrap_or_else(|| "<none>".to_string());
+    let selected_info = format!(
+        "selected: {} ({}/{})",
+        selected_label,
+        state.selected.saturating_add(1),
+        display_order.len()
+    );
+    let scroll_info = format!(
+        "view: rows {}-{} / {}",
+        visible_start, visible_end, row_count
+    );
     let hint = if state.input.is_some() {
-        "edit mode: type value, Enter save, Esc cancel, empty value unsets"
+        "edit: Enter save | Esc cancel | empty value unsets"
     } else {
-        "navigate: ↑/↓ or j/k, Enter edit, u unset, q quit"
+        "normal: Enter/e edit | u unset | ?/F1 help | q quit"
     };
-    let message = state.message.as_deref().unwrap_or(hint);
-    let footer =
-        Paragraph::new(message).block(Block::default().borders(Borders::ALL).title("Hints"));
-    frame.render_widget(footer, chunks[2]);
+    let primary_status = state.message.as_deref().unwrap_or(hint);
+    let secondary_status = format!("{selected_info} | {scroll_info}");
+
+    if state.show_help {
+        let footer_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(status_height),
+                Constraint::Min(help_height),
+            ])
+            .split(chunks[2]);
+        let status_width = usize::from(footer_chunks[0].width.saturating_sub(2)).max(1);
+        let status = Paragraph::new(vec![
+            Line::from(Span::raw(truncate_end(primary_status, status_width))),
+            Line::from(Span::styled(
+                truncate_end(&secondary_status, status_width),
+                theme.value,
+            )),
+        ])
+        .block(Block::default().borders(Borders::ALL).title("Status"));
+        frame.render_widget(status, footer_chunks[0]);
+
+        let help_width = usize::from(footer_chunks[1].width.saturating_sub(2)).max(1);
+        let help_lines = help_text_lines(density)
+            .into_iter()
+            .map(|line| Line::from(Span::raw(truncate_end(line, help_width))))
+            .collect::<Vec<_>>();
+        let help =
+            Paragraph::new(help_lines).block(Block::default().borders(Borders::ALL).title("Help"));
+        frame.render_widget(help, footer_chunks[1]);
+    } else {
+        let status_width = usize::from(chunks[2].width.saturating_sub(2)).max(1);
+        let status = Paragraph::new(vec![
+            Line::from(Span::raw(truncate_end(primary_status, status_width))),
+            Line::from(Span::styled(
+                truncate_end(&secondary_status, status_width),
+                theme.value,
+            )),
+        ])
+        .block(Block::default().borders(Borders::ALL).title("Status"));
+        frame.render_widget(status, chunks[2]);
+    }
 
     if let Some(input) = &state.input {
         let area = centered_rect(70, 24, frame.area());
         frame.render_widget(Clear, area);
-        let popup = Block::default().borders(Borders::ALL).title("Edit value");
+        let popup = Block::default().borders(Borders::ALL).title("Edit Value");
         frame.render_widget(popup, area);
 
         let inner = Layout::default()
@@ -457,49 +844,149 @@ fn draw_tui(frame: &mut ratatui::Frame<'_>, cfg: &ZaConfig, path: &Path, state: 
             Paragraph::new("Enter value, leave empty to unset"),
             inner[0],
         );
-        frame.render_widget(Paragraph::new(input.clone()), inner[1]);
+        frame.render_widget(Paragraph::new(input.clone()).style(theme.value), inner[1]);
         let x = inner[1].x + input.chars().count() as u16;
         frame.set_cursor_position((x, inner[1].y));
     }
 }
 
-fn render_module_list(
-    frame: &mut ratatui::Frame<'_>,
-    area: Rect,
-    title: &str,
-    module: ConfigModule,
+fn build_config_rows(
     cfg: &ZaConfig,
-    selected: usize,
-) {
-    let indexed_items: Vec<(usize, &ConfigItem)> = CONFIG_ITEMS
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| item.module == module)
-        .collect();
+    density: TuiDensity,
+    theme: TuiTheme,
+    content_width: u16,
+) -> (Vec<ListItem<'static>>, Vec<Option<usize>>) {
+    let mut rows = Vec::new();
+    let mut row_item_indices = Vec::new();
+    let compact = density == TuiDensity::Compact;
+    let width = usize::from(content_width.max(1));
+    let key_width = if compact {
+        width.saturating_mul(2) / 5
+    } else {
+        14
+    }
+    .clamp(10, 28);
+    let value_width = width.saturating_sub(key_width + 4).max(8);
 
-    let items: Vec<ListItem<'_>> = indexed_items
-        .iter()
-        .map(|(_, item)| {
-            let value = display_value(config_value_by_key(cfg, item.key), item.secret);
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{:<16}", item.label),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(value),
-            ]))
-        })
-        .collect();
+    let mut active_module: Option<ConfigModule> = None;
+    for idx in display_order_indices() {
+        let item = CONFIG_ITEMS[idx];
+        if !compact && active_module != Some(item.module) {
+            active_module = Some(item.module);
+            let header = format!("[{}]", module_label(item.module));
+            rows.push(ListItem::new(Line::from(Span::styled(
+                header,
+                theme.module,
+            ))));
+            row_item_indices.push(None);
+        }
 
-    let list = List::new(items)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .block(Block::default().borders(Borders::ALL).title(title));
-    let mut list_state = ListState::default();
-    let selected_local = indexed_items
-        .iter()
-        .position(|(global_idx, _)| *global_idx == selected);
-    list_state.select(selected_local);
-    frame.render_stateful_widget(list, area, &mut list_state);
+        let key_source = if compact {
+            format!("{}.{}", module_label(item.module), item.label)
+        } else {
+            item.label.to_string()
+        };
+        let key_cell = pad_to_width(&truncate_end(&key_source, key_width), key_width);
+        let value_raw = display_value(config_value_by_key(cfg, item.key), item.secret);
+        let value_cell = truncate_middle(&value_raw, value_width);
+        rows.push(ListItem::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(key_cell, theme.key),
+            Span::raw(" "),
+            Span::styled(value_cell, theme.value),
+        ])));
+        row_item_indices.push(Some(idx));
+    }
+
+    (rows, row_item_indices)
+}
+
+fn resolve_tui_density(area: Rect) -> TuiDensity {
+    if area.width < 100 || area.height < 26 {
+        TuiDensity::Compact
+    } else {
+        TuiDensity::Comfortable
+    }
+}
+
+fn help_text_lines(density: TuiDensity) -> Vec<&'static str> {
+    match density {
+        TuiDensity::Compact => vec![
+            "Move: Up/Down, j/k, PgUp/PgDn, Home/End",
+            "Edit: Enter/e | Unset: u | Save: Enter | Cancel: Esc",
+            "Help: ? or F1 | Quit: q",
+        ],
+        TuiDensity::Comfortable => vec![
+            "Navigation: Up/Down, j/k, PgUp/PgDn, Home/End",
+            "Edit selected item: Enter or e",
+            "Unset selected item: u",
+            "Save edit: Enter (empty value unsets)",
+            "Cancel edit: Esc",
+            "Toggle this panel: ? or F1",
+            "Quit: q",
+        ],
+    }
+}
+
+fn truncate_end(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let head: String = input.chars().take(max_chars - 3).collect();
+    format!("{head}...")
+}
+
+fn truncate_middle(input: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let head_len = (max_chars - 3) / 2;
+    let tail_len = max_chars - 3 - head_len;
+    let head: String = input.chars().take(head_len).collect();
+    let tail: String = input
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}...{tail}")
+}
+
+fn pad_to_width(input: &str, width: usize) -> String {
+    let len = input.chars().count();
+    if len >= width {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(width);
+    out.push_str(input);
+    out.push_str(&" ".repeat(width - len));
+    out
+}
+
+fn display_order_indices() -> Vec<usize> {
+    let mut out = Vec::with_capacity(CONFIG_ITEMS.len());
+    for module in CONFIG_MODULES {
+        for (idx, item) in CONFIG_ITEMS.iter().enumerate() {
+            if item.module == module {
+                out.push(idx);
+            }
+        }
+    }
+    out
 }
 
 fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
@@ -524,10 +1011,22 @@ fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
 fn config_value_by_key(cfg: &ZaConfig, key: ConfigKey) -> Option<&str> {
     match key {
         ConfigKey::GithubToken => cfg.auth.github_token.as_deref(),
-        ConfigKey::RunHttpProxy => cfg.run.http_proxy.as_deref(),
-        ConfigKey::RunHttpsProxy => cfg.run.https_proxy.as_deref(),
-        ConfigKey::RunAllProxy => cfg.run.all_proxy.as_deref(),
+        ConfigKey::ProxyHttp => cfg.proxy.http_proxy.as_deref(),
+        ConfigKey::ProxyHttps => cfg.proxy.https_proxy.as_deref(),
+        ConfigKey::ProxyAll => cfg.proxy.all_proxy.as_deref(),
+        ConfigKey::ProxyNoProxy => cfg.proxy.no_proxy.as_deref(),
+        ConfigKey::RunHttp => cfg.run.http_proxy.as_deref(),
+        ConfigKey::RunHttps => cfg.run.https_proxy.as_deref(),
+        ConfigKey::RunAll => cfg.run.all_proxy.as_deref(),
         ConfigKey::RunNoProxy => cfg.run.no_proxy.as_deref(),
+        ConfigKey::ToolHttp => cfg.tool.http_proxy.as_deref(),
+        ConfigKey::ToolHttps => cfg.tool.https_proxy.as_deref(),
+        ConfigKey::ToolAll => cfg.tool.all_proxy.as_deref(),
+        ConfigKey::ToolNoProxy => cfg.tool.no_proxy.as_deref(),
+        ConfigKey::UpdateHttp => cfg.update.http_proxy.as_deref(),
+        ConfigKey::UpdateHttps => cfg.update.https_proxy.as_deref(),
+        ConfigKey::UpdateAll => cfg.update.all_proxy.as_deref(),
+        ConfigKey::UpdateNoProxy => cfg.update.no_proxy.as_deref(),
     }
 }
 
@@ -586,6 +1085,33 @@ fn write_config(path: &Path, cfg: &ZaConfig) -> Result<()> {
     Ok(())
 }
 
+fn normalize_proxy_config(cfg: &ProxyConfig) -> ProxyOverrides {
+    ProxyOverrides {
+        http_proxy: cfg.http_proxy.clone().and_then(normalize_value),
+        https_proxy: cfg.https_proxy.clone().and_then(normalize_value),
+        all_proxy: cfg.all_proxy.clone().and_then(normalize_value),
+        no_proxy: cfg.no_proxy.clone().and_then(normalize_value),
+    }
+}
+
+fn merge_proxy_overrides(global: &ProxyOverrides, scoped: &ProxyOverrides) -> ProxyOverrides {
+    ProxyOverrides {
+        http_proxy: scoped
+            .http_proxy
+            .clone()
+            .or_else(|| global.http_proxy.clone()),
+        https_proxy: scoped
+            .https_proxy
+            .clone()
+            .or_else(|| global.https_proxy.clone()),
+        all_proxy: scoped
+            .all_proxy
+            .clone()
+            .or_else(|| global.all_proxy.clone()),
+        no_proxy: scoped.no_proxy.clone().or_else(|| global.no_proxy.clone()),
+    }
+}
+
 fn normalize_token(raw: String) -> Option<String> {
     normalize_value(raw)
 }
@@ -615,4 +1141,31 @@ fn mask_secret(secret: &str) -> String {
         .rev()
         .collect();
     format!("{head}…{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProxyOverrides, merge_proxy_overrides};
+
+    #[test]
+    fn scoped_proxy_overrides_global_values() {
+        let global = ProxyOverrides {
+            http_proxy: Some("http://global-http".to_string()),
+            https_proxy: Some("http://global-https".to_string()),
+            all_proxy: None,
+            no_proxy: Some("localhost".to_string()),
+        };
+        let scoped = ProxyOverrides {
+            http_proxy: None,
+            https_proxy: Some("http://scoped-https".to_string()),
+            all_proxy: Some("socks5://scoped-all".to_string()),
+            no_proxy: None,
+        };
+
+        let merged = merge_proxy_overrides(&global, &scoped);
+        assert_eq!(merged.http_proxy.as_deref(), Some("http://global-http"));
+        assert_eq!(merged.https_proxy.as_deref(), Some("http://scoped-https"));
+        assert_eq!(merged.all_proxy.as_deref(), Some("socks5://scoped-all"));
+        assert_eq!(merged.no_proxy.as_deref(), Some("localhost"));
+    }
 }

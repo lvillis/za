@@ -1,9 +1,94 @@
 use super::*;
 
+const TEMP_DIR_PREFIX_DOWNLOAD: &str = "za-tool-download";
+const TEMP_DIR_PREFIX_CARGO_INSTALL: &str = "za-tool-cargo-install";
+const TEMP_DIR_PREFIXES: [&str; 2] = [TEMP_DIR_PREFIX_DOWNLOAD, TEMP_DIR_PREFIX_CARGO_INSTALL];
+
+static ACTIVE_TEMP_DIRS: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+pub(super) fn unregister_temp_dir(path: &Path) {
+    if let Ok(mut dirs) = ACTIVE_TEMP_DIRS.lock() {
+        dirs.remove(path);
+    }
+}
+
+pub(super) fn cleanup_stale_temp_dirs() -> usize {
+    let base = env::temp_dir();
+    let Ok(entries) = fs::read_dir(&base) else {
+        return 0;
+    };
+
+    let active = ACTIVE_TEMP_DIRS
+        .lock()
+        .map(|dirs| dirs.clone())
+        .unwrap_or_default();
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if active.contains(&path) {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(prefix) = matched_temp_prefix(&name) else {
+            continue;
+        };
+        let Some(pid) = parse_temp_dir_pid(&name, prefix) else {
+            continue;
+        };
+        if pid == std::process::id() || process_is_alive(pid) {
+            continue;
+        }
+        if fs::remove_dir_all(&path).is_ok() {
+            removed = removed.saturating_add(1);
+        }
+    }
+    removed
+}
+
+fn matched_temp_prefix(name: &str) -> Option<&'static str> {
+    TEMP_DIR_PREFIXES
+        .iter()
+        .copied()
+        .find(|prefix| name.starts_with(prefix))
+}
+
+fn parse_temp_dir_pid(name: &str, prefix: &str) -> Option<u32> {
+    let rest = name.strip_prefix(prefix)?.strip_prefix('-')?;
+    let (_, pid) = rest.rsplit_once('-')?;
+    pid.parse::<u32>().ok()
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    false
+}
+
+fn register_temp_dir(path: &Path) {
+    if let Ok(mut dirs) = ACTIVE_TEMP_DIRS.lock() {
+        dirs.insert(path.to_path_buf());
+    }
+}
+
 pub(super) fn resolve_requested_version(
     name: &str,
     requested_version: Option<&str>,
+    proxy_scope: za_config::ProxyScope,
 ) -> Result<String> {
+    ensure_not_interrupted()?;
+
     if let Some(v) = requested_version {
         let v = normalize_version(v);
         if v.is_empty() {
@@ -21,10 +106,15 @@ pub(super) fn resolve_requested_version(
     let Some(release) = policy.github_release else {
         bail!("latest version resolution is not defined for `{name}`");
     };
-    fetch_latest_version_from_github_release(release)
+    fetch_latest_version_from_github_release(release, proxy_scope)
 }
 
-pub(super) fn resolve_install_source(tool: &ToolRef) -> Result<PullSource> {
+pub(super) fn resolve_install_source(
+    tool: &ToolRef,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<PullSource> {
+    ensure_not_interrupted()?;
+
     let Some(policy) = find_tool_policy(&tool.name) else {
         bail!(
             "unsupported tool `{}`: no built-in source policy. currently supported: {}",
@@ -36,7 +126,7 @@ pub(super) fn resolve_install_source(tool: &ToolRef) -> Result<PullSource> {
     let mut errors = Vec::new();
 
     if let Some(release) = policy.github_release {
-        match download_from_github_release(tool, release) {
+        match download_from_github_release(tool, release, proxy_scope) {
             Ok(src) => return Ok(src),
             Err(err) => errors.push(format!("github release: {err:#}")),
         }
@@ -71,15 +161,21 @@ struct GithubReleaseAsset {
 
 pub(super) fn fetch_latest_version_from_github_release(
     policy: GithubReleasePolicy,
+    proxy_scope: za_config::ProxyScope,
 ) -> Result<String> {
     let release = fetch_github_release(
         policy.project_label,
         &format!("/repos/{}/{}/releases/latest", policy.owner, policy.repo),
+        proxy_scope,
     )?;
     parse_release_version(&release.tag_name, policy.tag_prefix)
 }
 
-fn download_from_github_release(tool: &ToolRef, policy: GithubReleasePolicy) -> Result<PullSource> {
+fn download_from_github_release(
+    tool: &ToolRef,
+    policy: GithubReleasePolicy,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<PullSource> {
     let version = normalize_version(&tool.version);
     let expected_asset_name = (policy.expected_asset_name)(&version)?;
     let tag = format!("{}{}", policy.tag_prefix, version);
@@ -87,7 +183,7 @@ fn download_from_github_release(tool: &ToolRef, policy: GithubReleasePolicy) -> 
         "/repos/{}/{}/releases/tags/{tag}",
         policy.owner, policy.repo
     );
-    let release = fetch_github_release(policy.project_label, &path)?;
+    let release = fetch_github_release(policy.project_label, &path, proxy_scope)?;
     let asset = release
         .assets
         .iter()
@@ -101,61 +197,76 @@ fn download_from_github_release(tool: &ToolRef, policy: GithubReleasePolicy) -> 
         .and_then(parse_github_sha256_digest)
         .ok_or_else(|| anyhow!("release asset `{}` missing valid sha256 digest", asset.name))?;
 
-    download_from_url(tool, &asset.browser_download_url, Some(&expected_sha256))
+    download_from_url(
+        tool,
+        &asset.browser_download_url,
+        Some(&expected_sha256),
+        proxy_scope,
+    )
 }
 
 fn install_from_cargo_package(tool: &ToolRef, package: &str) -> Result<PullSource> {
-    let install_root = unique_temp_dir("za-tool-cargo-install")?;
-    let root_arg = install_root.to_string_lossy().to_string();
-    let version = normalize_version(&tool.version);
+    ensure_not_interrupted()?;
+    let install_root = unique_temp_dir(TEMP_DIR_PREFIX_CARGO_INSTALL)?;
+    let run = (|| -> Result<PullSource> {
+        let root_arg = install_root.to_string_lossy().to_string();
+        let version = normalize_version(&tool.version);
 
-    let output = Command::new("cargo")
-        .arg("install")
-        .arg("--locked")
-        .arg("--version")
-        .arg(&version)
-        .arg(package)
-        .arg("--root")
-        .arg(&root_arg)
-        .output()
-        .context("run `cargo install`")?;
+        let output = Command::new("cargo")
+            .arg("install")
+            .arg("--locked")
+            .arg("--version")
+            .arg(&version)
+            .arg(package)
+            .arg("--root")
+            .arg(&root_arg)
+            .output()
+            .context("run `cargo install`")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("`cargo install` failed: {}", stderr.trim());
-    }
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("`cargo install` failed: {}", stderr.trim());
+        }
+        ensure_not_interrupted()?;
 
-    let bin_dir = install_root.join("bin");
-    let mut candidates = command_candidates(&tool.name);
-    if !candidates.iter().any(|c| c == "codex") {
-        candidates.push("codex".to_string());
-    }
+        let bin_dir = install_root.join("bin");
+        let mut candidates = command_candidates(&tool.name);
+        if !candidates.iter().any(|c| c == "codex") {
+            candidates.push("codex".to_string());
+        }
 
-    for candidate in candidates {
-        let p = bin_dir.join(&candidate);
-        if is_executable_file(&p) {
+        for candidate in candidates {
+            let p = bin_dir.join(&candidate);
+            if is_executable_file(&p) {
+                return Ok(PullSource::temp(
+                    p,
+                    format!("cargo install {package}"),
+                    install_root.clone(),
+                ));
+            }
+        }
+
+        let mut files = Vec::new();
+        collect_files_recursive(&bin_dir, &mut files)?;
+        if files.len() == 1 {
             return Ok(PullSource::temp(
-                p,
+                files.remove(0),
                 format!("cargo install {package}"),
-                install_root,
+                install_root.clone(),
             ));
         }
-    }
 
-    let mut files = Vec::new();
-    collect_files_recursive(&bin_dir, &mut files)?;
-    if files.len() == 1 {
-        return Ok(PullSource::temp(
-            files.remove(0),
-            format!("cargo install {package}"),
-            install_root,
-        ));
-    }
+        bail!(
+            "could not determine installed executable in {}",
+            bin_dir.display()
+        )
+    })();
 
-    bail!(
-        "could not determine installed executable in {}",
-        bin_dir.display()
-    )
+    if run.is_err() {
+        unregister_temp_dir(&install_root);
+        let _ = fs::remove_dir_all(&install_root);
+    }
+    run
 }
 
 const HTTPS_PROXY_ENV_KEYS: [&str; 6] = [
@@ -198,8 +309,31 @@ pub(super) fn split_no_proxy_rules(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn apply_proxy_from_env(mut builder: ClientBuilder, scheme: &str) -> Result<ClientBuilder> {
-    let Some((proxy_var, proxy_value)) = first_env_value(proxy_env_keys_for_scheme(scheme)) else {
+fn apply_proxy_with_scope(
+    mut builder: ClientBuilder,
+    scheme: &str,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<ClientBuilder> {
+    let overrides = za_config::load_proxy_overrides(proxy_scope)?;
+    let proxy_value = if scheme.eq_ignore_ascii_case("https") {
+        overrides
+            .https_proxy
+            .clone()
+            .or_else(|| overrides.all_proxy.clone())
+            .or_else(|| overrides.http_proxy.clone())
+    } else {
+        overrides
+            .http_proxy
+            .clone()
+            .or_else(|| overrides.all_proxy.clone())
+            .or_else(|| overrides.https_proxy.clone())
+    };
+
+    let (proxy_var, proxy_value) = if let Some(value) = proxy_value {
+        ("config".to_string(), value)
+    } else if let Some((name, value)) = first_env_value(proxy_env_keys_for_scheme(scheme)) {
+        (name, value)
+    } else {
         return Ok(builder);
     };
 
@@ -208,7 +342,11 @@ fn apply_proxy_from_env(mut builder: ClientBuilder, scheme: &str) -> Result<Clie
         .with_context(|| format!("invalid proxy URI in `{proxy_var}`"))?;
     builder = builder.http_proxy(proxy_uri);
 
-    if let Some((_, no_proxy_raw)) = first_env_value(&["NO_PROXY", "no_proxy"]) {
+    let no_proxy_raw = overrides
+        .no_proxy
+        .clone()
+        .or_else(|| first_env_value(&["NO_PROXY", "no_proxy"]).map(|(_, value)| value));
+    if let Some(no_proxy_raw) = no_proxy_raw {
         let rules = split_no_proxy_rules(&no_proxy_raw);
         if !rules.is_empty() {
             builder = builder
@@ -220,7 +358,12 @@ fn apply_proxy_from_env(mut builder: ClientBuilder, scheme: &str) -> Result<Clie
     Ok(builder)
 }
 
-fn build_http_client(base_url: &str, client_name: &str, follow_redirects: bool) -> Result<Client> {
+fn build_http_client(
+    base_url: &str,
+    client_name: &str,
+    follow_redirects: bool,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<Client> {
     let mut builder = Client::builder(base_url)
         .request_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .total_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
@@ -233,15 +376,21 @@ fn build_http_client(base_url: &str, client_name: &str, follow_redirects: bool) 
         .split_once("://")
         .map(|(s, _)| s)
         .unwrap_or("https");
-    builder = apply_proxy_from_env(builder, scheme)
+    builder = apply_proxy_with_scope(builder, scheme, proxy_scope)
         .with_context(|| format!("configure HTTP client proxy for `{base_url}`"))?;
     builder
         .build()
         .with_context(|| format!("build HTTP client for `{base_url}`"))
 }
 
-fn fetch_github_release(project_label: &str, path: &str) -> Result<GithubRelease> {
-    let client = build_http_client(GITHUB_API_BASE, "za-tool-manager", false)
+fn fetch_github_release(
+    project_label: &str,
+    path: &str,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<GithubRelease> {
+    ensure_not_interrupted()?;
+
+    let client = build_http_client(GITHUB_API_BASE, "za-tool-manager", false, proxy_scope)
         .context("build GitHub API client")?;
     let github_token = resolve_github_token()?;
 
@@ -318,89 +467,101 @@ fn download_from_url(
     tool: &ToolRef,
     url: &str,
     expected_sha256: Option<&str>,
+    proxy_scope: za_config::ProxyScope,
 ) -> Result<PullSource> {
-    let download_root = unique_temp_dir("za-tool-download")?;
-    let url_parts = parse_url_parts(url)?;
-    let asset_name = url_parts.file_name.clone();
-    let asset_path = download_root.join(&asset_name);
+    ensure_not_interrupted()?;
+    let download_root = unique_temp_dir(TEMP_DIR_PREFIX_DOWNLOAD)?;
+    let run = (|| -> Result<PullSource> {
+        let url_parts = parse_url_parts(url)?;
+        let asset_name = url_parts.file_name.clone();
+        let asset_path = download_root.join(&asset_name);
 
-    let client = build_http_client(&url_parts.base_url, "za-tool-manager", true)
-        .context("build HTTP client")?;
-    let mut req = client.get(url_parts.path_and_query);
-    req = req
-        .try_header("user-agent", HTTP_USER_AGENT)
-        .context("set download user-agent")?;
-    let mut resp = req
-        .send_stream()
-        .with_context(|| format!("download from `{url}` ({PROXY_HINT})"))?;
-    let total_bytes = resp
-        .headers()
-        .get("content-length")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok());
+        let client = build_http_client(&url_parts.base_url, "za-tool-manager", true, proxy_scope)
+            .context("build HTTP client")?;
+        let mut req = client.get(url_parts.path_and_query);
+        req = req
+            .try_header("user-agent", HTTP_USER_AGENT)
+            .context("set download user-agent")?;
+        let mut resp = req
+            .send_stream()
+            .with_context(|| format!("download from `{url}` ({PROXY_HINT})"))?;
+        let total_bytes = resp
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok());
 
-    let mut out = File::create(&asset_path)
-        .with_context(|| format!("create downloaded file {}", asset_path.display()))?;
-    let mut chunk = [0_u8; 64 * 1024];
-    let mut downloaded = 0_u64;
-    let start = Instant::now();
-    let mut last_report = Instant::now();
-    let use_tty_line = io::stderr().is_terminal();
-    if use_tty_line {
-        eprint!(
-            "\r{}",
-            render_download_progress(downloaded, total_bytes, start.elapsed())
-        );
-        let _ = io::stderr().flush();
-    }
-    loop {
-        let read = resp
-            .read_chunk(&mut chunk)
-            .with_context(|| format!("read bytes from `{url}`"))?;
-        if read == 0 {
-            break;
+        let mut out = File::create(&asset_path)
+            .with_context(|| format!("create downloaded file {}", asset_path.display()))?;
+        let mut chunk = [0_u8; 64 * 1024];
+        let mut downloaded = 0_u64;
+        let start = Instant::now();
+        let mut last_report = Instant::now();
+        let use_tty_line = io::stderr().is_terminal();
+        if use_tty_line {
+            eprint!(
+                "\r{}",
+                render_download_progress(downloaded, total_bytes, start.elapsed())
+            );
+            let _ = io::stderr().flush();
         }
-        out.write_all(&chunk[..read])
-            .with_context(|| format!("write downloaded file {}", asset_path.display()))?;
-        downloaded = downloaded.saturating_add(read as u64);
+        loop {
+            ensure_not_interrupted()?;
+            let read = resp
+                .read_chunk(&mut chunk)
+                .with_context(|| format!("read bytes from `{url}`"))?;
+            if read == 0 {
+                break;
+            }
+            out.write_all(&chunk[..read])
+                .with_context(|| format!("write downloaded file {}", asset_path.display()))?;
+            downloaded = downloaded.saturating_add(read as u64);
+            report_download_progress(
+                downloaded,
+                total_bytes,
+                start.elapsed(),
+                &mut last_report,
+                false,
+                use_tty_line,
+            );
+        }
         report_download_progress(
             downloaded,
             total_bytes,
             start.elapsed(),
             &mut last_report,
-            false,
+            true,
             use_tty_line,
         );
+        out.flush()
+            .with_context(|| format!("flush downloaded file {}", asset_path.display()))?;
+        ensure_not_interrupted()?;
+
+        if let Some(expected_sha256) = expected_sha256 {
+            verify_sha256_file(&asset_path, expected_sha256)?;
+        }
+
+        let executable_path = if is_tar_gz_asset(&asset_name) {
+            extract_tar_gz_executable(tool, &asset_path, &download_root)?
+        } else {
+            asset_path
+        };
+
+        Ok(PullSource::temp(
+            executable_path,
+            match expected_sha256 {
+                Some(expected) => format!("URL {url} (sha256={expected})"),
+                None => format!("URL {url}"),
+            },
+            download_root.clone(),
+        ))
+    })();
+
+    if run.is_err() {
+        unregister_temp_dir(&download_root);
+        let _ = fs::remove_dir_all(&download_root);
     }
-    report_download_progress(
-        downloaded,
-        total_bytes,
-        start.elapsed(),
-        &mut last_report,
-        true,
-        use_tty_line,
-    );
-    out.flush()
-        .with_context(|| format!("flush downloaded file {}", asset_path.display()))?;
-
-    if let Some(expected_sha256) = expected_sha256 {
-        verify_sha256_file(&asset_path, expected_sha256)?;
-    }
-
-    let executable_path = if is_tar_gz_asset(&asset_name) {
-        extract_tar_gz_executable(tool, &asset_path, &download_root)?
-    } else {
-        asset_path
-    };
-
-    Ok(PullSource::temp(
-        executable_path,
-        match expected_sha256 {
-            Some(expected) => format!("URL {url} (sha256={expected})"),
-            None => format!("URL {url}"),
-        },
-        download_root,
-    ))
+    run
 }
 
 #[cfg(test)]
@@ -645,5 +806,45 @@ fn unique_temp_dir(prefix: &str) -> Result<PathBuf> {
     let pid = std::process::id();
     let dir = base.join(format!("{prefix}-{ts}-{pid}"));
     fs::create_dir(&dir).with_context(|| format!("create temp dir {}", dir.display()))?;
+    register_temp_dir(&dir);
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TEMP_DIR_PREFIX_DOWNLOAD, matched_temp_prefix, parse_temp_dir_pid};
+
+    #[test]
+    fn parse_temp_dir_pid_accepts_expected_layout() {
+        let name = "za-tool-download-123456789-4242";
+        assert_eq!(
+            parse_temp_dir_pid(name, TEMP_DIR_PREFIX_DOWNLOAD),
+            Some(4242)
+        );
+    }
+
+    #[test]
+    fn parse_temp_dir_pid_rejects_unknown_layout() {
+        assert_eq!(
+            parse_temp_dir_pid("za-tool-download", "za-tool-download"),
+            None
+        );
+        assert_eq!(
+            parse_temp_dir_pid("za-tool-download-abc-xyz", "za-tool-download"),
+            None
+        );
+    }
+
+    #[test]
+    fn matched_temp_prefix_finds_known_prefixes() {
+        assert_eq!(
+            matched_temp_prefix("za-tool-download-1-2"),
+            Some("za-tool-download")
+        );
+        assert_eq!(
+            matched_temp_prefix("za-tool-cargo-install-1-2"),
+            Some("za-tool-cargo-install")
+        );
+        assert_eq!(matched_temp_prefix("za-other-1-2"), None);
+    }
 }

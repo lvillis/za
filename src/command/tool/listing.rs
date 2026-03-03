@@ -521,7 +521,7 @@ fn resolve_latest_for_policy(policy: ToolPolicy) -> LatestCheck {
     let Some(release) = policy.github_release else {
         return LatestCheck::Unsupported;
     };
-    match source::fetch_latest_version_from_github_release(release) {
+    match source::fetch_latest_version_from_github_release(release, za_config::ProxyScope::Tool) {
         Ok(version) => LatestCheck::Latest(version),
         Err(err) => LatestCheck::Error(format!("{err:#}")),
     }

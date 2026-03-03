@@ -84,7 +84,7 @@ za deps --fail-on-high
 | `za tool` | Install/update/list/use/uninstall managed binaries. |
 | `za run` | Launch a tool directly with normalized proxy environment variables. |
 | `za deps` | Audit Rust dependency maintenance risk. |
-| `za config` | Persist global CLI config (`[auth]` and `[run]` modules). |
+| `za config` | Persist CLI config (`[auth]`, `[proxy]`, `[run]`, `[tool]`, `[update]`). |
 
 ## Tool Management
 
@@ -147,6 +147,8 @@ za tool uninstall codex:0.104.0
 za tool uninstall codex
 ```
 
+`za tool update` is interruption-safe: pressing `Ctrl+C` aborts cleanly and temporary download directories are removed automatically (stale leftovers are cleaned on next run).
+
 ### Existing binaries adoption
 
 If a supported unmanaged binary is already present in scope bin path (for example `/usr/local/bin/codex`), `za tool install <tool>` adopts it first by detecting local version.
@@ -168,11 +170,12 @@ Resolution order:
 
 ### Proxy behavior
 
-`za run`, `za tool`, and `za deps` respect proxy environment variables:
+`za run`, `za tool`, `za update`, and `za deps` respect proxy settings:
 
 - HTTPS: `HTTPS_PROXY` -> `ALL_PROXY` -> `HTTP_PROXY`
 - HTTP: `HTTP_PROXY` -> `ALL_PROXY`
 - Bypass: `NO_PROXY` / `no_proxy`
+- Config scopes: `[proxy]` defaults, overridden by `[run]` / `[tool]` / `[update]`
 
 Example:
 
@@ -217,14 +220,29 @@ za config unset github-token
 za config path
 ```
 
-Set global `za run` proxy once (works from any directory):
+Interactive `za config` keymap:
+
+- Move: `Up/Down`, `j/k`, `PgUp/PgDn`, `Home/End`
+- Edit selected: `Enter` or `e`
+- Unset selected: `u`
+- Save edit: `Enter` (empty value unsets)
+- Cancel edit: `Esc`
+- Toggle help panel: `?` or `F1`
+- Quit: `q`
+
+Set global proxy defaults once (works from any directory):
 
 ```bash
-za config set run-http-proxy http://127.0.0.1:1080
-za config set run-https-proxy http://127.0.0.1:1080
-za config set run-no-proxy localhost,127.0.0.1,.corp.local
+za config set proxy-http http://127.0.0.1:1080
+za config set proxy-https http://127.0.0.1:1080
+za config set proxy-no-proxy localhost,127.0.0.1,.corp.local
+
+# optional scope override
+za config set tool-https http://127.0.0.1:1080
 
 za run codex
+za tool update codex
+za update
 ```
 
 Resulting config layout (`za config path`):
@@ -233,10 +251,17 @@ Resulting config layout (`za config path`):
 [auth]
 github_token = "ghp_xxx"
 
-[run]
+[proxy]
 http_proxy = "http://127.0.0.1:1080"
 https_proxy = "http://127.0.0.1:1080"
 no_proxy = "localhost,127.0.0.1,.corp.local"
+
+[run]
+
+[tool]
+https_proxy = "http://127.0.0.1:1080"
+
+[update]
 ```
 
 ## License

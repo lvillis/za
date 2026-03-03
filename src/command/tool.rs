@@ -14,6 +14,7 @@ use reqx::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use signal_hook::{consts::signal::SIGINT, flag as signal_flag};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
@@ -21,7 +22,10 @@ use std::{
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -64,6 +68,42 @@ static VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bv?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z\.-]+)?)\b")
         .expect("version regex compiles")
 });
+static INTERRUPT_REQUESTED: LazyLock<Arc<AtomicBool>> =
+    LazyLock::new(|| Arc::new(AtomicBool::new(false)));
+static SIGNAL_HANDLER_REGISTRATION: LazyLock<Result<(), String>> = LazyLock::new(|| {
+    signal_flag::register(SIGINT, Arc::clone(&INTERRUPT_REQUESTED))
+        .map_err(|err| format!("register SIGINT handler: {err}"))?;
+    #[cfg(unix)]
+    signal_flag::register(
+        signal_hook::consts::signal::SIGTERM,
+        Arc::clone(&INTERRUPT_REQUESTED),
+    )
+    .map_err(|err| format!("register SIGTERM handler: {err}"))?;
+    Ok(())
+});
+
+fn prepare_interruptible_tool_operation() -> Result<()> {
+    if let Err(err) = &*SIGNAL_HANDLER_REGISTRATION {
+        bail!("failed to initialize interrupt handlers: {err}");
+    }
+    INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
+    let removed = source::cleanup_stale_temp_dirs();
+    if removed > 0 {
+        eprintln!("🧹 Cleaned {removed} stale temp dir(s) from previous interrupted runs");
+    }
+    Ok(())
+}
+
+pub(super) fn is_interrupt_requested() -> bool {
+    INTERRUPT_REQUESTED.load(Ordering::SeqCst)
+}
+
+pub(super) fn ensure_not_interrupted() -> Result<()> {
+    if is_interrupt_requested() {
+        bail!("operation interrupted by user");
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolScope {
@@ -85,6 +125,8 @@ impl ToolScope {
 }
 
 pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
+    prepare_interruptible_tool_operation()?;
+
     let scope = ToolScope::from_flags(user);
     let home = ToolHome::detect(scope)?;
 
@@ -128,10 +170,22 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
 
     match cmd {
         ToolCommands::Install { spec } => {
-            let _ = install(&home, &spec, ToolAction::Install, false)?;
+            let _ = install(
+                &home,
+                &spec,
+                ToolAction::Install,
+                false,
+                za_config::ProxyScope::Tool,
+            )?;
         }
         ToolCommands::Update { spec } => {
-            let _ = install(&home, &spec, ToolAction::Update, true)?;
+            let _ = install(
+                &home,
+                &spec,
+                ToolAction::Update,
+                true,
+                za_config::ProxyScope::Tool,
+            )?;
         }
         ToolCommands::Sync { file } => sync_manifest(&home, &file)?,
         ToolCommands::Use { image } => use_tool(&home, &image)?,
@@ -143,6 +197,8 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
 }
 
 pub fn update_self(user: bool, check: bool, version: Option<String>) -> Result<i32> {
+    prepare_interruptible_tool_operation()?;
+
     let scope = ToolScope::from_flags(user);
     let home = ToolHome::detect(scope)?;
 
@@ -171,12 +227,18 @@ pub fn update_self(user: bool, check: bool, version: Option<String>) -> Result<i
     };
 
     let requested = version.as_deref();
-    let target_version = resolve_requested_version("za", requested)?;
+    let target_version = resolve_requested_version("za", requested, za_config::ProxyScope::Update)?;
     let target_spec = format!("za:{target_version}");
     let previous_active = read_current_version(&home, "za")?;
     let backup = backup_existing_self_binary(&home)?;
 
-    let installed = install(&home, &target_spec, ToolAction::Update, false)?;
+    let installed = install(
+        &home,
+        &target_spec,
+        ToolAction::Update,
+        false,
+        za_config::ProxyScope::Update,
+    )?;
     if let Err(err) = verify_self_update(&home, &installed) {
         let rollback_res =
             rollback_self_update(&home, previous_active.as_deref(), backup.as_deref());
@@ -204,7 +266,11 @@ pub fn update_self(user: bool, check: bool, version: Option<String>) -> Result<i
 
 fn check_self_update(requested_version: &Option<String>) -> Result<i32> {
     let current = normalize_version(env!("CARGO_PKG_VERSION"));
-    let target = resolve_requested_version("za", requested_version.as_deref())?;
+    let target = resolve_requested_version(
+        "za",
+        requested_version.as_deref(),
+        za_config::ProxyScope::Update,
+    )?;
 
     println!("Current za: {current}");
     if requested_version.is_some() {
@@ -335,6 +401,7 @@ impl PullSource {
 impl Drop for PullSource {
     fn drop(&mut self) {
         if let Some(root) = &self.cleanup_root {
+            source::unregister_temp_dir(root);
             let _ = fs::remove_dir_all(root);
         }
     }
@@ -560,7 +627,10 @@ fn install(
     spec: &str,
     action: ToolAction,
     prune_after_update_activation: bool,
+    proxy_scope: za_config::ProxyScope,
 ) -> Result<ToolRef> {
+    ensure_not_interrupted()?;
+
     let mut requested = ToolSpec::parse(spec)?;
     requested.name = canonical_tool_name(&requested.name);
     let adoption = if action == ToolAction::Update {
@@ -578,11 +648,13 @@ fn install(
         adopted.version.clone()
     } else if action == ToolAction::Update {
         println!("🔎 Resolving latest release for `{}`...", requested.name);
-        resolve_requested_version(&requested.name, None)?
+        resolve_requested_version(&requested.name, None, proxy_scope)?
     } else {
-        resolve_requested_version(&requested.name, None)?
+        resolve_requested_version(&requested.name, None, proxy_scope)?
     };
     let tool = requested.resolve(version);
+    ensure_not_interrupted()?;
+
     let previous_active = read_current_version(home, &tool.name)?;
     let dst = home.install_path(&tool);
     let already_installed = dst.exists();
@@ -618,10 +690,12 @@ fn install(
                 detail: format!("existing binary {}", adopted.path.display()),
             }
         } else {
+            ensure_not_interrupted()?;
             if action == ToolAction::Update {
                 println!("⬇️  Downloading `{}` {} ...", tool.name, tool.version);
             }
-            let src = resolve_install_source(&tool)?;
+            let src = resolve_install_source(&tool, proxy_scope)?;
+            ensure_not_interrupted()?;
             copy_executable(&src.path, &dst)?;
             InstallSource {
                 kind: SOURCE_KIND_DOWNLOAD,
@@ -666,8 +740,15 @@ fn sync_manifest(home: &ToolHome, file: &Path) -> Result<()> {
 
     let mut failures = Vec::new();
     for (idx, spec) in specs.iter().enumerate() {
+        ensure_not_interrupted()?;
         println!("➡️  [{}/{}] {}", idx + 1, specs.len(), spec);
-        if let Err(err) = install(home, spec, ToolAction::Update, true) {
+        if let Err(err) = install(
+            home,
+            spec,
+            ToolAction::Update,
+            true,
+            za_config::ProxyScope::Tool,
+        ) {
             failures.push(format!("{spec}: {err:#}"));
         }
     }
@@ -1061,7 +1142,8 @@ fn copy_executable(src: &Path, dst: &Path) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let tmp = dst.with_extension("tmp");
+    let tmp = dst.with_extension(format!("tmp-copy-{}", std::process::id()));
+    remove_file_if_exists(&tmp)?;
     fs::copy(src, &tmp).with_context(|| format!("copy {} -> {}", src.display(), tmp.display()))?;
 
     #[cfg(unix)]
@@ -1071,10 +1153,31 @@ fn copy_executable(src: &Path, dst: &Path) -> Result<()> {
         fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
     }
 
-    if dst.exists() {
-        fs::remove_file(dst)?;
+    if let Err(err) = fs::rename(&tmp, dst) {
+        #[cfg(windows)]
+        {
+            if err.kind() == io::ErrorKind::AlreadyExists {
+                remove_file_if_exists(dst)?;
+                fs::rename(&tmp, dst).with_context(|| {
+                    format!(
+                        "replace executable {} with {}",
+                        dst.display(),
+                        tmp.display()
+                    )
+                })?;
+            } else {
+                let _ = remove_file_if_exists(&tmp);
+                return Err(err)
+                    .with_context(|| format!("rename {} -> {}", tmp.display(), dst.display()));
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = remove_file_if_exists(&tmp);
+            return Err(err)
+                .with_context(|| format!("rename {} -> {}", tmp.display(), dst.display()));
+        }
     }
-    fs::rename(&tmp, dst)?;
     Ok(())
 }
 
@@ -1136,13 +1239,16 @@ fn set_current_version(home: &ToolHome, tool: &ToolRef) -> Result<()> {
     writeln!(f, "{}", tool.version)?;
     f.flush()
         .with_context(|| format!("flush {}", tmp.display()))?;
-    fs::rename(&tmp, &p).with_context(|| {
-        format!(
-            "replace current version {} -> {}",
-            p.display(),
-            tmp.display()
-        )
-    })?;
+    if let Err(err) = fs::rename(&tmp, &p) {
+        let _ = remove_file_if_exists(&tmp);
+        return Err(err).with_context(|| {
+            format!(
+                "replace current version {} -> {}",
+                p.display(),
+                tmp.display()
+            )
+        });
+    }
     Ok(())
 }
 
@@ -1175,8 +1281,12 @@ fn link_executable(src: &Path, dst: &Path) -> Result<()> {
     remove_file_if_exists(&tmp)?;
     symlink(&src, &tmp)
         .with_context(|| format!("symlink {} -> {}", tmp.display(), src.display()))?;
-    fs::rename(&tmp, dst)
-        .with_context(|| format!("activate link {} -> {}", dst.display(), src.display()))
+    if let Err(err) = fs::rename(&tmp, dst) {
+        let _ = remove_file_if_exists(&tmp);
+        return Err(err)
+            .with_context(|| format!("activate link {} -> {}", dst.display(), src.display()));
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
