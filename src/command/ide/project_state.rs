@@ -22,7 +22,11 @@ fn remote_dev_recent_dir() -> Option<PathBuf> {
 
 pub(super) fn load_remote_session_state_by_pid() -> HashMap<i32, RemoteSessionState> {
     let mut state_by_pid = load_recent_remote_session_state_by_pid();
-    toolbox_status::merge_toolbox_status_state(&mut state_by_pid);
+    let identity_hints = state_by_pid
+        .values()
+        .filter_map(|state| state.ide_identity_string.clone())
+        .collect::<HashSet<_>>();
+    toolbox_status::merge_toolbox_status_state(&mut state_by_pid, &identity_hints);
     state_by_pid
 }
 

@@ -5,7 +5,7 @@ use super::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
@@ -13,8 +13,8 @@ use std::{
     time::Duration,
 };
 
-const TOOLBOX_STATUS_CONNECT_TIMEOUT_MS: u64 = 350;
-const TOOLBOX_STATUS_IO_TIMEOUT_MS: u64 = 1200;
+const TOOLBOX_STATUS_CONNECT_TIMEOUT_MS: u64 = 150;
+const TOOLBOX_STATUS_IO_TIMEOUT_MS: u64 = 450;
 const TOOLBOX_STATUS_PATH: &str = "/api/toolbox/status";
 
 #[derive(Debug, Default)]
@@ -64,8 +64,11 @@ struct ToolboxOpenProject {
     path: Option<String>,
 }
 
-pub(super) fn merge_toolbox_status_state(state_by_pid: &mut HashMap<i32, RemoteSessionState>) {
-    let status_by_pid = load_toolbox_status_session_state_by_pid();
+pub(super) fn merge_toolbox_status_state(
+    state_by_pid: &mut HashMap<i32, RemoteSessionState>,
+    identity_hints: &HashSet<String>,
+) {
+    let status_by_pid = load_toolbox_status_session_state_by_pid(identity_hints);
     for (pid, status) in status_by_pid {
         let current = state_by_pid.entry(pid).or_default();
         if status.freshest_snapshot_millis >= current.freshest_snapshot_millis {
@@ -111,7 +114,9 @@ fn merge_status_projects(
     status_projects
 }
 
-fn load_toolbox_status_session_state_by_pid() -> HashMap<i32, ToolboxStatusSessionState> {
+fn load_toolbox_status_session_state_by_pid(
+    identity_hints: &HashSet<String>,
+) -> HashMap<i32, ToolboxStatusSessionState> {
     let Some(config_dir) = jetbrains_config_dir() else {
         return HashMap::new();
     };
@@ -120,12 +125,16 @@ fn load_toolbox_status_session_state_by_pid() -> HashMap<i32, ToolboxStatusSessi
         Err(_) => return HashMap::new(),
     };
     let mut out = HashMap::new();
+    let mut seen_endpoints = HashSet::new();
     for identity_entry in identity_entries.flatten() {
         let identity_dir = identity_entry.path();
         if !identity_dir.is_dir() {
             continue;
         }
         let ide_identity = normalize_project_path(&identity_dir.display().to_string());
+        if !identity_hints.is_empty() && !identity_hints.contains(&ide_identity) {
+            continue;
+        }
         let vmoptions_entries = match fs::read_dir(&identity_dir) {
             Ok(entries) => entries,
             Err(_) => continue,
@@ -150,6 +159,9 @@ fn load_toolbox_status_session_state_by_pid() -> HashMap<i32, ToolboxStatusSessi
             let Some(port) = read_toolbox_port_from_file(&port_file) else {
                 continue;
             };
+            if !seen_endpoints.insert((port, token.clone())) {
+                continue;
+            }
             let Some(status) = fetch_toolbox_status_via_local_http(port, &token) else {
                 continue;
             };
@@ -314,13 +326,21 @@ Connection: close\r\n\
     loop {
         match stream.read(&mut buf) {
             Ok(0) => break,
-            Ok(read) => raw.extend_from_slice(&buf[..read]),
+            Ok(read) => {
+                raw.extend_from_slice(&buf[..read]);
+                if let Some(response) = decode_http_local_response(&raw) {
+                    return Ok(response);
+                }
+            }
             Err(err)
                 if matches!(
                     err.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
+                if let Some(response) = decode_http_local_response(&raw) {
+                    return Ok(response);
+                }
                 break;
             }
             Err(err) => return Err(err).context("read toolbox status HTTP response"),
