@@ -27,15 +27,16 @@ use std::{
 const CONFIG_DIR_NAME: &str = "za";
 const CONFIG_FILE_NAME: &str = "config.toml";
 
-const CONFIG_MODULES: [ConfigModule; 5] = [
+const CONFIG_MODULES: [ConfigModule; 6] = [
     ConfigModule::Auth,
     ConfigModule::Proxy,
     ConfigModule::Run,
     ConfigModule::Tool,
     ConfigModule::Update,
+    ConfigModule::Ide,
 ];
 
-const CONFIG_ITEMS: [ConfigItem; 17] = [
+const CONFIG_ITEMS: [ConfigItem; 19] = [
     ConfigItem {
         key: ConfigKey::GithubToken,
         module: ConfigModule::Auth,
@@ -138,6 +139,18 @@ const CONFIG_ITEMS: [ConfigItem; 17] = [
         label: "no-proxy",
         secret: false,
     },
+    ConfigItem {
+        key: ConfigKey::IdeMaxPerProject,
+        module: ConfigModule::Ide,
+        label: "max-per-project",
+        secret: false,
+    },
+    ConfigItem {
+        key: ConfigKey::IdeOrphanTtlMinutes,
+        module: ConfigModule::Ide,
+        label: "orphan-ttl-minutes",
+        secret: false,
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -155,6 +168,7 @@ enum ConfigModule {
     Run,
     Tool,
     Update,
+    Ide,
 }
 
 #[derive(Default)]
@@ -250,6 +264,8 @@ struct ZaConfig {
     tool: ProxyConfig,
     #[serde(default)]
     update: ProxyConfig,
+    #[serde(default)]
+    ide: IdeConfig,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -270,6 +286,20 @@ struct ProxyConfig {
     no_proxy: Option<String>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct IdeConfig {
+    #[serde(default)]
+    jetbrains: IdeJetbrainsConfig,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct IdeJetbrainsConfig {
+    #[serde(default)]
+    max_per_project: Option<String>,
+    #[serde(default)]
+    orphan_ttl_minutes: Option<String>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ProxyOverrides {
     pub http_proxy: Option<String>,
@@ -279,6 +309,15 @@ pub struct ProxyOverrides {
 }
 
 pub type RunProxyOverrides = ProxyOverrides;
+
+pub const IDE_MAX_PER_PROJECT_DEFAULT: usize = 1;
+pub const IDE_ORPHAN_TTL_MINUTES_DEFAULT: u64 = 30;
+
+#[derive(Debug, Clone, Copy)]
+pub struct IdeJetbrainsPolicy {
+    pub max_per_project: usize,
+    pub orphan_ttl_minutes: u64,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProxyScope {
@@ -327,6 +366,30 @@ pub fn load_proxy_overrides(scope: ProxyScope) -> Result<ProxyOverrides> {
     Ok(merge_proxy_overrides(&global, &scoped))
 }
 
+pub fn load_ide_jetbrains_policy() -> Result<IdeJetbrainsPolicy> {
+    let Some(path) = maybe_config_path() else {
+        return Ok(IdeJetbrainsPolicy {
+            max_per_project: IDE_MAX_PER_PROJECT_DEFAULT,
+            orphan_ttl_minutes: IDE_ORPHAN_TTL_MINUTES_DEFAULT,
+        });
+    };
+    let cfg = read_config(&path)?;
+    let max_per_project = parse_positive_usize_or_default(
+        cfg.ide.jetbrains.max_per_project.as_deref(),
+        IDE_MAX_PER_PROJECT_DEFAULT,
+        "ide.jetbrains.max_per_project",
+    )?;
+    let orphan_ttl_minutes = parse_positive_u64_or_default(
+        cfg.ide.jetbrains.orphan_ttl_minutes.as_deref(),
+        IDE_ORPHAN_TTL_MINUTES_DEFAULT,
+        "ide.jetbrains.orphan_ttl_minutes",
+    )?;
+    Ok(IdeJetbrainsPolicy {
+        max_per_project,
+        orphan_ttl_minutes,
+    })
+}
+
 fn set_value(key: ConfigKey, value: String) -> Result<()> {
     set_value_impl(key, value, true)?;
     Ok(())
@@ -353,6 +416,8 @@ fn get_value(key: ConfigKey, raw: bool) -> Result<()> {
         ConfigKey::UpdateHttps => cfg.update.https_proxy,
         ConfigKey::UpdateAll => cfg.update.all_proxy,
         ConfigKey::UpdateNoProxy => cfg.update.no_proxy,
+        ConfigKey::IdeMaxPerProject => cfg.ide.jetbrains.max_per_project,
+        ConfigKey::IdeOrphanTtlMinutes => cfg.ide.jetbrains.orphan_ttl_minutes,
     }
     .and_then(normalize_value);
 
@@ -392,6 +457,8 @@ fn set_value_impl(key: ConfigKey, value: String, print_result: bool) -> Result<(
         ConfigKey::UpdateHttps => cfg.update.https_proxy = Some(normalized),
         ConfigKey::UpdateAll => cfg.update.all_proxy = Some(normalized),
         ConfigKey::UpdateNoProxy => cfg.update.no_proxy = Some(normalized),
+        ConfigKey::IdeMaxPerProject => cfg.ide.jetbrains.max_per_project = Some(normalized),
+        ConfigKey::IdeOrphanTtlMinutes => cfg.ide.jetbrains.orphan_ttl_minutes = Some(normalized),
     }
     write_config(&path, &cfg)?;
     if print_result {
@@ -421,6 +488,8 @@ fn unset_value_impl(key: ConfigKey, print_result: bool) -> Result<()> {
         ConfigKey::UpdateHttps => cfg.update.https_proxy = None,
         ConfigKey::UpdateAll => cfg.update.all_proxy = None,
         ConfigKey::UpdateNoProxy => cfg.update.no_proxy = None,
+        ConfigKey::IdeMaxPerProject => cfg.ide.jetbrains.max_per_project = None,
+        ConfigKey::IdeOrphanTtlMinutes => cfg.ide.jetbrains.orphan_ttl_minutes = None,
     }
     write_config(&path, &cfg)?;
     if print_result {
@@ -448,6 +517,8 @@ fn key_label(key: ConfigKey) -> &'static str {
         ConfigKey::UpdateHttps => "update-https",
         ConfigKey::UpdateAll => "update-all",
         ConfigKey::UpdateNoProxy => "update-no-proxy",
+        ConfigKey::IdeMaxPerProject => "ide-max-per-project",
+        ConfigKey::IdeOrphanTtlMinutes => "ide-orphan-ttl-minutes",
     }
 }
 
@@ -462,6 +533,7 @@ fn module_label(module: ConfigModule) -> &'static str {
         ConfigModule::Run => "run",
         ConfigModule::Tool => "tool",
         ConfigModule::Update => "update",
+        ConfigModule::Ide => "ide",
     }
 }
 
@@ -1027,7 +1099,39 @@ fn config_value_by_key(cfg: &ZaConfig, key: ConfigKey) -> Option<&str> {
         ConfigKey::UpdateHttps => cfg.update.https_proxy.as_deref(),
         ConfigKey::UpdateAll => cfg.update.all_proxy.as_deref(),
         ConfigKey::UpdateNoProxy => cfg.update.no_proxy.as_deref(),
+        ConfigKey::IdeMaxPerProject => cfg.ide.jetbrains.max_per_project.as_deref(),
+        ConfigKey::IdeOrphanTtlMinutes => cfg.ide.jetbrains.orphan_ttl_minutes.as_deref(),
     }
+}
+
+fn parse_positive_usize_or_default(
+    raw: Option<&str>,
+    default: usize,
+    field: &str,
+) -> Result<usize> {
+    let Some(raw) = raw.and_then(|v| normalize_value(v.to_string())) else {
+        return Ok(default);
+    };
+    let value = raw
+        .parse::<usize>()
+        .with_context(|| format!("parse `{field}` as positive integer"))?;
+    if value == 0 {
+        bail!("`{field}` must be >= 1");
+    }
+    Ok(value)
+}
+
+fn parse_positive_u64_or_default(raw: Option<&str>, default: u64, field: &str) -> Result<u64> {
+    let Some(raw) = raw.and_then(|v| normalize_value(v.to_string())) else {
+        return Ok(default);
+    };
+    let value = raw
+        .parse::<u64>()
+        .with_context(|| format!("parse `{field}` as positive integer"))?;
+    if value == 0 {
+        bail!("`{field}` must be >= 1");
+    }
+    Ok(value)
 }
 
 fn maybe_config_path() -> Option<PathBuf> {

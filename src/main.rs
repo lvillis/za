@@ -58,6 +58,13 @@ fn main() -> Result<()> {
             Ok(())
         }
         cli::Commands::Config { cmd } => command::za_config::run(cmd),
+        cli::Commands::Ide { cmd } => {
+            let exit_code = command::ide::run(cmd)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
     }
 }
 

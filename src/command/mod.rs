@@ -2,6 +2,7 @@
 
 pub mod deps;
 pub mod r#gen;
+pub mod ide;
 pub mod run;
 pub mod tool;
 pub mod za_config;

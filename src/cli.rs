@@ -87,6 +87,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: Option<ConfigCommands>,
     },
+    /// Manage JetBrains remote IDE server processes
+    Ide {
+        #[command(subcommand)]
+        cmd: IdeCommands,
+    },
 }
 
 /// `za tool` sub-commands
@@ -164,6 +169,52 @@ pub enum ConfigCommands {
     },
 }
 
+/// `za ide` sub-commands
+#[derive(Subcommand)]
+pub enum IdeCommands {
+    /// List JetBrains remote IDE server processes
+    Ps {
+        /// Only show projects with duplicate server instances.
+        #[arg(long)]
+        duplicates: bool,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop one JetBrains server process by PID
+    Stop {
+        /// Target server PID.
+        pid: i32,
+        /// Graceful shutdown timeout before SIGKILL.
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reconcile duplicate server processes for the same IDE+project
+    Reconcile {
+        /// Apply actions. Without this flag, only print the plan.
+        #[arg(long)]
+        apply: bool,
+        /// Keep strategy when multiple server processes exist.
+        #[arg(long, value_enum, default_value_t = IdeReconcileStrategy::Newest)]
+        keep: IdeReconcileStrategy,
+        /// Graceful shutdown timeout before SIGKILL.
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum IdeReconcileStrategy {
+    Newest,
+    Oldest,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum ConfigKey {
     #[value(name = "github-token")]
@@ -200,4 +251,8 @@ pub enum ConfigKey {
     UpdateAll,
     #[value(name = "update-no-proxy")]
     UpdateNoProxy,
+    #[value(name = "ide-max-per-project")]
+    IdeMaxPerProject,
+    #[value(name = "ide-orphan-ttl-minutes")]
+    IdeOrphanTtlMinutes,
 }

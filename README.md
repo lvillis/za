@@ -76,6 +76,20 @@ za deps --jobs 16
 za deps --fail-on-high
 ```
 
+### 4) Manage JetBrains remote IDE sessions
+
+```bash
+za ide ps
+za ide ps --duplicates
+za ide reconcile
+za ide reconcile --apply
+za ide stop 42589
+```
+
+`za ide reconcile` reads policy from config:
+- `ide-max-per-project` (default `1`)
+- `ide-orphan-ttl-minutes` (default `30`)
+
 ## Command Map
 
 | Command | Purpose |
@@ -85,6 +99,7 @@ za deps --fail-on-high
 | `za run` | Launch a tool directly with normalized proxy environment variables. |
 | `za deps` | Audit Rust dependency maintenance risk. |
 | `za config` | Persist CLI config (`[auth]`, `[proxy]`, `[run]`, `[tool]`, `[update]`). |
+| `za ide` | Inspect and reconcile JetBrains remote IDE server processes. |
 
 ## Tool Management
 
@@ -240,6 +255,10 @@ za config set proxy-no-proxy localhost,127.0.0.1,.corp.local
 # optional scope override
 za config set tool-https http://127.0.0.1:1080
 
+# ide policy defaults (optional overrides)
+za config set ide-max-per-project 1
+za config set ide-orphan-ttl-minutes 30
+
 za run codex
 za tool update codex
 za update
@@ -262,6 +281,10 @@ no_proxy = "localhost,127.0.0.1,.corp.local"
 https_proxy = "http://127.0.0.1:1080"
 
 [update]
+
+[ide.jetbrains]
+max_per_project = "1"
+orphan_ttl_minutes = "30"
 ```
 
 ## License
