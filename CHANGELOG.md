@@ -1,8 +1,21 @@
+## [0.1.16] - 2026-03-04
+
+### 🚀 Features
+
+- Add ide management
+
+### ⚡ Performance
+
+- *(ide)* Speed up ide ps
 ## [0.1.15] - 2026-03-03
 
 ### 🚀 Features
 
 - Harden tool update interruption cleanup and signal handling
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.15
 ## [0.1.14] - 2026-02-27
 
 ### 🚀 Features
