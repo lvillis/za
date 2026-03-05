@@ -1,8 +1,17 @@
+## [0.1.18] - 2026-03-05
+
+### 🐛 Bug Fixes
+
+- Clippy
 ## [0.1.17] - 2026-03-05
 
 ### 🚀 Features
 
 - *(git)* Add GitHub credential helper auth
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.17
 ## [0.1.16] - 2026-03-04
 
 ### 🚀 Features
