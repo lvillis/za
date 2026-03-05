@@ -90,6 +90,18 @@ za ide stop 42589
 - `ide-max-per-project` (default `1`)
 - `ide-orphan-ttl-minutes` (default `30`)
 
+### 5) Enable GitHub auth for IDE/CLI Git operations
+
+```bash
+za git auth enable
+za git auth status
+za git auth doctor
+za git auth test
+za git auth test --repo https://github.com/org/repo.git
+```
+
+`za git auth enable` configures GitHub HTTPS auth through a credential helper (`za git credential`) so remote URLs can stay clean (`https://github.com/org/repo.git`) without embedding token secrets.
+
 ## Command Map
 
 | Command | Purpose |
@@ -100,6 +112,7 @@ za ide stop 42589
 | `za deps` | Audit Rust dependency maintenance risk. |
 | `za config` | Persist CLI config (`[auth]`, `[proxy]`, `[run]`, `[tool]`, `[update]`). |
 | `za ide` | Inspect and reconcile JetBrains remote IDE server processes. |
+| `za git` | Wire and diagnose GitHub credential-helper based auth. |
 
 ## Tool Management
 

@@ -65,6 +65,13 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        cli::Commands::Git { cmd } => {
+            let exit_code = command::git::run(cmd)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
     }
 }
 

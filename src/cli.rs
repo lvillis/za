@@ -92,6 +92,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: IdeCommands,
     },
+    /// Manage Git authentication integration
+    Git {
+        #[command(subcommand)]
+        cmd: GitCommands,
+    },
 }
 
 /// `za tool` sub-commands
@@ -213,6 +218,57 @@ pub enum IdeCommands {
 pub enum IdeReconcileStrategy {
     Newest,
     Oldest,
+}
+
+/// `za git` sub-commands
+#[derive(Subcommand)]
+pub enum GitCommands {
+    /// Manage GitHub credential-helper wiring
+    Auth {
+        #[command(subcommand)]
+        cmd: GitAuthCommands,
+    },
+    /// Internal credential helper entrypoint used by Git
+    #[command(hide = true)]
+    Credential {
+        /// Git credential helper operation: get/store/erase
+        operation: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum GitAuthCommands {
+    /// Enable GitHub credential helper via za
+    Enable,
+    /// Show current GitHub credential helper status
+    Status {
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diagnose common GitHub auth wiring issues
+    Doctor {
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a real GitHub auth connectivity test against a repo
+    Test {
+        /// Target repository URL. If omitted, use current repo remote URL.
+        #[arg(long, value_name = "URL")]
+        repo: Option<String>,
+        /// Remote name used when `--repo` is omitted.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Timeout for the probe request.
+        #[arg(long, default_value_t = 15)]
+        timeout_secs: u64,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Disable GitHub credential helper wiring added by za
+    Disable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
