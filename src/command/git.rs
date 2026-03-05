@@ -147,10 +147,7 @@ fn run_auth_disable() -> Result<i32> {
 }
 
 fn run_auth_status(json: bool) -> Result<i32> {
-    let git_version = match git_version() {
-        Ok(version) => Some(version),
-        Err(_) => None,
-    };
+    let git_version = git_version().ok();
 
     if git_version.is_none() {
         let status = GitAuthStatus {
@@ -647,8 +644,9 @@ fn run_credential_get() -> Result<i32> {
         return Ok(0);
     };
 
-    print!("username={GITHUB_USERNAME_VALUE}\n");
-    print!("password={token}\n\n");
+    println!("username={GITHUB_USERNAME_VALUE}");
+    println!("password={token}");
+    println!();
     Ok(0)
 }
 
