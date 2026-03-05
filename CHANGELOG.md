@@ -1,3 +1,8 @@
+## [0.1.17] - 2026-03-05
+
+### 🚀 Features
+
+- *(git)* Add GitHub credential helper auth
 ## [0.1.16] - 2026-03-04
 
 ### 🚀 Features
@@ -7,6 +12,10 @@
 ### ⚡ Performance
 
 - *(ide)* Speed up ide ps
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.16
 ## [0.1.15] - 2026-03-03
 
 ### 🚀 Features
