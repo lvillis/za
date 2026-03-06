@@ -58,6 +58,8 @@ struct GitAuthDoctorReport {
 #[derive(Debug, Serialize)]
 struct GitAuthTestReport {
     ok: bool,
+    auth_verified: bool,
+    anonymous_readable: bool,
     target_url: String,
     remote: Option<String>,
     timeout_secs: u64,
@@ -66,6 +68,23 @@ struct GitAuthTestReport {
     exit_code: Option<i32>,
     reason: String,
     hint: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct GitProbeResult {
+    success: bool,
+    timed_out: bool,
+    elapsed_ms: u128,
+    exit_code: Option<i32>,
+    stderr: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeFailureKind {
+    Authentication,
+    RepositoryNotFound,
+    Network,
+    Unknown,
 }
 
 pub fn run(cmd: GitCommands) -> Result<i32> {
@@ -410,6 +429,7 @@ fn run_auth_test(
         (url, Some(remote))
     };
     let target_display = sanitize_url_for_log(&target_url);
+    let anonymous_target_url = strip_url_userinfo(&target_url);
 
     let is_github_https = request_targets_github_https(&CredentialRequest {
         protocol: None,
@@ -420,6 +440,8 @@ fn run_auth_test(
     if !is_github_https {
         let report = GitAuthTestReport {
             ok: false,
+            auth_verified: false,
+            anonymous_readable: false,
             target_url: target_display.clone(),
             remote: remote_used,
             timeout_secs,
@@ -447,39 +469,39 @@ fn run_auth_test(
         return Ok(1);
     }
 
-    let (output, timed_out, elapsed_ms) = run_git_ls_remote_probe(&target_url, timeout)?;
-    let exit_code = output.status.code();
-    let (ok, reason, hint) = if timed_out {
-        (
-            false,
-            format!("probe timed out after {}s", timeout_secs),
-            Some(
-                "Check network/proxy reachability to github.com, then retry with a larger `--timeout-secs`."
-                    .to_string(),
-            ),
-        )
-    } else if output.status.success() {
-        (
-            true,
-            "probe succeeded (read access confirmed; public repositories may succeed without credentials)"
-                .to_string(),
-            None,
-        )
-    } else {
-        summarize_probe_failure(exit_code, &String::from_utf8_lossy(&output.stderr))
-    };
+    let auth_probe = run_git_ls_remote_probe(&target_url, timeout, false)?;
+    if auth_probe.timed_out || !auth_probe.success {
+        let report = build_auth_probe_failure_report(
+            &target_display,
+            remote_used.clone(),
+            timeout_secs,
+            &auth_probe,
+        );
 
-    let report = GitAuthTestReport {
-        ok,
-        target_url: target_display.clone(),
-        remote: remote_used,
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).context("serialize git auth test report")?
+            );
+        } else {
+            println!("Git auth test failed for {}.", report.target_url);
+            println!("Git: {git_version}");
+            println!("reason: {}", report.reason);
+            if let Some(hint) = report.hint {
+                println!("hint: {hint}");
+            }
+        }
+        return Ok(1);
+    }
+
+    let anon_probe = run_git_ls_remote_probe(&anonymous_target_url, timeout, true)?;
+    let report = build_auth_verification_report(
+        &target_display,
+        remote_used,
         timeout_secs,
-        elapsed_ms,
-        timed_out,
-        exit_code,
-        reason,
-        hint,
-    };
+        &auth_probe,
+        &anon_probe,
+    );
 
     if json {
         println!(
@@ -516,8 +538,27 @@ fn git_remote_get_url(remote: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("remote `{remote}` URL is empty"))
 }
 
-fn run_git_ls_remote_probe(target_url: &str, timeout: Duration) -> Result<(Output, bool, u128)> {
-    let mut child = Command::new("git")
+fn run_git_ls_remote_probe(
+    target_url: &str,
+    timeout: Duration,
+    disable_helper: bool,
+) -> Result<GitProbeResult> {
+    let mut cmd = Command::new("git");
+    if disable_helper {
+        cmd.args([
+            "-c",
+            "credential.helper=",
+            "-c",
+            "credential.https://github.com.helper=",
+            "-c",
+            "credential.interactive=false",
+            "-c",
+            "core.askPass=",
+        ]);
+        cmd.env_remove("GIT_ASKPASS");
+        cmd.env_remove("SSH_ASKPASS");
+    }
+    let mut child = cmd
         .args(["ls-remote", "--heads", target_url])
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
@@ -542,7 +583,11 @@ fn run_git_ls_remote_probe(target_url: &str, timeout: Duration) -> Result<(Outpu
             let output = child
                 .wait_with_output()
                 .context("collect git ls-remote output")?;
-            return Ok((output, false, start.elapsed().as_millis()));
+            return Ok(probe_result_from_output(
+                output,
+                false,
+                start.elapsed().as_millis(),
+            ));
         }
 
         if start.elapsed() >= timeout {
@@ -550,61 +595,221 @@ fn run_git_ls_remote_probe(target_url: &str, timeout: Duration) -> Result<(Outpu
             let output = child
                 .wait_with_output()
                 .context("collect timed-out git ls-remote output")?;
-            return Ok((output, true, start.elapsed().as_millis()));
+            return Ok(probe_result_from_output(
+                output,
+                true,
+                start.elapsed().as_millis(),
+            ));
         }
 
         thread::sleep(Duration::from_millis(50));
     }
 }
 
-fn summarize_probe_failure(exit_code: Option<i32>, stderr: &str) -> (bool, String, Option<String>) {
-    let lower = stderr.to_ascii_lowercase();
-    if lower.contains("authentication failed")
-        || lower.contains("fatal: could not read username")
-        || lower.contains("terminal prompts disabled")
-    {
-        return (
+fn probe_result_from_output(output: Output, timed_out: bool, elapsed_ms: u128) -> GitProbeResult {
+    GitProbeResult {
+        success: output.status.success(),
+        timed_out,
+        elapsed_ms,
+        exit_code: output.status.code(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+fn build_auth_probe_failure_report(
+    target_url: &str,
+    remote: Option<String>,
+    timeout_secs: u64,
+    auth_probe: &GitProbeResult,
+) -> GitAuthTestReport {
+    let (reason, hint) = if auth_probe.timed_out {
+        (
+            format!("probe timed out after {}s", timeout_secs),
+            Some(
+                "Check network/proxy reachability to github.com, then retry with a larger `--timeout-secs`."
+                    .to_string(),
+            ),
+        )
+    } else {
+        summarize_auth_probe_failure(
+            classify_probe_failure(&auth_probe.stderr),
+            auth_probe.exit_code,
+        )
+    };
+
+    GitAuthTestReport {
+        ok: false,
+        auth_verified: false,
+        anonymous_readable: false,
+        target_url: target_url.to_string(),
+        remote,
+        timeout_secs,
+        elapsed_ms: auth_probe.elapsed_ms,
+        timed_out: auth_probe.timed_out,
+        exit_code: auth_probe.exit_code,
+        reason,
+        hint,
+    }
+}
+
+fn build_auth_verification_report(
+    target_url: &str,
+    remote: Option<String>,
+    timeout_secs: u64,
+    auth_probe: &GitProbeResult,
+    anon_probe: &GitProbeResult,
+) -> GitAuthTestReport {
+    let failure_kind = classify_probe_failure(&anon_probe.stderr);
+    let (ok, auth_verified, anonymous_readable, timed_out, reason, hint) = if anon_probe.success {
+        (
             false,
+            false,
+            true,
+            false,
+            "repository is anonymously readable; auth cannot be verified with this target"
+                .to_string(),
+            Some(
+                "Use a private repository (or one requiring authentication) with `za git auth test --repo <url>`."
+                    .to_string(),
+            ),
+        )
+    } else if anon_probe.timed_out {
+        (
+            false,
+            false,
+            false,
+            true,
+            format!(
+                "anonymous comparison probe timed out after {}s; auth verification inconclusive",
+                timeout_secs
+            ),
+            Some(
+                "Retry with a larger `--timeout-secs` or check network/proxy stability."
+                    .to_string(),
+            ),
+        )
+    } else if matches!(
+        failure_kind,
+        ProbeFailureKind::Authentication | ProbeFailureKind::RepositoryNotFound
+    ) {
+        (
+            true,
+            true,
+            false,
+            false,
+            "authentication verified; authenticated probe succeeded and anonymous probe was rejected (auth/access required)"
+                .to_string(),
+            None,
+        )
+    } else {
+        let (reason, hint) = summarize_anonymous_probe_failure(failure_kind, anon_probe.exit_code);
+        (false, false, false, false, reason, hint)
+    };
+
+    GitAuthTestReport {
+        ok,
+        auth_verified,
+        anonymous_readable,
+        target_url: target_url.to_string(),
+        remote,
+        timeout_secs,
+        elapsed_ms: auth_probe.elapsed_ms.saturating_add(anon_probe.elapsed_ms),
+        timed_out,
+        exit_code: anon_probe.exit_code.or(auth_probe.exit_code),
+        reason,
+        hint,
+    }
+}
+
+fn summarize_auth_probe_failure(
+    kind: ProbeFailureKind,
+    exit_code: Option<i32>,
+) -> (String, Option<String>) {
+    match kind {
+        ProbeFailureKind::Authentication => (
             "GitHub authentication failed".to_string(),
             Some(
                 "Run `za git auth doctor`, then ensure a valid token is set and has required repo permissions."
                     .to_string(),
             ),
-        );
-    }
-    if lower.contains("repository not found") {
-        return (
-            false,
-            "repository not found or inaccessible".to_string(),
+        ),
+        ProbeFailureKind::RepositoryNotFound => (
+            "repository not found or token lacks access".to_string(),
             Some("Verify repository URL and token access scope.".to_string()),
-        );
+        ),
+        ProbeFailureKind::Network => (
+            "network connectivity to GitHub failed".to_string(),
+            Some("Check DNS/proxy/firewall settings for github.com.".to_string()),
+        ),
+        ProbeFailureKind::Unknown => (
+            format!(
+                "git ls-remote failed{}",
+                exit_code
+                    .map(|code| format!(" (exit code {code})"))
+                    .unwrap_or_default()
+            ),
+            Some(
+                "Run `za git auth doctor` and inspect your Git remote and network settings."
+                    .to_string(),
+            ),
+        ),
+    }
+}
+
+fn summarize_anonymous_probe_failure(
+    kind: ProbeFailureKind,
+    exit_code: Option<i32>,
+) -> (String, Option<String>) {
+    match kind {
+        ProbeFailureKind::Network => (
+            "anonymous comparison probe hit a network error; auth verification inconclusive"
+                .to_string(),
+            Some(
+                "Retry with a larger `--timeout-secs` after checking DNS/proxy/firewall reachability to github.com."
+                    .to_string(),
+            ),
+        ),
+        ProbeFailureKind::Unknown => (
+            format!(
+                "anonymous comparison probe failed{}; auth verification inconclusive",
+                exit_code
+                    .map(|code| format!(" (exit code {code})"))
+                    .unwrap_or_default()
+            ),
+            Some(
+                "Retry the probe or inspect local Git transport settings that may affect unauthenticated access."
+                    .to_string(),
+            ),
+        ),
+        ProbeFailureKind::Authentication | ProbeFailureKind::RepositoryNotFound => (
+            "authentication verified; authenticated probe succeeded and anonymous probe was rejected (auth/access required)"
+                .to_string(),
+            None,
+        ),
+    }
+}
+
+fn classify_probe_failure(stderr: &str) -> ProbeFailureKind {
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("repository") && lower.contains("not found") {
+        return ProbeFailureKind::RepositoryNotFound;
+    }
+    if lower.contains("authentication failed")
+        || lower.contains("fatal: could not read username")
+        || lower.contains("terminal prompts disabled")
+    {
+        return ProbeFailureKind::Authentication;
     }
     if lower.contains("could not resolve host")
         || lower.contains("connection timed out")
         || lower.contains("failed to connect")
     {
-        return (
-            false,
-            "network connectivity to GitHub failed".to_string(),
-            Some("Check DNS/proxy/firewall settings for github.com.".to_string()),
-        );
+        return ProbeFailureKind::Network;
     }
-    (
-        false,
-        format!(
-            "git ls-remote failed{}",
-            exit_code
-                .map(|code| format!(" (exit code {code})"))
-                .unwrap_or_default()
-        ),
-        Some(
-            "Run `za git auth doctor` and inspect your Git remote and network settings."
-                .to_string(),
-        ),
-    )
+    ProbeFailureKind::Unknown
 }
 
-fn sanitize_url_for_log(input: &str) -> String {
+fn strip_url_userinfo(input: &str) -> String {
     let trimmed = input.trim();
     if let Some((scheme, rest)) = trimmed.split_once("://") {
         let mut authority_and_path = rest;
@@ -623,6 +828,10 @@ fn sanitize_url_for_log(input: &str) -> String {
         return format!("{scheme}://{authority}{suffix}");
     }
     trimmed.to_string()
+}
+
+fn sanitize_url_for_log(input: &str) -> String {
+    strip_url_userinfo(input)
 }
 
 fn run_credential(operation: Option<String>) -> Result<i32> {
@@ -878,9 +1087,26 @@ fn run_git_args(args: &[&str]) -> Result<Output> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CredentialRequest, extract_url_host, extract_url_scheme, normalize_host,
-        request_targets_github_https, sanitize_url_for_log,
+        CredentialRequest, GitProbeResult, ProbeFailureKind, build_auth_probe_failure_report,
+        build_auth_verification_report, classify_probe_failure, extract_url_host,
+        extract_url_scheme, normalize_host, request_targets_github_https, sanitize_url_for_log,
+        strip_url_userinfo,
     };
+
+    fn probe(
+        success: bool,
+        timed_out: bool,
+        exit_code: Option<i32>,
+        stderr: &str,
+    ) -> GitProbeResult {
+        GitProbeResult {
+            success,
+            timed_out,
+            elapsed_ms: 25,
+            exit_code,
+            stderr: stderr.to_string(),
+        }
+    }
 
     #[test]
     fn normalize_host_strips_port_and_userinfo_wrappers() {
@@ -941,5 +1167,92 @@ mod tests {
             sanitize_url_for_log("https://user:pass@github.com/org/repo.git"),
             "https://github.com/org/repo.git"
         );
+    }
+
+    #[test]
+    fn strip_url_userinfo_preserves_urls_without_credentials() {
+        assert_eq!(
+            strip_url_userinfo("https://github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+    }
+
+    #[test]
+    fn classify_probe_failure_distinguishes_repository_not_found() {
+        assert_eq!(
+            classify_probe_failure(
+                "fatal: repository 'https://github.com/org/repo.git/' not found"
+            ),
+            ProbeFailureKind::RepositoryNotFound
+        );
+        assert_eq!(
+            classify_probe_failure(
+                "fatal: Authentication failed for 'https://github.com/org/repo.git/'"
+            ),
+            ProbeFailureKind::Authentication
+        );
+    }
+
+    #[test]
+    fn auth_probe_repository_not_found_is_not_reported_as_auth_failure() {
+        let report = build_auth_probe_failure_report(
+            "https://github.com/org/repo.git",
+            None,
+            5,
+            &probe(
+                false,
+                false,
+                Some(128),
+                "fatal: repository 'https://github.com/org/repo.git/' not found",
+            ),
+        );
+
+        assert!(!report.ok);
+        assert!(!report.auth_verified);
+        assert_eq!(report.reason, "repository not found or token lacks access");
+    }
+
+    #[test]
+    fn anonymous_network_failure_is_inconclusive_not_success() {
+        let report = build_auth_verification_report(
+            "https://github.com/org/private.git",
+            None,
+            5,
+            &probe(true, false, Some(0), ""),
+            &probe(
+                false,
+                false,
+                Some(128),
+                "fatal: unable to access: Could not resolve host: github.com",
+            ),
+        );
+
+        assert!(!report.ok);
+        assert!(!report.auth_verified);
+        assert!(!report.anonymous_readable);
+        assert_eq!(
+            report.reason,
+            "anonymous comparison probe hit a network error; auth verification inconclusive"
+        );
+    }
+
+    #[test]
+    fn anonymous_access_rejection_verifies_auth() {
+        let report = build_auth_verification_report(
+            "https://github.com/org/private.git",
+            None,
+            5,
+            &probe(true, false, Some(0), ""),
+            &probe(
+                false,
+                false,
+                Some(128),
+                "fatal: repository 'https://github.com/org/private.git/' not found",
+            ),
+        );
+
+        assert!(report.ok);
+        assert!(report.auth_verified);
+        assert!(!report.anonymous_readable);
     }
 }

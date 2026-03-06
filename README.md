@@ -101,6 +101,7 @@ za git auth test --repo https://github.com/org/repo.git
 ```
 
 `za git auth enable` configures GitHub HTTPS auth through a credential helper (`za git credential`) so remote URLs can stay clean (`https://github.com/org/repo.git`) without embedding token secrets.
+`za git auth test` uses an authenticated probe plus an anonymous comparison probe; it only reports verified auth when the anonymous probe is explicitly rejected, and treats network/transport failures as inconclusive. Use a private repo target for strict auth verification.
 
 ## Command Map
 

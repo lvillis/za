@@ -1,10 +1,7 @@
-FROM rust:1.93.1-alpine3.23 AS builder
+FROM rust:1.94.0-alpine3.23 AS builder
 
 RUN set -ex \
-        \
-    && apk update \
-    && apk upgrade \
-    && apk add --update --no-cache build-base musl-dev openssl-dev perl make
+    && apk add --no-cache build-base musl-dev openssl-dev perl make
 
 WORKDIR /opt/app
 
@@ -21,8 +18,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 RUN rm -f /opt/app/src/main.rs
 COPY src/ /opt/app/src/
 
-RUN set -ex \
-        \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    set -ex \
     && cargo build --release --locked
 
 
