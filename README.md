@@ -23,7 +23,7 @@
 
 - Generate high-signal project context files fast.
 - Manage critical CLI binaries with version visibility and safe updates.
-- Audit Rust dependencies with maintenance signals before they become incidents.
+- Audit Rust dependencies with governance and maintenance signals before they become incidents.
 - Run tools with consistent runtime and proxy settings.
 
 ## Install
@@ -110,7 +110,7 @@ za git auth test --repo https://github.com/org/repo.git
 | `za gen` | Generate project context snapshots (`CONTEXT.md`). |
 | `za tool` | Install/update/list/use/uninstall managed binaries. |
 | `za run` | Launch a tool directly with normalized proxy environment variables. |
-| `za deps` | Audit Rust dependency maintenance risk. |
+| `za deps` | Audit Rust dependency governance and maintenance risk. |
 | `za config` | Persist CLI config (`[auth]`, `[proxy]`, `[run]`, `[tool]`, `[update]`). |
 | `za ide` | Inspect and reconcile JetBrains remote IDE server processes. |
 | `za git` | Wire and diagnose GitHub credential-helper based auth. |
@@ -214,7 +214,7 @@ HTTPS_PROXY=http://proxy.internal:1080 za tool update docker-compose
 
 ## Dependency Audit (`za deps`)
 
-`za deps` inspects Rust dependencies and combines ecosystem/maintenance signals.
+`za deps` inspects Rust dependencies and combines governance and maintenance signals, including yanked latest releases, license metadata, MSRV declarations, crates.io freshness, and GitHub activity.
 
 ```bash
 # default project (Cargo.toml in cwd)

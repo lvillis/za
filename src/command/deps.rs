@@ -1,4 +1,4 @@
-//! Dependency maintenance audit for Rust projects.
+//! Dependency governance and maintenance audit for Rust projects.
 
 mod api;
 mod model;
@@ -347,17 +347,38 @@ fn build_summary(records: &[DepAuditRecord]) -> AuditSummary {
 }
 
 fn print_report(manifest_path: &Path, summary: &AuditSummary, records: &[DepAuditRecord]) {
-    println!("Dependency Maintenance Audit");
+    println!("Dependency Governance Audit");
     println!("Manifest: {}", manifest_path.display());
     println!(
         "Summary: high={} medium={} low={} unknown={}",
         summary.high, summary.medium, summary.low, summary.unknown
     );
     println!(
-        "{:<18} {:<15} {:<8} {:<8} {:<10} {:<10} {:<9} NOTES",
-        "NAME", "REQ", "RISK", "STARS", "REL_AGE_D", "PUSH_AGE_D", "ARCHIVED"
+        "{:<18} {:<15} {:<8} {:<6} {:<16} {:<8} {:<8} {:<10} {:<10} {:<9} NOTES",
+        "NAME",
+        "REQ",
+        "RISK",
+        "YANKED",
+        "LICENSE",
+        "MSRV",
+        "STARS",
+        "REL_AGE_D",
+        "PUSH_AGE_D",
+        "ARCHIVED"
     );
     for rec in records {
+        let yanked = rec
+            .latest_version_yanked
+            .map(|v| if v { "yes" } else { "no" }.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let license = rec
+            .latest_version_license
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
+        let msrv = rec
+            .latest_version_rust_version
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
         let stars = rec
             .github_stars
             .map(|v| v.to_string())
@@ -376,10 +397,13 @@ fn print_report(manifest_path: &Path, summary: &AuditSummary, records: &[DepAudi
             .unwrap_or_else(|| "-".to_string());
         let notes = rec.notes.join("; ");
         println!(
-            "{:<18} {:<15} {:<8} {:<8} {:<10} {:<10} {:<9} {}",
+            "{:<18} {:<15} {:<8} {:<6} {:<16} {:<8} {:<8} {:<10} {:<10} {:<9} {}",
             rec.name,
             truncate(&rec.requirement, 15),
             rec.risk.as_str(),
+            yanked,
+            truncate(&license, 16),
+            truncate(&msrv, 8),
             stars,
             release_age,
             push_age,
@@ -465,6 +489,12 @@ struct CratesCrate {
 struct CratesVersion {
     num: String,
     created_at: String,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    rust_version: Option<String>,
+    #[serde(default)]
+    yanked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -473,6 +503,9 @@ struct CrateSnapshot {
     updated_at: Option<String>,
     latest_release_at: Option<String>,
     repository: Option<String>,
+    latest_version_license: Option<String>,
+    latest_version_rust_version: Option<String>,
+    latest_version_yanked: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -187,6 +187,9 @@ impl ApiClient {
             kinds: spec.kinds,
             optional: spec.optional,
             latest_version: None,
+            latest_version_license: None,
+            latest_version_rust_version: None,
+            latest_version_yanked: None,
             crate_updated_at: None,
             latest_release_at: None,
             latest_release_age_days: None,
@@ -203,6 +206,9 @@ impl ApiClient {
         match self.fetch_crate(&spec.name) {
             Ok(crate_resp) => {
                 record.latest_version = Some(crate_resp.max_version.clone());
+                record.latest_version_license = crate_resp.latest_version_license.clone();
+                record.latest_version_rust_version = crate_resp.latest_version_rust_version.clone();
+                record.latest_version_yanked = crate_resp.latest_version_yanked;
                 record.crate_updated_at = crate_resp.updated_at.clone();
                 record.latest_release_at = crate_resp.latest_release_at.clone();
                 record.latest_release_age_days = crate_resp
@@ -318,10 +324,8 @@ impl ApiClient {
             .clone()
             .or(parsed.krate.max_version.clone())
             .ok_or_else(|| anyhow!("missing max version in crates.io response"))?;
-        let latest_release_at = parsed
-            .versions
-            .iter()
-            .find(|v| v.num == max_version)
+        let latest_version = parsed.versions.iter().find(|v| v.num == max_version);
+        let latest_release_at = latest_version
             .map(|v| v.created_at.clone())
             .or_else(|| parsed.krate.updated_at.clone());
 
@@ -330,6 +334,11 @@ impl ApiClient {
             updated_at: parsed.krate.updated_at,
             latest_release_at,
             repository: parsed.krate.repository,
+            latest_version_license: latest_version
+                .and_then(|v| normalize_optional_string(v.license.clone())),
+            latest_version_rust_version: latest_version
+                .and_then(|v| normalize_optional_string(v.rust_version.clone())),
+            latest_version_yanked: latest_version.map(|v| v.yanked),
         };
         self.cache_put_crate(name, snapshot.clone())?;
         Ok(snapshot)
@@ -486,6 +495,15 @@ impl ApiClient {
 fn unique_cache_temp_path(path: &Path) -> PathBuf {
     let nonce = CACHE_TEMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     path.with_extension(format!("tmp-{}-{nonce}", std::process::id()))
+}
+
+fn normalize_optional_string(input: Option<String>) -> Option<String> {
+    let value = input?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 fn proxy_env_keys_for_scheme(scheme: &str) -> &'static [&'static str] {

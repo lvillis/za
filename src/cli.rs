@@ -27,7 +27,7 @@ pub enum Commands {
         #[arg(long, value_name = "REF")]
         r#ref: Option<String>,
     },
-    /// Audit Rust dependency maintenance signals (crates.io + GitHub)
+    /// Audit Rust dependency governance and maintenance signals (crates.io + GitHub)
     Deps {
         /// Optional path to Cargo.toml (defaults to current workspace root).
         #[arg(long, value_name = "PATH")]

@@ -71,6 +71,9 @@ pub(super) struct DepAuditRecord {
     pub(super) kinds: String,
     pub(super) optional: bool,
     pub(super) latest_version: Option<String>,
+    pub(super) latest_version_license: Option<String>,
+    pub(super) latest_version_rust_version: Option<String>,
+    pub(super) latest_version_yanked: Option<bool>,
     pub(super) crate_updated_at: Option<String>,
     pub(super) latest_release_at: Option<String>,
     pub(super) latest_release_age_days: Option<u64>,
@@ -100,6 +103,20 @@ pub(super) fn classify_risk(record: &mut DepAuditRecord) {
         .as_deref()
         .and_then(github_repo_from_url)
         .is_some();
+
+    if record.latest_version_yanked == Some(true) {
+        elevate(&mut risk, RiskLevel::High);
+        reasons.push("latest published crate version is yanked".to_string());
+    }
+
+    if record.latest_version_license.is_none() {
+        elevate(&mut risk, RiskLevel::Medium);
+        reasons.push("license metadata missing on latest crate release".to_string());
+    }
+
+    if record.latest_version_rust_version.is_none() {
+        reasons.push("MSRV not declared on latest crate release".to_string());
+    }
 
     if record.github_archived == Some(true) {
         elevate(&mut risk, RiskLevel::High);
@@ -145,12 +162,16 @@ pub(super) fn classify_risk(record: &mut DepAuditRecord) {
         && record.github_archived.is_none()
         && record.github_pushed_at.is_none()
     {
-        risk = RiskLevel::Unknown;
+        if matches!(risk, RiskLevel::Low) {
+            risk = RiskLevel::Unknown;
+        }
         reasons.push("GitHub signals unavailable (set GITHUB_TOKEN for stable quota)".to_string());
     }
 
     if record.latest_release_at.is_none() && record.github_pushed_at.is_none() {
-        risk = RiskLevel::Unknown;
+        if matches!(risk, RiskLevel::Low) {
+            risk = RiskLevel::Unknown;
+        }
         reasons.push("insufficient maintenance signals".to_string());
     }
 
@@ -231,7 +252,33 @@ impl GitHubCacheEntry {
 
 #[cfg(test)]
 mod tests {
-    use super::{RiskLevel, elevate, github_repo_from_url, parse_owner_repo};
+    use super::{
+        DepAuditRecord, RiskLevel, classify_risk, elevate, github_repo_from_url, parse_owner_repo,
+    };
+
+    fn base_record() -> DepAuditRecord {
+        DepAuditRecord {
+            name: "demo".to_string(),
+            requirement: "^1".to_string(),
+            kinds: "normal".to_string(),
+            optional: false,
+            latest_version: Some("1.2.3".to_string()),
+            latest_version_license: Some("MIT".to_string()),
+            latest_version_rust_version: Some("1.70".to_string()),
+            latest_version_yanked: Some(false),
+            crate_updated_at: None,
+            latest_release_at: Some("2025-01-01T00:00:00Z".to_string()),
+            latest_release_age_days: Some(30),
+            repository: None,
+            github_stars: None,
+            github_archived: None,
+            github_pushed_at: None,
+            github_push_age_days: None,
+            std_alternative: None,
+            risk: RiskLevel::Unknown,
+            notes: Vec::new(),
+        }
+    }
 
     #[test]
     fn parse_github_https_repo() {
@@ -260,5 +307,37 @@ mod tests {
         assert_eq!(risk, RiskLevel::Medium);
         elevate(&mut risk, RiskLevel::High);
         assert_eq!(risk, RiskLevel::High);
+    }
+
+    #[test]
+    fn classify_risk_marks_yanked_latest_as_high() {
+        let mut record = base_record();
+        record.latest_version_yanked = Some(true);
+
+        classify_risk(&mut record);
+
+        assert_eq!(record.risk, RiskLevel::High);
+        assert!(
+            record
+                .notes
+                .iter()
+                .any(|note| note.contains("latest published crate version is yanked"))
+        );
+    }
+
+    #[test]
+    fn classify_risk_marks_missing_license_as_medium() {
+        let mut record = base_record();
+        record.latest_version_license = None;
+
+        classify_risk(&mut record);
+
+        assert_eq!(record.risk, RiskLevel::Medium);
+        assert!(
+            record
+                .notes
+                .iter()
+                .any(|note| note.contains("license metadata missing"))
+        );
     }
 }
