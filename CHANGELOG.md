@@ -1,8 +1,18 @@
+## [0.1.19] - 2026-03-06
+
+### 🐛 Bug Fixes
+
+- Harden git auth verification
+- Harden process identity, proxy wiring, and temp/cache safety
 ## [0.1.18] - 2026-03-05
 
 ### 🐛 Bug Fixes
 
 - Clippy
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.18
 ## [0.1.17] - 2026-03-05
 
 ### 🚀 Features
