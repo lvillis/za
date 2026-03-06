@@ -12,6 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     path::Path,
     process::Command,
     thread,
@@ -69,6 +70,18 @@ struct ProcStat {
     stime_ticks: u64,
     start_ticks: u64,
     rss_pages: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessIdentity {
+    pid: i32,
+    start_ticks: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StopOutcome {
+    AlreadyExited,
+    Stopped { forced: bool, elapsed_ms: u128 },
 }
 
 #[derive(Debug, Clone)]
@@ -369,13 +382,21 @@ fn run_stop(pid: i32, timeout_secs: u64, json: bool) -> Result<i32> {
         .find(|s| s.pid == pid)
         .ok_or_else(|| anyhow!("PID {pid} is not a JetBrains serverMode process"))?;
 
-    let (forced, elapsed_ms) = stop_session(pid, Duration::from_secs(timeout_secs))?;
+    let identity = ProcessIdentity {
+        pid: session.pid,
+        start_ticks: session.start_ticks,
+    };
+    let outcome = stop_session(identity, Duration::from_secs(timeout_secs))?;
+    let (stopped, forced, elapsed_ms) = match outcome {
+        StopOutcome::AlreadyExited => (false, false, 0),
+        StopOutcome::Stopped { forced, elapsed_ms } => (true, forced, elapsed_ms),
+    };
     if json {
         let out = IdeStopOutput {
             pid: session.pid,
             ide: session.ide.clone(),
             project_real: session.project_real.clone(),
-            stopped: true,
+            stopped,
             forced,
             elapsed_ms,
         };
@@ -386,7 +407,12 @@ fn run_stop(pid: i32, timeout_secs: u64, json: bool) -> Result<i32> {
         return Ok(0);
     }
 
-    if forced {
+    if !stopped {
+        println!(
+            "ℹ️  {} (pid {}) already exited before signal delivery",
+            session.ide, session.pid
+        );
+    } else if forced {
         println!(
             "🛑 Stopped {} (pid {}) with SIGKILL after timeout ({} ms)",
             session.ide, session.pid, elapsed_ms
@@ -408,6 +434,10 @@ fn run_reconcile(
 ) -> Result<i32> {
     let policy = za_config::load_ide_jetbrains_policy()?;
     let mut sessions = collect_ide_sessions()?;
+    let start_ticks_by_pid = sessions
+        .iter()
+        .map(|session| (session.pid, session.start_ticks))
+        .collect::<HashMap<_, _>>();
     annotate_group_state(
         &mut sessions,
         policy.max_per_project,
@@ -502,7 +532,14 @@ fn run_reconcile(
     if apply {
         for group in &mut outputs {
             for pid in &group.stop_pids {
-                match stop_session(*pid, Duration::from_secs(timeout_secs)) {
+                let identity = ProcessIdentity {
+                    pid: *pid,
+                    start_ticks: start_ticks_by_pid
+                        .get(pid)
+                        .copied()
+                        .ok_or_else(|| anyhow!("missing start ticks for pid {pid}"))?,
+                };
+                match stop_session(identity, Duration::from_secs(timeout_secs)) {
                     Ok(_) => group.stopped_pids.push(*pid),
                     Err(err) => group.failures.push(ReconcileFailure {
                         pid: *pid,
@@ -513,7 +550,14 @@ fn run_reconcile(
             total_failures += group.failures.len();
         }
         for pid in &orphan_pids {
-            if let Err(err) = stop_session(*pid, Duration::from_secs(timeout_secs)) {
+            let identity = ProcessIdentity {
+                pid: *pid,
+                start_ticks: start_ticks_by_pid
+                    .get(pid)
+                    .copied()
+                    .ok_or_else(|| anyhow!("missing start ticks for pid {pid}"))?,
+            };
+            if let Err(err) = stop_session(identity, Duration::from_secs(timeout_secs)) {
                 orphan_failures.push(ReconcileFailure {
                     pid: *pid,
                     error: err.to_string(),
@@ -667,47 +711,77 @@ fn pick_keep_pids(
     selected
 }
 
-fn stop_session(pid: i32, timeout: Duration) -> Result<(bool, u128)> {
-    if !process_exists(pid) {
-        return Ok((false, 0));
+fn stop_session(identity: ProcessIdentity, timeout: Duration) -> Result<StopOutcome> {
+    if !process_matches_identity(identity) {
+        return Ok(StopOutcome::AlreadyExited);
     }
 
     let start = Instant::now();
-    send_signal(pid, "-TERM").with_context(|| format!("send SIGTERM to pid {pid}"))?;
-    if wait_for_exit(pid, timeout) {
-        return Ok((false, start.elapsed().as_millis()));
+    if !send_signal(identity, "-TERM")
+        .with_context(|| format!("send SIGTERM to pid {}", identity.pid))?
+    {
+        return Ok(StopOutcome::AlreadyExited);
+    }
+    if wait_for_exit(identity, timeout) {
+        return Ok(StopOutcome::Stopped {
+            forced: false,
+            elapsed_ms: start.elapsed().as_millis(),
+        });
     }
 
-    send_signal(pid, "-KILL").with_context(|| format!("send SIGKILL to pid {pid}"))?;
-    if wait_for_exit(pid, Duration::from_secs(STOP_KILL_GRACE_SECS)) {
-        return Ok((true, start.elapsed().as_millis()));
+    let sent_kill = send_signal(identity, "-KILL")
+        .with_context(|| format!("send SIGKILL to pid {}", identity.pid))?;
+    if !sent_kill {
+        return Ok(StopOutcome::Stopped {
+            forced: false,
+            elapsed_ms: start.elapsed().as_millis(),
+        });
+    }
+    if wait_for_exit(identity, Duration::from_secs(STOP_KILL_GRACE_SECS)) {
+        return Ok(StopOutcome::Stopped {
+            forced: true,
+            elapsed_ms: start.elapsed().as_millis(),
+        });
     }
 
-    bail!("pid {pid} still exists after SIGKILL")
+    bail!("pid {} still exists after SIGKILL", identity.pid)
 }
 
-fn send_signal(pid: i32, signal: &str) -> Result<()> {
+fn send_signal(identity: ProcessIdentity, signal: &str) -> Result<bool> {
+    if !process_matches_identity(identity) {
+        return Ok(false);
+    }
+
     let status = Command::new("kill")
         .arg(signal)
-        .arg(pid.to_string())
+        .arg(identity.pid.to_string())
         .status()
-        .with_context(|| format!("execute kill {signal} {pid}"))?;
+        .with_context(|| format!("execute kill {signal} {}", identity.pid))?;
     if !status.success() {
-        bail!("kill {signal} {pid} failed with status {status}");
+        if !process_matches_identity(identity) {
+            return Ok(false);
+        }
+        bail!("kill {signal} {} failed with status {status}", identity.pid);
     }
-    Ok(())
+    Ok(true)
 }
 
-fn wait_for_exit(pid: i32, timeout: Duration) -> bool {
+fn wait_for_exit(identity: ProcessIdentity, timeout: Duration) -> bool {
     let start = Instant::now();
-    while process_exists(pid) && start.elapsed() < timeout {
+    while process_matches_identity(identity) && start.elapsed() < timeout {
         thread::sleep(Duration::from_millis(STOP_POLL_MS));
     }
-    !process_exists(pid)
+    !process_matches_identity(identity)
 }
 
-fn process_exists(pid: i32) -> bool {
-    Path::new(PROC_ROOT).join(pid.to_string()).exists()
+fn process_matches_identity(identity: ProcessIdentity) -> bool {
+    read_process_start_ticks(identity.pid) == Some(identity.start_ticks)
+}
+
+fn read_process_start_ticks(pid: i32) -> Option<u64> {
+    let stat_path = Path::new(PROC_ROOT).join(pid.to_string()).join("stat");
+    let raw = fs::read_to_string(stat_path).ok()?;
+    proc_scan::parse_proc_stat_line(&raw).map(|stat| stat.start_ticks)
 }
 
 fn truncate_end(input: &str, max_chars: usize) -> String {
@@ -728,7 +802,10 @@ mod tests {
         extract_jetbrains_server_session, has_jetbrains_shell_integration,
         parse_build_number_from_build_txt, parse_cmdline, parse_proc_stat_line,
     };
-    use super::{IdeReconcileStrategy, IdeSession, pick_keep_pid, pick_keep_pids};
+    use super::{
+        IdeReconcileStrategy, IdeSession, ProcessIdentity, pick_keep_pid, pick_keep_pids,
+        process_matches_identity, read_process_start_ticks,
+    };
 
     #[test]
     fn parse_cmdline_splits_nul_parts() {
@@ -871,5 +948,19 @@ mod tests {
             pick_keep_pids(&sessions, IdeReconcileStrategy::Oldest, 1),
             vec![100]
         );
+    }
+
+    #[test]
+    fn process_identity_matches_current_process_start_ticks() {
+        let pid = std::process::id() as i32;
+        let start_ticks = read_process_start_ticks(pid).expect("current process start ticks");
+        assert!(process_matches_identity(ProcessIdentity {
+            pid,
+            start_ticks
+        }));
+        assert!(!process_matches_identity(ProcessIdentity {
+            pid,
+            start_ticks: start_ticks.saturating_add(1),
+        }));
     }
 }

@@ -51,6 +51,7 @@ const MANIFEST_FILE: &str = "manifest.json";
 const LOCK_FILE: &str = ".tool.lock";
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 const SOURCE_KIND_DOWNLOAD: &str = "download";
+const SOURCE_KIND_CARGO_INSTALL: &str = "cargo-install";
 const SOURCE_KIND_ADOPTED: &str = "adopted";
 const SOURCE_KIND_SYNTHESIZED: &str = "synthesized";
 const PROXY_HINT: &str =
@@ -383,14 +384,16 @@ enum ToolAction {
 
 #[derive(Debug)]
 struct PullSource {
+    kind: &'static str,
     path: PathBuf,
     resolved_by: String,
     cleanup_root: Option<PathBuf>,
 }
 
 impl PullSource {
-    fn temp(path: PathBuf, resolved_by: String, cleanup_root: PathBuf) -> Self {
+    fn temp(kind: &'static str, path: PathBuf, resolved_by: String, cleanup_root: PathBuf) -> Self {
         Self {
+            kind,
             path,
             resolved_by,
             cleanup_root: Some(cleanup_root),
@@ -698,7 +701,7 @@ fn install(
             ensure_not_interrupted()?;
             copy_executable(&src.path, &dst)?;
             InstallSource {
-                kind: SOURCE_KIND_DOWNLOAD,
+                kind: src.kind,
                 detail: src.resolved_by.clone(),
             }
         };

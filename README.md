@@ -204,7 +204,7 @@ Resolution order:
 - HTTPS: `HTTPS_PROXY` -> `ALL_PROXY` -> `HTTP_PROXY`
 - HTTP: `HTTP_PROXY` -> `ALL_PROXY`
 - Bypass: `NO_PROXY` / `no_proxy`
-- Config scopes: `[proxy]` defaults, overridden by `[run]` / `[tool]` / `[update]`
+- Config scopes: `za deps` uses `[proxy]` defaults; `za run` / `za tool` / `za update` additionally honor `[run]` / `[tool]` / `[update]`
 
 Example:
 

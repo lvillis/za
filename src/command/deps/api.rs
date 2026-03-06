@@ -1,4 +1,10 @@
 use super::*;
+use fs4::fs_std::FileExt;
+use reqx::blocking::ClientBuilder;
+use std::{
+    fs::{File, OpenOptions},
+    sync::atomic::AtomicU64,
+};
 
 pub(super) struct ApiClient {
     crates_http: Client,
@@ -47,6 +53,23 @@ struct DepsCacheState {
     dirty: bool,
 }
 
+#[derive(Debug)]
+struct DepsCacheLock {
+    _file: File,
+}
+
+const HTTPS_PROXY_ENV_KEYS: [&str; 6] = [
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+];
+const HTTP_PROXY_ENV_KEYS: [&str; 4] = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
+
+static CACHE_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
 impl DepsCacheState {
     fn load() -> Self {
         let Some(path) = deps_cache_path() else {
@@ -89,6 +112,7 @@ impl DepsCacheState {
         let Some(path) = self.path.clone() else {
             return Ok(());
         };
+        let _lock = DepsCacheLock::acquire(&path)?;
         self.data.schema_version = DEPS_CACHE_SCHEMA_VERSION;
         let content =
             serde_json::to_vec_pretty(&self.data).context("serialize dependency cache")?;
@@ -96,7 +120,7 @@ impl DepsCacheState {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create cache directory {}", parent.display()))?;
         }
-        let tmp = path.with_extension("tmp");
+        let tmp = unique_cache_temp_path(&path);
         fs::write(&tmp, content).with_context(|| format!("write {}", tmp.display()))?;
         fs::rename(&tmp, &path)
             .with_context(|| format!("replace cache {} -> {}", path.display(), tmp.display()))?;
@@ -105,22 +129,38 @@ impl DepsCacheState {
     }
 }
 
+impl DepsCacheLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let lock_path = path.with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create cache directory {}", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("open cache lock {}", lock_path.display()))?;
+        file.lock_exclusive()
+            .with_context(|| format!("acquire cache lock {}", lock_path.display()))?;
+        Ok(Self { _file: file })
+    }
+}
+
+impl Drop for DepsCacheLock {
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
+}
+
 impl ApiClient {
     pub(super) fn new(github_token_override: Option<String>) -> Result<Self> {
-        let crates_http = Client::builder("https://crates.io")
-            .request_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-            .total_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-            .retry_policy(RetryPolicy::disabled())
-            .client_name("za-deps-audit")
-            .build()
-            .context("build crates.io HTTP client")?;
-        let github_http = Client::builder("https://api.github.com")
-            .request_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-            .total_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-            .retry_policy(RetryPolicy::disabled())
-            .client_name("za-deps-audit")
-            .build()
-            .context("build GitHub HTTP client")?;
+        let crates_http =
+            build_http_client("https://crates.io").context("build crates.io HTTP client")?;
+        let github_http =
+            build_http_client("https://api.github.com").context("build GitHub HTTP client")?;
         let github_token = resolve_github_token(github_token_override)?;
         Ok(Self {
             crates_http,
@@ -441,6 +481,107 @@ impl ApiClient {
         let err = last_err.unwrap_or_else(|| anyhow!("unknown retry failure"));
         Err(err).with_context(|| format!("{op_name} failed after {HTTP_MAX_ATTEMPTS} attempts"))
     }
+}
+
+fn unique_cache_temp_path(path: &Path) -> PathBuf {
+    let nonce = CACHE_TEMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_extension(format!("tmp-{}-{nonce}", std::process::id()))
+}
+
+fn proxy_env_keys_for_scheme(scheme: &str) -> &'static [&'static str] {
+    if scheme.eq_ignore_ascii_case("https") {
+        &HTTPS_PROXY_ENV_KEYS
+    } else {
+        &HTTP_PROXY_ENV_KEYS
+    }
+}
+
+fn first_env_value(names: &[&str]) -> Option<(String, String)> {
+    for name in names {
+        let Ok(value) = env::var(name) else {
+            continue;
+        };
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(((*name).to_string(), value.to_string()));
+        }
+    }
+    None
+}
+
+fn split_no_proxy_rules(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn apply_proxy_with_scope(
+    mut builder: ClientBuilder,
+    scheme: &str,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<ClientBuilder> {
+    let overrides = za_config::load_proxy_overrides(proxy_scope)?;
+    let proxy_value = if scheme.eq_ignore_ascii_case("https") {
+        overrides
+            .https_proxy
+            .clone()
+            .or_else(|| overrides.all_proxy.clone())
+            .or_else(|| overrides.http_proxy.clone())
+    } else {
+        overrides
+            .http_proxy
+            .clone()
+            .or_else(|| overrides.all_proxy.clone())
+            .or_else(|| overrides.https_proxy.clone())
+    };
+
+    let (proxy_var, proxy_value) = if let Some(value) = proxy_value {
+        ("config".to_string(), value)
+    } else if let Some((name, value)) = first_env_value(proxy_env_keys_for_scheme(scheme)) {
+        (name, value)
+    } else {
+        return Ok(builder);
+    };
+
+    let proxy_uri = proxy_value
+        .parse()
+        .with_context(|| format!("invalid proxy URI in `{proxy_var}`"))?;
+    builder = builder.http_proxy(proxy_uri);
+
+    let no_proxy_raw = overrides
+        .no_proxy
+        .clone()
+        .or_else(|| first_env_value(&["NO_PROXY", "no_proxy"]).map(|(_, value)| value));
+    if let Some(no_proxy_raw) = no_proxy_raw {
+        let rules = split_no_proxy_rules(&no_proxy_raw);
+        if !rules.is_empty() {
+            builder = builder
+                .try_no_proxy(rules)
+                .context("invalid `NO_PROXY`/`no_proxy` rules")?;
+        }
+    }
+
+    Ok(builder)
+}
+
+fn build_http_client(base_url: &str) -> Result<Client> {
+    let mut builder = Client::builder(base_url)
+        .request_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .total_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .retry_policy(RetryPolicy::disabled())
+        .client_name("za-deps-audit");
+    let scheme = base_url
+        .split_once("://")
+        .map(|(scheme, _)| scheme)
+        .unwrap_or("https");
+    builder = apply_proxy_with_scope(builder, scheme, za_config::ProxyScope::Deps)
+        .with_context(|| format!("configure HTTP client proxy for `{base_url}`"))?;
+    builder
+        .build()
+        .with_context(|| format!("build HTTP client for `{base_url}`"))
 }
 
 fn resolve_github_token(override_token: Option<String>) -> Result<Option<String>> {

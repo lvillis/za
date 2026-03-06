@@ -324,6 +324,7 @@ pub enum ProxyScope {
     Run,
     Tool,
     Update,
+    Deps,
 }
 
 pub fn run(cmd: Option<ConfigCommands>) -> Result<()> {
@@ -362,6 +363,7 @@ pub fn load_proxy_overrides(scope: ProxyScope) -> Result<ProxyOverrides> {
         ProxyScope::Run => normalize_proxy_config(&cfg.run),
         ProxyScope::Tool => normalize_proxy_config(&cfg.tool),
         ProxyScope::Update => normalize_proxy_config(&cfg.update),
+        ProxyScope::Deps => ProxyOverrides::default(),
     };
     Ok(merge_proxy_overrides(&global, &scoped))
 }

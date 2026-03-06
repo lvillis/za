@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::AtomicU64;
 
 const TEMP_DIR_PREFIX_DOWNLOAD: &str = "za-tool-download";
 const TEMP_DIR_PREFIX_CARGO_INSTALL: &str = "za-tool-cargo-install";
@@ -6,6 +7,7 @@ const TEMP_DIR_PREFIXES: [&str; 2] = [TEMP_DIR_PREFIX_DOWNLOAD, TEMP_DIR_PREFIX_
 
 static ACTIVE_TEMP_DIRS: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+static TEMP_DIR_NONCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn unregister_temp_dir(path: &Path) {
     if let Ok(mut dirs) = ACTIVE_TEMP_DIRS.lock() {
@@ -239,6 +241,7 @@ fn install_from_cargo_package(tool: &ToolRef, package: &str) -> Result<PullSourc
             let p = bin_dir.join(&candidate);
             if is_executable_file(&p) {
                 return Ok(PullSource::temp(
+                    SOURCE_KIND_CARGO_INSTALL,
                     p,
                     format!("cargo install {package}"),
                     install_root.clone(),
@@ -250,6 +253,7 @@ fn install_from_cargo_package(tool: &ToolRef, package: &str) -> Result<PullSourc
         collect_files_recursive(&bin_dir, &mut files)?;
         if files.len() == 1 {
             return Ok(PullSource::temp(
+                SOURCE_KIND_CARGO_INSTALL,
                 files.remove(0),
                 format!("cargo install {package}"),
                 install_root.clone(),
@@ -548,6 +552,7 @@ fn download_from_url(
         };
 
         Ok(PullSource::temp(
+            SOURCE_KIND_DOWNLOAD,
             executable_path,
             match expected_sha256 {
                 Some(expected) => format!("URL {url} (sha256={expected})"),
@@ -799,15 +804,26 @@ fn collect_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 fn unique_temp_dir(prefix: &str) -> Result<PathBuf> {
     let base = env::temp_dir();
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
     let pid = std::process::id();
-    let dir = base.join(format!("{prefix}-{ts}-{pid}"));
-    fs::create_dir(&dir).with_context(|| format!("create temp dir {}", dir.display()))?;
-    register_temp_dir(&dir);
-    Ok(dir)
+    for _ in 0..128 {
+        let nonce = TEMP_DIR_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let dir = base.join(format!("{prefix}-{nonce}-{ts}-{pid}"));
+        match fs::create_dir(&dir) {
+            Ok(()) => {
+                register_temp_dir(&dir);
+                return Ok(dir);
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("create temp dir {}", dir.display()));
+            }
+        }
+    }
+    bail!("failed to allocate unique temp dir for prefix `{prefix}`")
 }
 
 #[cfg(test)]

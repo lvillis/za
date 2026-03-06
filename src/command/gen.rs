@@ -11,6 +11,7 @@ use std::{
     fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tar::Archive;
@@ -19,6 +20,8 @@ use crate::command::{BinaryFile, TextFile, lang_of, md_header, walk_workspace};
 
 const HTTP_TIMEOUT_SECS: u64 = 180;
 const HTTP_USER_AGENT: &str = "za-gen/0.1";
+
+static TEMP_DIR_NONCE: AtomicU64 = AtomicU64::new(0);
 
 /// Entry for `za gen`
 pub fn run(
@@ -34,6 +37,7 @@ pub fn run(
     } else {
         std::env::current_dir()?.join(output)
     };
+    ensure_output_parent(&output_abs)?;
 
     match repo {
         None => {
@@ -56,6 +60,16 @@ pub fn run(
         }
     }
 
+    Ok(())
+}
+
+fn ensure_output_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create output directory {}", parent.display()))?;
+    }
     Ok(())
 }
 
@@ -429,19 +443,32 @@ impl Drop for CwdGuard {
 
 fn unique_temp_dir(prefix: &str) -> Result<PathBuf> {
     let base = std::env::temp_dir();
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
     let pid = std::process::id();
-    let dir = base.join(format!("{prefix}-{ts}-{pid}"));
-    fs::create_dir(&dir).with_context(|| format!("create temp dir {}", dir.display()))?;
-    Ok(dir)
+    for _ in 0..128 {
+        let nonce = TEMP_DIR_NONCE.fetch_add(1, Ordering::Relaxed);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let dir = base.join(format!("{prefix}-{nonce}-{ts}-{pid}"));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("create temp dir {}", dir.display()));
+            }
+        }
+    }
+    bail!("failed to allocate unique temp dir for prefix `{prefix}`")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_github_repo, percent_encode_path_segment, snippet};
+    use super::{ensure_output_parent, parse_github_repo, percent_encode_path_segment, snippet};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn snippet_preserves_odd_max_lines() {
@@ -475,5 +502,23 @@ mod tests {
             percent_encode_path_segment("feature/x"),
             "feature%2Fx".to_string()
         );
+    }
+
+    #[test]
+    fn ensure_output_parent_creates_missing_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "za-gen-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let target = root.join("docs/CONTEXT.md");
+
+        ensure_output_parent(&target).expect("create parent directories");
+        assert!(target.parent().is_some_and(|parent| parent.is_dir()));
+
+        let _ = fs::remove_dir_all(root);
     }
 }
