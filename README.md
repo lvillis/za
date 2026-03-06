@@ -214,7 +214,7 @@ HTTPS_PROXY=http://proxy.internal:1080 za tool update docker-compose
 
 ## Dependency Audit (`za deps`)
 
-`za deps` inspects Rust dependencies and combines governance and maintenance signals, including yanked latest releases, license metadata, MSRV declarations, crates.io freshness, and GitHub activity.
+`za deps` inspects Rust dependencies and combines governance and maintenance signals, including yanked latest releases, license metadata, MSRV declarations, crates.io freshness, and GitHub activity. By default it audits the direct dependencies currently activated by Cargo's resolved feature graph for the target manifest; add `--include-optional` to also include optional direct dependencies that are declared but inactive.
 
 ```bash
 # default project (Cargo.toml in cwd)

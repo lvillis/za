@@ -44,7 +44,7 @@ pub enum Commands {
         /// Include build-dependencies in audit.
         #[arg(long)]
         include_build: bool,
-        /// Include optional dependencies in audit.
+        /// Also include optional dependencies that are not active in the current resolved feature set.
         #[arg(long)]
         include_optional: bool,
         /// Write full audit report to JSON.

@@ -243,7 +243,6 @@ fn cargo_metadata(manifest_path: &Path) -> Result<CargoMetadata> {
         .arg("metadata")
         .arg("--format-version")
         .arg("1")
-        .arg("--no-deps")
         .arg("--manifest-path")
         .arg(manifest_path)
         .output()
@@ -270,33 +269,143 @@ fn collect_dependency_specs(
     let package_ids = target_package_ids(metadata);
     let mut collected: BTreeMap<String, DependencySpecBuilder> = BTreeMap::new();
 
+    let used_resolve = collect_resolved_dependency_specs(
+        metadata,
+        &package_by_id,
+        &package_ids,
+        include_dev,
+        include_build,
+        &mut collected,
+    )?;
+
+    if include_optional {
+        collect_declared_dependency_specs(
+            &package_by_id,
+            &package_ids,
+            include_dev,
+            include_build,
+            true,
+            &mut collected,
+            DeclaredDependencySelection::OptionalOnly,
+        )?;
+    }
+
+    if !used_resolve {
+        collect_declared_dependency_specs(
+            &package_by_id,
+            &package_ids,
+            include_dev,
+            include_build,
+            include_optional,
+            &mut collected,
+            DeclaredDependencySelection::All,
+        )?;
+    }
+
+    Ok(build_dependency_specs(collected))
+}
+
+fn collect_resolved_dependency_specs(
+    metadata: &CargoMetadata,
+    package_by_id: &BTreeMap<&str, &CargoPackage>,
+    package_ids: &[&str],
+    include_dev: bool,
+    include_build: bool,
+    collected: &mut BTreeMap<String, DependencySpecBuilder>,
+) -> Result<bool> {
+    let Some(resolve) = metadata.resolve.as_ref() else {
+        return Ok(false);
+    };
+
+    let mut node_by_id: BTreeMap<&str, &CargoResolveNode> = BTreeMap::new();
+    for node in &resolve.nodes {
+        node_by_id.insert(node.id.as_str(), node);
+    }
+
     for package_id in package_ids {
         let package = package_by_id
             .get(package_id)
             .ok_or_else(|| anyhow!("workspace package id not found in metadata: {package_id}"))?;
+        let Some(node) = node_by_id.get(package_id) else {
+            return Ok(false);
+        };
+
+        for dep in &node.deps {
+            let dep_package = package_by_id
+                .get(dep.pkg.as_str())
+                .ok_or_else(|| anyhow!("resolved dependency package not found: {}", dep.pkg))?;
+
+            let active_kinds = dependency_kinds_from_resolve(dep);
+            for kind in active_kinds {
+                if !should_include_kind(kind, include_dev, include_build) {
+                    continue;
+                }
+
+                let declarations =
+                    matching_dependency_declarations(package, &dep_package.name, kind);
+                let requirement = declarations
+                    .iter()
+                    .map(|dep| dep.req.as_str())
+                    .collect::<BTreeSet<_>>();
+                let optional = declarations.iter().all(|dep| dep.optional);
+
+                insert_dependency_spec(
+                    collected,
+                    dep_package.name.clone(),
+                    join_str_set(&requirement),
+                    kind.to_string(),
+                    optional,
+                );
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+fn collect_declared_dependency_specs(
+    package_by_id: &BTreeMap<&str, &CargoPackage>,
+    package_ids: &[&str],
+    include_dev: bool,
+    include_build: bool,
+    include_optional: bool,
+    collected: &mut BTreeMap<String, DependencySpecBuilder>,
+    selection: DeclaredDependencySelection,
+) -> Result<()> {
+    for package_id in package_ids {
+        let package = package_by_id
+            .get(package_id)
+            .ok_or_else(|| anyhow!("workspace package id not found in metadata: {package_id}"))?;
+
         for dep in &package.dependencies {
+            if !selection.matches(dep.optional) {
+                continue;
+            }
             if dep.optional && !include_optional {
                 continue;
             }
 
-            let kind = dep.kind.as_deref().unwrap_or("normal");
-            if kind == "dev" && !include_dev {
-                continue;
-            }
-            if kind == "build" && !include_build {
-                continue;
-            }
-            if kind != "normal" && kind != "dev" && kind != "build" {
+            let kind = dependency_kind(dep.kind.as_deref());
+            if !should_include_kind(kind, include_dev, include_build) {
                 continue;
             }
 
-            let entry = collected.entry(dep.name.clone()).or_default();
-            entry.requirements.insert(dep.req.clone());
-            entry.kinds.insert(kind.to_string());
-            entry.optional = entry.optional && dep.optional;
+            insert_dependency_spec(
+                collected,
+                dep.name.clone(),
+                dep.req.clone(),
+                kind.to_string(),
+                dep.optional,
+            );
         }
     }
 
+    Ok(())
+}
+
+fn build_dependency_specs(
+    collected: BTreeMap<String, DependencySpecBuilder>,
+) -> Vec<DependencySpec> {
     let mut out = Vec::with_capacity(collected.len());
     for (name, builder) in collected {
         out.push(DependencySpec {
@@ -306,7 +415,81 @@ fn collect_dependency_specs(
             optional: builder.optional,
         });
     }
-    Ok(out)
+    out
+}
+
+fn insert_dependency_spec(
+    collected: &mut BTreeMap<String, DependencySpecBuilder>,
+    name: String,
+    requirement: String,
+    kind: String,
+    optional: bool,
+) {
+    let entry = collected.entry(name).or_default();
+    entry.requirements.insert(requirement);
+    entry.kinds.insert(kind);
+    entry.optional = entry.optional && optional;
+}
+
+fn matching_dependency_declarations<'a>(
+    package: &'a CargoPackage,
+    dep_package_name: &str,
+    kind: &str,
+) -> Vec<&'a CargoDependency> {
+    let mut matches = package
+        .dependencies
+        .iter()
+        .filter(|dep| {
+            dependency_name_matches(dep.name.as_str(), dep_package_name)
+                && dependency_kind(dep.kind.as_deref()) == kind
+        })
+        .collect::<Vec<_>>();
+
+    if matches.is_empty() {
+        matches = package
+            .dependencies
+            .iter()
+            .filter(|dep| dependency_name_matches(dep.name.as_str(), dep_package_name))
+            .collect::<Vec<_>>();
+    }
+
+    matches
+}
+
+fn dependency_kinds_from_resolve(dep: &CargoResolveNodeDep) -> BTreeSet<&str> {
+    let mut kinds = BTreeSet::new();
+    for dep_kind in &dep.dep_kinds {
+        kinds.insert(dependency_kind(dep_kind.kind.as_deref()));
+    }
+    if kinds.is_empty() {
+        kinds.insert("normal");
+    }
+    kinds
+}
+
+fn dependency_kind(kind: Option<&str>) -> &str {
+    kind.unwrap_or("normal")
+}
+
+fn should_include_kind(kind: &str, include_dev: bool, include_build: bool) -> bool {
+    match kind {
+        "normal" => true,
+        "dev" => include_dev,
+        "build" => include_build,
+        _ => false,
+    }
+}
+
+fn dependency_name_matches(left: &str, right: &str) -> bool {
+    left == right || normalize_dependency_name(left) == normalize_dependency_name(right)
+}
+
+fn normalize_dependency_name(name: &str) -> String {
+    name.replace('-', "_")
+}
+
+fn join_str_set(set: &BTreeSet<&str>) -> String {
+    set.iter().copied().collect::<Vec<_>>().join(",")
 }
 
 fn target_package_ids(metadata: &CargoMetadata) -> Vec<&str> {
@@ -454,11 +637,13 @@ struct CargoMetadata {
     packages: Vec<CargoPackage>,
     workspace_members: Vec<String>,
     root: Option<String>,
+    resolve: Option<CargoResolve>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CargoPackage {
     id: String,
+    name: String,
     dependencies: Vec<CargoDependency>,
 }
 
@@ -468,6 +653,45 @@ struct CargoDependency {
     req: String,
     kind: Option<String>,
     optional: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoResolve {
+    nodes: Vec<CargoResolveNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoResolveNode {
+    id: String,
+    #[serde(default)]
+    deps: Vec<CargoResolveNodeDep>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoResolveNodeDep {
+    pkg: String,
+    #[serde(default)]
+    dep_kinds: Vec<CargoResolveDepKind>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoResolveDepKind {
+    kind: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum DeclaredDependencySelection {
+    All,
+    OptionalOnly,
+}
+
+impl DeclaredDependencySelection {
+    fn matches(self, optional: bool) -> bool {
+        match self {
+            Self::All => true,
+            Self::OptionalOnly => optional,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
