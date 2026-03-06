@@ -3,8 +3,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use flate2::read::GzDecoder;
 use reqx::{
-    RedirectPolicy, RetryPolicy,
+    advanced::{ClientProfile, RedirectPolicy},
     blocking::{Client, ClientBuilder},
+    prelude::RetryPolicy,
 };
 use std::{
     env,
@@ -270,7 +271,7 @@ fn download_to_path(url: &str, dst: &Path) -> Result<()> {
         .try_header("user-agent", HTTP_USER_AGENT)
         .context("set download user-agent")?;
     let mut resp = req
-        .send_stream()
+        .send_response_stream()
         .with_context(|| format!("download `{url}`"))?;
     let status = resp.status();
     if !status.is_success() {
@@ -406,6 +407,7 @@ fn apply_proxy_from_env(mut builder: ClientBuilder, scheme: &str) -> Result<Clie
 
 fn build_http_client(base_url: &str, client_name: &str, follow_redirects: bool) -> Result<Client> {
     let mut builder = Client::builder(base_url)
+        .profile(ClientProfile::HighThroughput)
         .request_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .total_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .retry_policy(RetryPolicy::disabled())

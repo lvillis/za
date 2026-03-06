@@ -1,6 +1,10 @@
 use super::*;
 use fs4::fs_std::FileExt;
-use reqx::blocking::ClientBuilder;
+use reqx::{
+    advanced::ClientProfile,
+    blocking::{Client, ClientBuilder},
+    prelude::RetryPolicy,
+};
 use std::{
     fs::{File, OpenOptions},
     sync::atomic::AtomicU64,
@@ -294,7 +298,7 @@ impl ApiClient {
             req = req
                 .try_header("user-agent", HTTP_USER_AGENT)
                 .map_err(|err| AttemptError::Fatal(anyhow!("set user-agent header: {err}")))?;
-            let response = req.send_with_status().map_err(|err| {
+            let response = req.send_response().map_err(|err| {
                 AttemptError::Retryable(anyhow!("request crates.io API failed: {err}"))
             })?;
             let status = response.status();
@@ -369,7 +373,7 @@ impl ApiClient {
                     })?;
             }
 
-            let response = req.send_with_status().map_err(|err| {
+            let response = req.send_response().map_err(|err| {
                 AttemptError::Retryable(anyhow!("request GitHub API failed: {err}"))
             })?;
             let status = response.status();
@@ -587,6 +591,7 @@ fn apply_proxy_with_scope(
 
 fn build_http_client(base_url: &str) -> Result<Client> {
     let mut builder = Client::builder(base_url)
+        .profile(ClientProfile::StandardSdk)
         .request_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .total_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .retry_policy(RetryPolicy::disabled())

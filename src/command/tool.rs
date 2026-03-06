@@ -9,8 +9,9 @@ use flate2::read::GzDecoder;
 use fs4::fs_std::FileExt;
 use regex::Regex;
 use reqx::{
-    RedirectPolicy, RetryPolicy,
+    advanced::{ClientProfile, RedirectPolicy},
     blocking::{Client, ClientBuilder},
+    prelude::RetryPolicy,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

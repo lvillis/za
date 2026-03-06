@@ -369,6 +369,11 @@ fn build_http_client(
     proxy_scope: za_config::ProxyScope,
 ) -> Result<Client> {
     let mut builder = Client::builder(base_url)
+        .profile(if follow_redirects {
+            ClientProfile::HighThroughput
+        } else {
+            ClientProfile::StandardSdk
+        })
         .request_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .total_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
         .retry_policy(RetryPolicy::disabled())
@@ -412,7 +417,7 @@ fn fetch_github_release(
     }
 
     let response = req
-        .send_with_status()
+        .send_response()
         .with_context(|| format!("query {project_label} release metadata ({PROXY_HINT})"))?;
     let status = response.status();
     if !status.is_success() {
@@ -487,8 +492,19 @@ fn download_from_url(
             .try_header("user-agent", HTTP_USER_AGENT)
             .context("set download user-agent")?;
         let mut resp = req
-            .send_stream()
+            .send_response_stream()
             .with_context(|| format!("download from `{url}` ({PROXY_HINT})"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp
+                .into_text_lossy_limited(16 * 1024)
+                .unwrap_or_else(|_| "<body unavailable>".to_string());
+            bail!(
+                "download from `{url}` failed: status {} body {}",
+                status,
+                truncate_for_log(&body, 200)
+            );
+        }
         let total_bytes = resp
             .headers()
             .get("content-length")
