@@ -1,9 +1,18 @@
+## [0.1.20] - 2026-03-06
+
+### 🚀 Features
+
+- Add dependency governance signals to deps audit
 ## [0.1.19] - 2026-03-06
 
 ### 🐛 Bug Fixes
 
 - Harden git auth verification
 - Harden process identity, proxy wiring, and temp/cache safety
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.19
 ## [0.1.18] - 2026-03-05
 
 ### 🐛 Bug Fixes
