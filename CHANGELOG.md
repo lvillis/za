@@ -3,6 +3,10 @@
 ### 🐛 Bug Fixes
 
 - Audit active Cargo dependencies from the resolved feature graph
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.21
 ## [0.1.20] - 2026-03-06
 
 ### 🚀 Features
