@@ -23,7 +23,9 @@
 
 - Generate high-signal project context files fast.
 - Manage critical CLI binaries with version visibility and safe updates.
+- Keep Codex work sessions alive across SSH clients with tmux-backed attach/resume flows.
 - Audit Rust dependencies with governance and maintenance signals before they become incidents.
+- Track GitHub Actions progress for the current commit without opening the web UI.
 - Run tools with consistent runtime and proxy settings.
 
 ## Install
@@ -68,7 +70,21 @@ za tool update codex
 za run codex
 ```
 
-### 3) Audit dependency risk
+### 3) Keep Codex sessions alive across devices
+
+```bash
+za codex up
+za codex -- resume
+za codex attach
+za codex exec -- bash
+za codex resume
+za codex ps
+za codex stop
+```
+
+`za codex` uses `tmux` to keep a per-workspace Codex session alive. Start from your Windows IDE terminal, then SSH in from your phone and run `za codex attach` from the same repository to take over the session.
+
+### 4) Audit dependency risk
 
 ```bash
 za deps
@@ -76,7 +92,7 @@ za deps --jobs 16
 za deps --fail-on-high
 ```
 
-### 4) Manage JetBrains remote IDE sessions
+### 5) Manage JetBrains remote IDE sessions
 
 ```bash
 za ide ps
@@ -90,7 +106,18 @@ za ide stop 42589
 - `ide-max-per-project` (default `1`)
 - `ide-orphan-ttl-minutes` (default `30`)
 
-### 5) Enable GitHub auth for IDE/CLI Git operations
+### 6) Track GitHub Actions
+
+```bash
+za ci
+za ci watch
+za ci list --repo lvillis/za --repo lvillis/reqx-rs
+za ci list --group work
+```
+
+`za ci` inspects the current repository `HEAD` commit. `za ci watch` follows that commit until GitHub Actions reaches a terminal state. `za ci list` can read repo groups from `~/.config/za/ci.toml`.
+
+### 7) Enable GitHub auth for IDE/CLI Git operations
 
 ```bash
 za git auth enable
@@ -110,7 +137,9 @@ za git auth test --repo https://github.com/org/repo.git
 | `za gen` | Generate project context snapshots (`CONTEXT.md`). |
 | `za tool` | Install/update/list/use/uninstall managed binaries. |
 | `za run` | Launch a tool directly with normalized proxy environment variables. |
+| `za codex` | Manage long-lived Codex tmux sessions for the current workspace. |
 | `za deps` | Audit Rust dependency governance and maintenance risk. |
+| `za ci` | Inspect GitHub Actions progress for the current commit or repo groups. |
 | `za config` | Persist CLI config (`[auth]`, `[proxy]`, `[run]`, `[tool]`, `[update]`). |
 | `za ide` | Inspect and reconcile JetBrains remote IDE server processes. |
 | `za git` | Wire and diagnose GitHub credential-helper based auth. |
@@ -197,14 +226,55 @@ Resolution order:
 2. Global-scope active managed tool
 3. `PATH`
 
+### Managed Codex Sessions (`za codex`)
+
+Use `za codex` when you want a durable Codex work session that survives SSH disconnects and can be reattached from another device. `tmux` is required.
+
+```bash
+# create or attach the current workspace session
+za codex up
+
+# bare `za codex` is equivalent to `za codex up`
+za codex
+
+# force a fresh managed startup path with explicit Codex args
+za codex -- resume
+za codex -- resume --last
+
+# take over the session from another terminal/device
+za codex attach
+
+# open another tmux window in the same session
+za codex exec -- bash
+za codex exec -- git status
+
+# recreate the managed session by resuming the last Codex conversation
+za codex resume
+
+# inspect and stop managed sessions
+za codex ps
+za codex stop
+```
+
+Behavior notes:
+
+- Session name is stable per workspace root, so any terminal in the same repo resolves to the same tmux session.
+- `za codex up` launches the active managed `codex` binary with `--no-alt-screen`.
+- `za codex -- <codex args>` is treated as an explicit startup request, not an attach. If a managed session already exists for the workspace, `za` recreates it first and then launches `codex --no-alt-screen <args>`.
+- `za codex attach` uses `tmux attach -d` semantics outside tmux, so one device can cleanly take over the session from another.
+- `za codex exec` creates a new tmux window inside the existing session; its exit code reflects tmux window creation, not the spawned command result.
+- `za codex resume` starts a managed tmux session running `codex resume --last` when no session exists yet.
+- `za codex ps` now surfaces the Codex session id plus the same `MODEL`, `EFFORT`, and remaining context percentage (`LEFT%`) shown in the Codex TUI by reading the latest `token_count` event in the local Codex session log, with older TUI sampling logs kept only as a compatibility fallback.
+- If `tmux` is not installed, `za codex ps` still shows locally recorded sessions as `unavailable`, and `za codex stop` degrades to local metadata cleanup instead of failing with an opaque error.
+
 ### Proxy behavior
 
-`za run`, `za tool`, `za update`, and `za deps` respect proxy settings:
+`za run`, `za codex`, `za tool`, `za update`, `za deps`, and `za ci` respect proxy settings:
 
 - HTTPS: `HTTPS_PROXY` -> `ALL_PROXY` -> `HTTP_PROXY`
 - HTTP: `HTTP_PROXY` -> `ALL_PROXY`
 - Bypass: `NO_PROXY` / `no_proxy`
-- Config scopes: `za deps` uses `[proxy]` defaults; `za run` / `za tool` / `za update` additionally honor `[run]` / `[tool]` / `[update]`
+- Config scopes: `za deps` and `za ci` use `[proxy]` defaults; `za run` / `za codex` / `za tool` / `za update` additionally honor `[run]` / `[tool]` / `[update]`
 
 Example:
 
@@ -235,6 +305,42 @@ Token resolution priority:
 1. `--github-token`
 2. `GITHUB_TOKEN` / `GH_TOKEN`
 3. `za config` persisted value
+
+## CI Status (`za ci`)
+
+`za ci` reports GitHub Actions state for the current repository `HEAD` commit. It aggregates workflow runs for the same `head_sha`, so the first screen answers the question you usually care about after a push: did this commit pass yet?
+
+```bash
+# current repo HEAD
+za ci
+
+# wait until terminal state
+za ci watch --timeout-secs 900
+
+# inspect explicit repos or local clones
+za ci list --repo lvillis/za --repo /code/reqx-rs
+
+# read a named repo group
+za ci list --group work
+```
+
+Repo groups live in `~/.config/za/ci.toml` by default:
+
+```toml
+[groups.work]
+repos = [
+  "/code/za",
+  "/code/reqx-rs",
+  "lvillis/some-other-repo",
+]
+```
+
+Token resolution priority:
+
+1. `--github-token`
+2. `ZA_GITHUB_TOKEN`
+3. `GITHUB_TOKEN` / `GH_TOKEN`
+4. `za config` persisted value
 
 Set token once:
 

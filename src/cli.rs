@@ -70,6 +70,14 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Manage long-lived Codex work sessions backed by tmux
+    Codex {
+        #[command(subcommand)]
+        cmd: Option<CodexCommands>,
+        /// Arguments passed through to `codex` when prefixed by `--`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Update za itself from GitHub releases
     Update {
         /// Install to user-level paths (`~/.local/...`) instead of system-level paths.
@@ -91,6 +99,17 @@ pub enum Commands {
     Ide {
         #[command(subcommand)]
         cmd: IdeCommands,
+    },
+    /// Inspect GitHub Actions progress for the current commit or repo groups
+    Ci {
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+        /// Optional GitHub token override for this run.
+        #[arg(long, value_name = "TOKEN")]
+        github_token: Option<String>,
+        #[command(subcommand)]
+        cmd: Option<CiCommands>,
     },
     /// Manage Git authentication integration
     Git {
@@ -220,6 +239,78 @@ pub enum IdeReconcileStrategy {
     Oldest,
 }
 
+/// `za codex` sub-commands
+#[derive(Subcommand)]
+pub enum CodexCommands {
+    /// Create or attach the current workspace Codex tmux session
+    Up {
+        /// Arguments passed through to `codex`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Attach to the current workspace Codex tmux session
+    Attach,
+    /// Open a new tmux window inside the current workspace Codex session
+    Exec {
+        /// Command to run inside the existing tmux session
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
+    /// Start a managed session by resuming the most recent Codex conversation
+    Resume {
+        /// Arguments passed through to `codex resume --last`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// List managed Codex tmux sessions
+    Ps {
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the current workspace Codex tmux session
+    Stop {
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `za ci` sub-commands
+#[derive(Subcommand)]
+pub enum CiCommands {
+    /// Watch current commit CI until it reaches a terminal state
+    Watch {
+        /// Stop waiting after this many seconds.
+        #[arg(long, value_name = "SECS")]
+        timeout_secs: Option<u64>,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+        /// Optional GitHub token override for this run.
+        #[arg(long, value_name = "TOKEN")]
+        github_token: Option<String>,
+    },
+    /// List CI status across repos from args or a group manifest
+    List {
+        /// Group name from `~/.config/za/ci.toml` (or `--file`).
+        #[arg(long, value_name = "GROUP")]
+        group: Option<String>,
+        /// Repo slug, GitHub URL, or local repo path. Repeat to add more targets.
+        #[arg(long, value_name = "REPO_OR_PATH")]
+        repo: Vec<String>,
+        /// CI manifest path. Defaults to `~/.config/za/ci.toml`.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+        /// Optional GitHub token override for this run.
+        #[arg(long, value_name = "TOKEN")]
+        github_token: Option<String>,
+    },
+}
+
 /// `za git` sub-commands
 #[derive(Subcommand)]
 pub enum GitCommands {
@@ -311,4 +402,34 @@ pub enum ConfigKey {
     IdeMaxPerProject,
     #[value(name = "ide-orphan-ttl-minutes")]
     IdeOrphanTtlMinutes,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, CodexCommands, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn codex_passthrough_args_are_captured_after_double_dash() {
+        let cli = Cli::try_parse_from(["za", "codex", "--", "resume"]).expect("must parse");
+        match cli.cmd {
+            Commands::Codex { cmd, args } => {
+                assert!(cmd.is_none());
+                assert_eq!(args, vec!["resume"]);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn codex_subcommand_still_parses_normally() {
+        let cli = Cli::try_parse_from(["za", "codex", "attach"]).expect("must parse");
+        match cli.cmd {
+            Commands::Codex { cmd, args } => {
+                assert!(args.is_empty());
+                assert!(matches!(cmd, Some(CodexCommands::Attach)));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
 }

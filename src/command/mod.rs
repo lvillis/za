@@ -1,5 +1,7 @@
 //! Shared helpers and constants for all sub-commands.
 
+pub mod ci;
+pub mod codex;
 pub mod deps;
 pub mod r#gen;
 pub mod git;

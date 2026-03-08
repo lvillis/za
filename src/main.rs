@@ -46,6 +46,13 @@ fn main() -> Result<()> {
             let exit_code = command::run::run(&tool, &args)?;
             std::process::exit(exit_code);
         }
+        cli::Commands::Codex { cmd, args } => {
+            let exit_code = command::codex::run(cmd, &args)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         cli::Commands::Update {
             user,
             check,
@@ -60,6 +67,17 @@ fn main() -> Result<()> {
         cli::Commands::Config { cmd } => command::za_config::run(cmd),
         cli::Commands::Ide { cmd } => {
             let exit_code = command::ide::run(cmd)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
+        cli::Commands::Ci {
+            json,
+            github_token,
+            cmd,
+        } => {
+            let exit_code = command::ci::run(cmd, json, github_token)?;
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }

@@ -35,7 +35,7 @@ pub fn run(tool: &str, args: &[String]) -> Result<i32> {
     Ok(status.code().unwrap_or(130))
 }
 
-fn resolve_executable_path(name: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_executable_path(name: &str) -> Result<PathBuf> {
     if let Some(path) = resolve_user_managed_active(name)? {
         return Ok(path);
     }
@@ -142,7 +142,7 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-fn normalized_proxy_env_from_system() -> Result<Vec<(String, String)>> {
+pub(crate) fn normalized_proxy_env_from_system() -> Result<Vec<(String, String)>> {
     let vars: HashMap<String, String> = env::vars().collect();
     let overrides = crate::command::za_config::load_run_proxy_overrides()?;
     Ok(normalized_proxy_env(&vars, &overrides))
