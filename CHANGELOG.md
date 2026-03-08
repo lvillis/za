@@ -1,3 +1,13 @@
+## [0.1.23] - 2026-03-08
+
+### 🚀 Features
+
+- Add managed codex sessions and graceful tmux fallback
+## [0.1.22] - 2026-03-06
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.22
 ## [0.1.21] - 2026-03-06
 
 ### 🐛 Bug Fixes
