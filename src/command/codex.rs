@@ -1175,7 +1175,9 @@ fn truncate_end(value: &str, max: usize) -> String {
 
 fn is_tmux_no_server(stderr: &str) -> bool {
     let lower = stderr.trim().to_ascii_lowercase();
-    lower.contains("failed to connect to server") || lower.contains("no server running")
+    lower.contains("failed to connect to server")
+        || lower.contains("no server running")
+        || (lower.contains("error connecting to") && lower.contains("no such file or directory"))
 }
 
 fn is_tmux_missing_session(stderr: &str) -> bool {
@@ -1202,9 +1204,10 @@ fn git_capture(path: &Path, args: &[&str]) -> Result<String> {
 mod tests {
     use super::{
         CodexStopOutput, SESSION_HASH_LEN, activity_age_label, build_shell_exec_command,
-        calculate_context_left_percent, parse_legacy_codex_context_left_percent_lines,
-        parse_tmux_sessions, render_stop_message, sanitize_session_label, session_status_label,
-        shell_escape, summarize_codex_session_lines, workspace_hash,
+        calculate_context_left_percent, is_tmux_no_server,
+        parse_legacy_codex_context_left_percent_lines, parse_tmux_sessions, render_stop_message,
+        sanitize_session_label, session_status_label, shell_escape, summarize_codex_session_lines,
+        workspace_hash,
     };
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -1289,6 +1292,13 @@ mod tests {
         });
         assert!(message.contains("Removed local Codex session metadata"));
         assert!(message.contains("tmux` is unavailable"));
+    }
+
+    #[test]
+    fn tmux_socket_missing_is_treated_as_no_server() {
+        assert!(is_tmux_no_server(
+            "error connecting to /tmp/tmux-0/default (No such file or directory)"
+        ));
     }
 
     #[test]
