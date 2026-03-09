@@ -1,8 +1,25 @@
+## [0.1.24] - 2026-03-09
+
+### 🚀 Features
+
+- Improve codex tmux fallback and ci watch output
+
+### 🐛 Bug Fixes
+
+- Treat missing tmux socket as no-server state for codex
+
+### 🚜 Refactor
+
+- Unify GitHub commands under za gh
 ## [0.1.23] - 2026-03-08
 
 ### 🚀 Features
 
 - Add managed codex sessions and graceful tmux fallback
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.23
 ## [0.1.22] - 2026-03-06
 
 ### ⚙️ Miscellaneous Tasks
