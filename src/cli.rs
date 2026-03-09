@@ -258,6 +258,15 @@ pub enum CodexCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Watch Codex sessions in a live terminal dashboard
+    Top {
+        /// Show all local Codex sessions instead of filtering to the current workspace.
+        #[arg(long)]
+        all: bool,
+        /// Include historical sessions that are no longer active.
+        #[arg(long)]
+        history: bool,
+    },
     /// Stop the current workspace Codex tmux session
     Stop {
         /// Print JSON output for scripting.
@@ -429,6 +438,25 @@ mod tests {
             Commands::Codex { cmd, args } => {
                 assert!(args.is_empty());
                 assert!(matches!(cmd, Some(CodexCommands::Attach)));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn codex_top_parses_all_flag() {
+        let cli =
+            Cli::try_parse_from(["za", "codex", "top", "--all", "--history"]).expect("must parse");
+        match cli.cmd {
+            Commands::Codex { cmd, args } => {
+                assert!(args.is_empty());
+                assert!(matches!(
+                    cmd,
+                    Some(CodexCommands::Top {
+                        all: true,
+                        history: true
+                    })
+                ));
             }
             _ => panic!("unexpected command"),
         }
