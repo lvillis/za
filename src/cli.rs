@@ -100,21 +100,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: IdeCommands,
     },
-    /// Inspect GitHub Actions progress for the current commit or repo groups
-    Ci {
-        /// Print JSON output for scripting.
-        #[arg(long)]
-        json: bool,
-        /// Optional GitHub token override for this run.
-        #[arg(long, value_name = "TOKEN")]
-        github_token: Option<String>,
+    /// Unified GitHub shortcuts (`za gh auth`, `za gh ci`)
+    #[command(visible_alias = "github")]
+    Gh {
         #[command(subcommand)]
-        cmd: Option<CiCommands>,
-    },
-    /// Manage Git authentication integration
-    Git {
-        #[command(subcommand)]
-        cmd: GitCommands,
+        cmd: GhCommands,
     },
 }
 
@@ -276,7 +266,7 @@ pub enum CodexCommands {
     },
 }
 
-/// `za ci` sub-commands
+/// `za gh ci` sub-commands
 #[derive(Subcommand)]
 pub enum CiCommands {
     /// Watch current commit CI until it reaches a terminal state
@@ -311,13 +301,24 @@ pub enum CiCommands {
     },
 }
 
-/// `za git` sub-commands
+/// `za gh` sub-commands
 #[derive(Subcommand)]
-pub enum GitCommands {
+pub enum GhCommands {
     /// Manage GitHub credential-helper wiring
     Auth {
         #[command(subcommand)]
         cmd: GitAuthCommands,
+    },
+    /// Inspect GitHub Actions progress for the current commit or repo groups
+    Ci {
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+        /// Optional GitHub token override for this run.
+        #[arg(long, value_name = "TOKEN")]
+        github_token: Option<String>,
+        #[command(subcommand)]
+        cmd: Option<CiCommands>,
     },
     /// Internal credential helper entrypoint used by Git
     #[command(hide = true)]
@@ -406,7 +407,7 @@ pub enum ConfigKey {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, CodexCommands, Commands};
+    use super::{CiCommands, Cli, CodexCommands, Commands, GhCommands, GitAuthCommands};
     use clap::Parser;
 
     #[test]
@@ -429,6 +430,47 @@ mod tests {
                 assert!(args.is_empty());
                 assert!(matches!(cmd, Some(CodexCommands::Attach)));
             }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn gh_auth_parses_to_github_auth_shortcut() {
+        let cli = Cli::try_parse_from(["za", "gh", "auth", "status"]).expect("must parse");
+        match cli.cmd {
+            Commands::Gh { cmd } => match cmd {
+                GhCommands::Auth { cmd } => {
+                    assert!(matches!(cmd, GitAuthCommands::Status { json: false }));
+                }
+                _ => panic!("unexpected gh command"),
+            },
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn github_alias_parses_to_gh_command() {
+        let cli = Cli::try_parse_from(["za", "github", "ci", "watch"]).expect("must parse");
+        match cli.cmd {
+            Commands::Gh { cmd } => match cmd {
+                GhCommands::Ci {
+                    json,
+                    github_token,
+                    cmd,
+                } => {
+                    assert!(!json);
+                    assert!(github_token.is_none());
+                    assert!(matches!(
+                        cmd,
+                        Some(CiCommands::Watch {
+                            timeout_secs: None,
+                            json: false,
+                            github_token: None,
+                        })
+                    ));
+                }
+                _ => panic!("unexpected gh command"),
+            },
             _ => panic!("unexpected command"),
         }
     }

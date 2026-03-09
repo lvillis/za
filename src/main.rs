@@ -72,24 +72,33 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        cli::Commands::Ci {
-            json,
-            github_token,
-            cmd,
-        } => {
-            let exit_code = command::ci::run(cmd, json, github_token)?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
+        cli::Commands::Gh { cmd } => match cmd {
+            cli::GhCommands::Auth { cmd } => {
+                let exit_code = command::git::run_auth(cmd)?;
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                Ok(())
             }
-            Ok(())
-        }
-        cli::Commands::Git { cmd } => {
-            let exit_code = command::git::run(cmd)?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
+            cli::GhCommands::Ci {
+                json,
+                github_token,
+                cmd,
+            } => {
+                let exit_code = command::ci::run(cmd, json, github_token)?;
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                Ok(())
             }
-            Ok(())
-        }
+            cli::GhCommands::Credential { operation } => {
+                let exit_code = command::git::run_credential(operation)?;
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                Ok(())
+            }
+        },
     }
 }
 

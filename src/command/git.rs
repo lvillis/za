@@ -1,9 +1,6 @@
 //! Git authentication integration utilities.
 
-use crate::{
-    cli::{GitAuthCommands, GitCommands},
-    command::za_config,
-};
+use crate::{cli::GitAuthCommands, command::za_config};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::{
@@ -18,7 +15,7 @@ const GITHUB_HELPER_KEY: &str = "credential.https://github.com.helper";
 const GITHUB_USERNAME_KEY: &str = "credential.https://github.com.username";
 const GITHUB_USERNAME_VALUE: &str = "x-access-token";
 const CREDENTIAL_USE_HTTP_PATH_KEY: &str = "credential.useHttpPath";
-const ZA_HELPER_COMMAND: &str = "!za git credential";
+const ZA_HELPER_COMMAND: &str = "!za gh credential";
 
 #[derive(Debug, Clone, Default)]
 struct CredentialRequest {
@@ -87,14 +84,7 @@ enum ProbeFailureKind {
     Unknown,
 }
 
-pub fn run(cmd: GitCommands) -> Result<i32> {
-    match cmd {
-        GitCommands::Auth { cmd } => run_auth(cmd),
-        GitCommands::Credential { operation } => run_credential(operation),
-    }
-}
-
-fn run_auth(cmd: GitAuthCommands) -> Result<i32> {
+pub fn run_auth(cmd: GitAuthCommands) -> Result<i32> {
     match cmd {
         GitAuthCommands::Enable => run_auth_enable(),
         GitAuthCommands::Status { json } => run_auth_status(json),
@@ -130,7 +120,7 @@ fn run_auth_enable() -> Result<i32> {
         println!("- {helper}");
     }
     println!();
-    println!("Run `za git auth doctor` to verify the setup.");
+    println!("Run `za gh auth doctor` to verify the setup.");
     Ok(0)
 }
 
@@ -299,7 +289,7 @@ fn run_auth_doctor(json: bool) -> Result<i32> {
         hint: if helper_configured {
             None
         } else {
-            Some("Run `za git auth enable`.".to_string())
+            Some("Run `za gh auth enable`.".to_string())
         },
     });
 
@@ -317,7 +307,7 @@ fn run_auth_doctor(json: bool) -> Result<i32> {
         hint: if helper_first {
             None
         } else {
-            Some("Run `za git auth enable` to move za helper to the first position.".to_string())
+            Some("Run `za gh auth enable` to move za helper to the first position.".to_string())
         },
     });
 
@@ -337,7 +327,7 @@ fn run_auth_doctor(json: bool) -> Result<i32> {
             None
         } else {
             Some(format!(
-                "Set `{GITHUB_USERNAME_KEY}` to `{GITHUB_USERNAME_VALUE}` via `za git auth enable`."
+                "Set `{GITHUB_USERNAME_KEY}` to `{GITHUB_USERNAME_VALUE}` via `za gh auth enable`."
             ))
         },
     });
@@ -359,7 +349,7 @@ fn run_auth_doctor(json: bool) -> Result<i32> {
             None
         } else {
             Some(format!(
-                "Set `{CREDENTIAL_USE_HTTP_PATH_KEY}` to `true` via `za git auth enable`."
+                "Set `{CREDENTIAL_USE_HTTP_PATH_KEY}` to `true` via `za gh auth enable`."
             ))
         },
     });
@@ -669,7 +659,7 @@ fn build_auth_verification_report(
             "repository is anonymously readable; auth cannot be verified with this target"
                 .to_string(),
             Some(
-                "Use a private repository (or one requiring authentication) with `za git auth test --repo <url>`."
+                "Use a private repository (or one requiring authentication) with `za gh auth test --repo <url>`."
                     .to_string(),
             ),
         )
@@ -729,7 +719,7 @@ fn summarize_auth_probe_failure(
         ProbeFailureKind::Authentication => (
             "GitHub authentication failed".to_string(),
             Some(
-                "Run `za git auth doctor`, then ensure a valid token is set and has required repo permissions."
+                "Run `za gh auth doctor`, then ensure a valid token is set and has required repo permissions."
                     .to_string(),
             ),
         ),
@@ -749,7 +739,7 @@ fn summarize_auth_probe_failure(
                     .unwrap_or_default()
             ),
             Some(
-                "Run `za git auth doctor` and inspect your Git remote and network settings."
+                "Run `za gh auth doctor` and inspect your Git remote and network settings."
                     .to_string(),
             ),
         ),
@@ -834,7 +824,7 @@ fn sanitize_url_for_log(input: &str) -> String {
     strip_url_userinfo(input)
 }
 
-fn run_credential(operation: Option<String>) -> Result<i32> {
+pub fn run_credential(operation: Option<String>) -> Result<i32> {
     let op = operation.unwrap_or_else(|| "get".to_string());
     match op.as_str() {
         "get" => run_credential_get(),

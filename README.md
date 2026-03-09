@@ -109,26 +109,26 @@ za ide stop 42589
 ### 6) Track GitHub Actions
 
 ```bash
-za ci
-za ci watch
-za ci list --repo lvillis/za --repo lvillis/reqx-rs
-za ci list --group work
+za gh ci
+za gh ci watch
+za gh ci list --repo lvillis/za --repo lvillis/reqx-rs
+za gh ci list --group work
 ```
 
-`za ci` inspects the current repository `HEAD` commit. `za ci watch` follows that commit until GitHub Actions reaches a terminal state. `za ci list` can read repo groups from `~/.config/za/ci.toml`.
+`za gh ci` inspects the current repository `HEAD` commit. `za gh ci watch` follows that commit until GitHub Actions reaches a terminal state. `za gh ci list` can read repo groups from `~/.config/za/ci.toml`.
 
 ### 7) Enable GitHub auth for IDE/CLI Git operations
 
 ```bash
-za git auth enable
-za git auth status
-za git auth doctor
-za git auth test
-za git auth test --repo https://github.com/org/repo.git
+za gh auth enable
+za gh auth status
+za gh auth doctor
+za gh auth test
+za gh auth test --repo https://github.com/org/repo.git
 ```
 
-`za git auth enable` configures GitHub HTTPS auth through a credential helper (`za git credential`) so remote URLs can stay clean (`https://github.com/org/repo.git`) without embedding token secrets.
-`za git auth test` uses an authenticated probe plus an anonymous comparison probe; it only reports verified auth when the anonymous probe is explicitly rejected, and treats network/transport failures as inconclusive. Use a private repo target for strict auth verification.
+`za gh auth enable` configures GitHub HTTPS auth through a credential helper (`za gh credential`) so remote URLs can stay clean (`https://github.com/org/repo.git`) without embedding token secrets.
+`za gh auth test` uses an authenticated probe plus an anonymous comparison probe; it only reports verified auth when the anonymous probe is explicitly rejected, and treats network/transport failures as inconclusive. Use a private repo target for strict auth verification.
 
 ## Command Map
 
@@ -139,10 +139,9 @@ za git auth test --repo https://github.com/org/repo.git
 | `za run` | Launch a tool directly with normalized proxy environment variables. |
 | `za codex` | Manage long-lived Codex tmux sessions for the current workspace. |
 | `za deps` | Audit Rust dependency governance and maintenance risk. |
-| `za ci` | Inspect GitHub Actions progress for the current commit or repo groups. |
+| `za gh` | Unified GitHub shortcuts for auth and Actions status. |
 | `za config` | Persist CLI config (`[auth]`, `[proxy]`, `[run]`, `[tool]`, `[update]`). |
 | `za ide` | Inspect and reconcile JetBrains remote IDE server processes. |
-| `za git` | Wire and diagnose GitHub credential-helper based auth. |
 
 ## Tool Management
 
@@ -269,12 +268,12 @@ Behavior notes:
 
 ### Proxy behavior
 
-`za run`, `za codex`, `za tool`, `za update`, `za deps`, and `za ci` respect proxy settings:
+`za run`, `za codex`, `za tool`, `za update`, `za deps`, and `za gh ci` respect proxy settings:
 
 - HTTPS: `HTTPS_PROXY` -> `ALL_PROXY` -> `HTTP_PROXY`
 - HTTP: `HTTP_PROXY` -> `ALL_PROXY`
 - Bypass: `NO_PROXY` / `no_proxy`
-- Config scopes: `za deps` and `za ci` use `[proxy]` defaults; `za run` / `za codex` / `za tool` / `za update` additionally honor `[run]` / `[tool]` / `[update]`
+- Config scopes: `za deps` and `za gh ci` use `[proxy]` defaults; `za run` / `za codex` / `za tool` / `za update` additionally honor `[run]` / `[tool]` / `[update]`
 
 Example:
 
@@ -306,22 +305,22 @@ Token resolution priority:
 2. `GITHUB_TOKEN` / `GH_TOKEN`
 3. `za config` persisted value
 
-## CI Status (`za ci`)
+## GitHub CI (`za gh ci`)
 
-`za ci` reports GitHub Actions state for the current repository `HEAD` commit. It aggregates workflow runs for the same `head_sha`, so the first screen answers the question you usually care about after a push: did this commit pass yet? `za ci watch` also streams the currently active workflows while a commit is still pending or running.
+`za gh ci` reports GitHub Actions state for the current repository `HEAD` commit. It aggregates workflow runs for the same `head_sha`, so the first screen answers the question you usually care about after a push: did this commit pass yet? `za gh ci watch` also streams the currently active workflows while a commit is still pending or running.
 
 ```bash
 # current repo HEAD
-za ci
+za gh ci
 
 # wait until terminal state
-za ci watch --timeout-secs 900
+za gh ci watch --timeout-secs 900
 
 # inspect explicit repos or local clones
-za ci list --repo lvillis/za --repo /code/reqx-rs
+za gh ci list --repo lvillis/za --repo /code/reqx-rs
 
 # read a named repo group
-za ci list --group work
+za gh ci list --group work
 ```
 
 Repo groups live in `~/.config/za/ci.toml` by default:
