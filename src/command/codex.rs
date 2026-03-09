@@ -159,6 +159,8 @@ fn start_managed_session(
 ) -> Result<()> {
     let command = build_codex_launch_command(mode, args)?;
     tmux_new_session(&ctx.session_name, &ctx.workspace_root, &command)?;
+    tmux_ensure_outer_scrollback_preserved()?;
+    tmux_disable_alternate_screen_for_codex_windows(&ctx.session_name)?;
     persist_session_record(ctx, launcher, args)?;
     Ok(())
 }
@@ -1105,6 +1107,112 @@ fn tmux_list_panes_start_commands(session_name: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn tmux_disable_alternate_screen_for_codex_windows(session_name: &str) -> Result<()> {
+    for window_id in tmux_codex_window_ids(session_name)? {
+        tmux_set_window_option(&window_id, "alternate-screen", "off")?;
+    }
+    Ok(())
+}
+
+fn tmux_ensure_outer_scrollback_preserved() -> Result<()> {
+    if tmux_terminal_overrides_disable_alt_screen(&tmux_show_server_option("terminal-overrides")?) {
+        return Ok(());
+    }
+    let output = Command::new("tmux")
+        .args([
+            "set-option",
+            "-sa",
+            "terminal-overrides",
+            ",*:smcup@:rmcup@",
+        ])
+        .output()
+        .context("append tmux terminal-overrides to preserve outer scrollback")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "`tmux set-option -sa terminal-overrides ',*:smcup@:rmcup@'` failed: {}",
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+fn tmux_show_server_option(option: &str) -> Result<String> {
+    let output = Command::new("tmux")
+        .args(["show-options", "-s", option])
+        .output()
+        .with_context(|| format!("show tmux server option `{option}`"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.trim().eq_ignore_ascii_case("invalid option") {
+            return Ok(String::new());
+        }
+        bail!("`tmux show-options -s {option}` failed: {}", stderr.trim());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn tmux_codex_window_ids(session_name: &str) -> Result<BTreeSet<String>> {
+    let output = Command::new("tmux")
+        .args([
+            "list-panes",
+            "-t",
+            session_name,
+            "-F",
+            "#{pane_current_command}\t#{window_id}",
+        ])
+        .output()
+        .with_context(|| format!("list tmux codex panes for `{session_name}`"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_tmux_session_absent(&stderr) {
+            return Ok(BTreeSet::new());
+        }
+        bail!(
+            "`tmux list-panes -t {session_name}` failed: {}",
+            stderr.trim()
+        );
+    }
+    Ok(parse_tmux_codex_window_ids(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_tmux_codex_window_ids(output: &str) -> BTreeSet<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (command, window_id) = line.split_once('\t')?;
+            (command.trim() == "codex")
+                .then_some(window_id.trim())
+                .filter(|window_id| !window_id.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
+fn tmux_terminal_overrides_disable_alt_screen(output: &str) -> bool {
+    output.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.contains("smcup@") && trimmed.contains("rmcup@")
+    })
+}
+
+fn tmux_set_window_option(target: &str, option: &str, value: &str) -> Result<()> {
+    let output = Command::new("tmux")
+        .args(["set-window-option", "-t", target, option, value])
+        .output()
+        .with_context(|| format!("set tmux window option `{option}` for `{target}`"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "`tmux set-window-option -t {target} {option} {value}` failed: {}",
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
 fn tmux_panes_include_listener_endpoint(output: &str, endpoint: &str) -> bool {
     output.lines().any(|line| {
         let Some((current_command, start_command)) = line.split_once('\t') else {
@@ -1199,6 +1307,8 @@ fn maybe_attach_or_report(session_name: &str, workspace_root: &Path) -> Result<i
 }
 
 fn attach_session(session_name: &str) -> Result<i32> {
+    tmux_ensure_outer_scrollback_preserved()?;
+    tmux_disable_alternate_screen_for_codex_windows(session_name)?;
     let mut cmd = Command::new("tmux");
     if env::var_os("TMUX").is_some() {
         cmd.args(["switch-client", "-t", session_name]);
@@ -3607,9 +3717,10 @@ mod tests {
         build_top_rows, calculate_context_left_percent, config_overrides_otel,
         ensure_local_listener_no_proxy, is_tmux_no_server, is_tmux_session_absent,
         parse_legacy_codex_context_left_percent_lines, parse_otlp_session_events,
-        parse_tmux_sessions, render_stop_message, resolve_state_home, sanitize_session_label,
-        session_status_label, shell_escape, summarize_codex_session_lines,
-        tmux_panes_include_listener_endpoint, workspace_hash,
+        parse_tmux_codex_window_ids, parse_tmux_sessions, render_stop_message, resolve_state_home,
+        sanitize_session_label, session_status_label, shell_escape, summarize_codex_session_lines,
+        tmux_panes_include_listener_endpoint, tmux_terminal_overrides_disable_alt_screen,
+        workspace_hash,
     };
     use std::{
         collections::{BTreeMap, BTreeSet, VecDeque},
@@ -3727,6 +3838,30 @@ mod tests {
             output,
             "http://127.0.0.1:45554/v1/logs"
         ));
+    }
+
+    #[test]
+    fn parse_tmux_codex_window_ids_extracts_unique_codex_windows() {
+        let output = concat!("codex\t@1\n", "bash\t@2\n", "codex\t@1\n", "codex\t@3\n");
+
+        let window_ids = parse_tmux_codex_window_ids(output);
+
+        assert_eq!(
+            window_ids,
+            BTreeSet::from(["@1".to_string(), "@3".to_string()])
+        );
+    }
+
+    #[test]
+    fn tmux_terminal_overrides_disable_alt_screen_detects_override() {
+        let output = "terminal-overrides[0] *:smcup@:rmcup@\n";
+        assert!(tmux_terminal_overrides_disable_alt_screen(output));
+    }
+
+    #[test]
+    fn tmux_terminal_overrides_disable_alt_screen_ignores_unrelated_override() {
+        let output = "terminal-overrides[0] xterm*:focus:title\n";
+        assert!(!tmux_terminal_overrides_disable_alt_screen(output));
     }
 
     #[test]
