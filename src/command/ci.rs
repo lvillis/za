@@ -25,6 +25,7 @@ const CI_CONFIG_FILE_NAME: &str = "ci.toml";
 const CONFIG_DIR_NAME: &str = "za";
 const WATCH_PENDING_INTERVAL_SECS: u64 = 2;
 const WATCH_RUNNING_INTERVAL_SECS: u64 = 5;
+const WATCH_DETAIL_LIMIT: usize = 3;
 const EXIT_RUNNING: i32 = 10;
 const EXIT_FAILED: i32 = 11;
 const EXIT_NO_RUNS: i32 = 12;
@@ -782,7 +783,7 @@ fn watch_interval_for_state(state: CiState) -> Duration {
 }
 
 fn report_digest(report: &CommitCiReport) -> String {
-    format!(
+    let mut digest = format!(
         "{}:{}:{}:{}:{}:{}",
         report.state.as_str(),
         report.summary.pending,
@@ -790,21 +791,23 @@ fn report_digest(report: &CommitCiReport) -> String {
         report.summary.success,
         report.summary.failed,
         report.summary.cancelled + report.summary.skipped
-    )
+    );
+    for run in &report.runs {
+        digest.push(':');
+        digest.push_str(&format!(
+            "{}:{}:{}",
+            run.id,
+            run.state.as_str(),
+            run.run_attempt.unwrap_or_default()
+        ));
+    }
+    digest
 }
 
 fn print_watch_update(report: &CommitCiReport) {
-    println!(
-        "[{}] {} @ {} {}",
-        report.state.as_str(),
-        report.repo,
-        report
-            .sha
-            .as_deref()
-            .map(short_sha)
-            .unwrap_or_else(|| "-".to_string()),
-        format_summary(&report.summary)
-    );
+    for line in render_watch_update_lines(report) {
+        println!("{line}");
+    }
 }
 
 fn print_commit_report(report: &CommitCiReport) {
@@ -926,6 +929,77 @@ fn format_summary(summary: &CiSummary) -> String {
         "no runs".to_string()
     } else {
         parts.join(", ")
+    }
+}
+
+fn render_watch_update_lines(report: &CommitCiReport) -> Vec<String> {
+    let updated = age_label(report.latest_update_at.as_deref())
+        .map(|value| format!("updated {value} ago"))
+        .unwrap_or_else(|| "updated -".to_string());
+    let mut lines = vec![format!(
+        "[{}] {} @ {} {}, {}",
+        report.state.as_str(),
+        report.repo,
+        report
+            .sha
+            .as_deref()
+            .map(short_sha)
+            .unwrap_or_else(|| "-".to_string()),
+        format_summary(&report.summary),
+        updated
+    )];
+
+    if !matches!(report.state, CiState::Pending | CiState::Running) {
+        return lines;
+    }
+
+    let detail_runs = watch_detail_runs(report);
+    let hidden_runs = detail_runs.len().saturating_sub(WATCH_DETAIL_LIMIT);
+    for run in detail_runs.iter().take(WATCH_DETAIL_LIMIT) {
+        lines.push(format!(
+            "  - {:<10} {:<8} {:<8} {:<8} {}",
+            run.state.as_str(),
+            run.run_attempt
+                .map(|attempt| format!("#{attempt}"))
+                .unwrap_or_else(|| "-".to_string()),
+            age_label(run.updated_at.as_deref()).unwrap_or_else(|| "-".to_string()),
+            truncate_end(run.event.as_deref().unwrap_or("-"), 8),
+            truncate_end(&run.name, 80)
+        ));
+    }
+    if hidden_runs > 0 {
+        lines.push(format!(
+            "  - ... {} more non-terminal workflow{}",
+            hidden_runs,
+            if hidden_runs == 1 { "" } else { "s" }
+        ));
+    }
+    lines
+}
+
+fn watch_detail_runs(report: &CommitCiReport) -> Vec<&WorkflowRunReport> {
+    let mut runs = report
+        .runs
+        .iter()
+        .filter(|run| !matches!(run.state, CiState::Success | CiState::Skipped))
+        .collect::<Vec<_>>();
+    runs.sort_by(|a, b| {
+        watch_detail_priority(a.state)
+            .cmp(&watch_detail_priority(b.state))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    runs
+}
+
+fn watch_detail_priority(state: CiState) -> u8 {
+    match state {
+        CiState::Running => 0,
+        CiState::Pending => 1,
+        CiState::Failed => 2,
+        CiState::Cancelled => 3,
+        CiState::NoRuns => 4,
+        CiState::Skipped => 5,
+        CiState::Success => 6,
     }
 }
 
@@ -1219,8 +1293,9 @@ fn split_no_proxy_rules(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CiManifest, CiState, WorkflowRunReport, aggregate_commit_state, latest_head_sha,
-        parse_owner_repo, parse_repo_slug, workflow_run_state,
+        CiManifest, CiSourceKind, CiState, CommitCiReport, WorkflowRunReport,
+        aggregate_commit_state, latest_head_sha, parse_owner_repo, parse_repo_slug,
+        render_watch_update_lines, workflow_run_state,
     };
 
     #[test]
@@ -1341,5 +1416,125 @@ repos = ["openai/codex", "/code/za"]
         let group = manifest.groups.get("work").unwrap();
         assert_eq!(group.repos.len(), 2);
         assert_eq!(group.repos[0], "openai/codex");
+    }
+
+    #[test]
+    fn render_watch_update_lines_includes_active_workflow_details() {
+        let report = CommitCiReport {
+            repo: "lvillis/tele-rs".to_string(),
+            branch: Some("main".to_string()),
+            sha: Some("babf70d123456789".to_string()),
+            state: CiState::Running,
+            summary: super::CiSummary {
+                running: 1,
+                success: 2,
+                ..Default::default()
+            },
+            latest_update_at: Some("2026-03-09T00:00:00Z".to_string()),
+            source: CiSourceKind::CurrentRepo,
+            source_path: None,
+            runs: vec![
+                WorkflowRunReport {
+                    id: 2,
+                    name: "ci / test".to_string(),
+                    event: Some("push".to_string()),
+                    state: CiState::Running,
+                    status: Some("in_progress".to_string()),
+                    conclusion: None,
+                    run_attempt: Some(1),
+                    updated_at: Some("2026-03-09T00:00:00Z".to_string()),
+                    html_url: None,
+                },
+                WorkflowRunReport {
+                    id: 1,
+                    name: "ci / lint".to_string(),
+                    event: Some("push".to_string()),
+                    state: CiState::Success,
+                    status: Some("completed".to_string()),
+                    conclusion: Some("success".to_string()),
+                    run_attempt: Some(1),
+                    updated_at: Some("2026-03-09T00:00:00Z".to_string()),
+                    html_url: None,
+                },
+            ],
+        };
+
+        let lines = render_watch_update_lines(&report);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("[running] lvillis/tele-rs @ babf70d"));
+        assert!(lines[0].contains("1 running, 2 success"));
+        assert!(lines[0].contains("updated"));
+        assert!(lines[1].contains("ci / test"));
+        assert!(lines[1].contains("running"));
+    }
+
+    #[test]
+    fn render_watch_update_lines_caps_non_terminal_workflow_details() {
+        let report = CommitCiReport {
+            repo: "lvillis/tele-rs".to_string(),
+            branch: Some("main".to_string()),
+            sha: Some("babf70d123456789".to_string()),
+            state: CiState::Running,
+            summary: super::CiSummary {
+                running: 2,
+                pending: 2,
+                ..Default::default()
+            },
+            latest_update_at: Some("2026-03-09T00:00:00Z".to_string()),
+            source: CiSourceKind::CurrentRepo,
+            source_path: None,
+            runs: vec![
+                WorkflowRunReport {
+                    id: 1,
+                    name: "run-1".to_string(),
+                    event: Some("push".to_string()),
+                    state: CiState::Pending,
+                    status: Some("queued".to_string()),
+                    conclusion: None,
+                    run_attempt: Some(1),
+                    updated_at: None,
+                    html_url: None,
+                },
+                WorkflowRunReport {
+                    id: 2,
+                    name: "run-2".to_string(),
+                    event: Some("push".to_string()),
+                    state: CiState::Running,
+                    status: Some("in_progress".to_string()),
+                    conclusion: None,
+                    run_attempt: Some(1),
+                    updated_at: None,
+                    html_url: None,
+                },
+                WorkflowRunReport {
+                    id: 3,
+                    name: "run-3".to_string(),
+                    event: Some("push".to_string()),
+                    state: CiState::Failed,
+                    status: Some("completed".to_string()),
+                    conclusion: Some("failure".to_string()),
+                    run_attempt: Some(1),
+                    updated_at: None,
+                    html_url: None,
+                },
+                WorkflowRunReport {
+                    id: 4,
+                    name: "run-4".to_string(),
+                    event: Some("push".to_string()),
+                    state: CiState::Pending,
+                    status: Some("queued".to_string()),
+                    conclusion: None,
+                    run_attempt: Some(1),
+                    updated_at: None,
+                    html_url: None,
+                },
+            ],
+        };
+
+        let lines = render_watch_update_lines(&report);
+        assert_eq!(lines.len(), 5);
+        assert!(lines[1].contains("run-2"));
+        assert!(lines[2].contains("run-1") || lines[2].contains("run-4"));
+        assert!(lines[4].contains("1 more non-terminal workflow"));
     }
 }

@@ -308,7 +308,7 @@ Token resolution priority:
 
 ## CI Status (`za ci`)
 
-`za ci` reports GitHub Actions state for the current repository `HEAD` commit. It aggregates workflow runs for the same `head_sha`, so the first screen answers the question you usually care about after a push: did this commit pass yet?
+`za ci` reports GitHub Actions state for the current repository `HEAD` commit. It aggregates workflow runs for the same `head_sha`, so the first screen answers the question you usually care about after a push: did this commit pass yet? `za ci watch` also streams the currently active workflows while a commit is still pending or running.
 
 ```bash
 # current repo HEAD
