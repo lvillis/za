@@ -344,30 +344,15 @@ struct CodexSessionSummary {
 }
 
 #[derive(Debug, Deserialize)]
-struct SessionMetaEvent {
-    payload: SessionMetaPayload,
-}
-
-#[derive(Debug, Deserialize)]
 struct SessionMetaPayload {
     id: String,
     cwd: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct TurnContextEvent {
-    payload: TurnContextPayload,
-}
-
-#[derive(Debug, Deserialize)]
 struct TurnContextPayload {
     model: Option<String>,
     effort: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenCountEvent {
-    payload: TokenCountPayload,
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,8 +367,28 @@ struct TokenCountInfo {
 }
 
 #[derive(Debug, Deserialize)]
+struct CodexLogEventEnvelope {
+    #[serde(rename = "type")]
+    kind: String,
+    payload: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexEventMessagePayload {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    info: Option<TokenCountInfo>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TokenUsage {
     total_tokens: u64,
+}
+
+enum ParsedCodexSessionEvent {
+    SessionMeta(SessionMetaPayload),
+    TurnContext(TurnContextPayload),
+    TokenCount(TokenCountInfo),
 }
 
 fn resolve_workspace_context() -> Result<WorkspaceContext> {
@@ -429,12 +434,22 @@ fn workspace_hash(root: &Path) -> String {
 }
 
 fn state_home() -> Result<PathBuf> {
-    let home = env::var_os("HOME")
+    resolve_state_home(env_path("XDG_STATE_HOME"), env_path("HOME"))
+}
+
+fn resolve_state_home(xdg_state_home: Option<PathBuf>, home: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = xdg_state_home {
+        return Ok(path);
+    }
+    let home = home
+        .ok_or_else(|| anyhow!("cannot resolve state directory: set `XDG_STATE_HOME` or `HOME`"))?;
+    Ok(home.join(".local/state"))
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("cannot resolve state directory: set `HOME`"))?;
-    Ok(env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/state")))
 }
 
 fn build_codex_launch_command(mode: CodexLaunchMode, extra_args: &[String]) -> Result<String> {
@@ -567,7 +582,7 @@ fn tmux_has_session(session_name: &str) -> Result<bool> {
         return Ok(true);
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if is_tmux_missing_session(&stderr) || is_tmux_no_server(&stderr) {
+    if is_tmux_session_absent(&stderr) {
         return Ok(false);
     }
     bail!(
@@ -636,6 +651,9 @@ fn tmux_kill_session(session_name: &str) -> Result<()> {
         .with_context(|| format!("stop tmux session `{session_name}`"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_tmux_session_absent(&stderr) {
+            return Ok(());
+        }
         bail!(
             "`tmux kill-session -t {session_name}` failed: {}",
             stderr.trim()
@@ -833,13 +851,35 @@ fn load_legacy_codex_context_left_percent_by_session_id(
 }
 
 fn codex_home() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("CODEX_HOME") {
-        return Ok(PathBuf::from(path));
+    if let Some(path) = env_path("CODEX_HOME") {
+        return Ok(path);
     }
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("cannot resolve Codex home: set `HOME`"))?;
+    let home = env_path("HOME")
+        .ok_or_else(|| anyhow!("cannot resolve Codex home: set `CODEX_HOME` or `HOME`"))?;
     Ok(home.join(".codex"))
+}
+
+fn parse_codex_session_event(line: &str) -> Option<ParsedCodexSessionEvent> {
+    let event = serde_json::from_str::<CodexLogEventEnvelope>(line).ok()?;
+    match event.kind.as_str() {
+        "session_meta" => serde_json::from_value::<SessionMetaPayload>(event.payload)
+            .ok()
+            .map(ParsedCodexSessionEvent::SessionMeta),
+        "turn_context" => serde_json::from_value::<TurnContextPayload>(event.payload)
+            .ok()
+            .map(ParsedCodexSessionEvent::TurnContext),
+        "token_count" => serde_json::from_value::<TokenCountPayload>(event.payload)
+            .ok()
+            .map(|payload| ParsedCodexSessionEvent::TokenCount(payload.info)),
+        "event_msg" => {
+            let payload = serde_json::from_value::<CodexEventMessagePayload>(event.payload).ok()?;
+            if payload.kind.as_deref() != Some("token_count") {
+                return None;
+            }
+            payload.info.map(ParsedCodexSessionEvent::TokenCount)
+        }
+        _ => None,
+    }
 }
 
 fn summarize_codex_session_file(
@@ -870,53 +910,43 @@ fn summarize_codex_session_lines<R: BufRead>(
 
     for line in reader.lines() {
         let line = line.context("read codex session log line")?;
-        if session_id.is_none() && line.contains("\"type\":\"session_meta\"") {
-            let event = match serde_json::from_str::<SessionMetaEvent>(&line) {
-                Ok(event) => event,
-                Err(_) => continue,
-            };
-            let cwd = event.payload.cwd.trim();
-            let Some(started_unix) = workspace_starts.get(cwd) else {
-                return Ok(None);
-            };
-            if modified_unix + 300 < *started_unix {
-                return Ok(None);
-            }
-            session_id = Some(event.payload.id);
-            workspace_root = Some(cwd.to_string());
+        let Some(event) = parse_codex_session_event(&line) else {
             continue;
-        }
-
-        if session_id.is_some()
-            && line.contains("\"type\":\"turn_context\"")
-            && let Ok(event) = serde_json::from_str::<TurnContextEvent>(&line)
-        {
-            if let Some(value) = event
-                .payload
-                .model
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-            {
-                model = Some(value);
+        };
+        match event {
+            ParsedCodexSessionEvent::SessionMeta(payload) => {
+                let cwd = payload.cwd.trim();
+                let Some(started_unix) = workspace_starts.get(cwd) else {
+                    return Ok(None);
+                };
+                if modified_unix + 300 < *started_unix {
+                    return Ok(None);
+                }
+                session_id = Some(payload.id);
+                workspace_root = Some(cwd.to_string());
             }
-            if let Some(value) = event
-                .payload
-                .effort
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-            {
-                effort = Some(value);
+            ParsedCodexSessionEvent::TurnContext(payload) => {
+                if let Some(value) = payload
+                    .model
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                {
+                    model = Some(value);
+                }
+                if let Some(value) = payload
+                    .effort
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                {
+                    effort = Some(value);
+                }
             }
-        }
-
-        if session_id.is_some()
-            && line.contains("\"type\":\"token_count\"")
-            && let Ok(event) = serde_json::from_str::<TokenCountEvent>(&line)
-        {
-            context_left_percent = calculate_context_left_percent(
-                event.payload.info.last_token_usage.total_tokens,
-                event.payload.info.model_context_window,
-            );
+            ParsedCodexSessionEvent::TokenCount(info) => {
+                context_left_percent = calculate_context_left_percent(
+                    info.last_token_usage.total_tokens,
+                    info.model_context_window,
+                );
+            }
         }
     }
 
@@ -1187,6 +1217,10 @@ fn is_tmux_missing_session(stderr: &str) -> bool {
         .contains("can't find session")
 }
 
+fn is_tmux_session_absent(stderr: &str) -> bool {
+    is_tmux_missing_session(stderr) || is_tmux_no_server(stderr)
+}
+
 fn git_capture(path: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
@@ -1204,15 +1238,15 @@ fn git_capture(path: &Path, args: &[&str]) -> Result<String> {
 mod tests {
     use super::{
         CodexStopOutput, SESSION_HASH_LEN, activity_age_label, build_shell_exec_command,
-        calculate_context_left_percent, is_tmux_no_server,
+        calculate_context_left_percent, is_tmux_no_server, is_tmux_session_absent,
         parse_legacy_codex_context_left_percent_lines, parse_tmux_sessions, render_stop_message,
-        sanitize_session_label, session_status_label, shell_escape, summarize_codex_session_lines,
-        workspace_hash,
+        resolve_state_home, sanitize_session_label, session_status_label, shell_escape,
+        summarize_codex_session_lines, workspace_hash,
     };
     use std::{
         collections::{BTreeMap, BTreeSet},
         io::Cursor,
-        path::Path,
+        path::{Path, PathBuf},
     };
 
     #[test]
@@ -1302,6 +1336,24 @@ mod tests {
     }
 
     #[test]
+    fn tmux_missing_session_or_server_is_treated_as_absent() {
+        assert!(is_tmux_session_absent(
+            "can't find session: za-codex-za-123"
+        ));
+        assert!(is_tmux_session_absent(
+            "error connecting to /tmp/tmux-0/default (No such file or directory)"
+        ));
+    }
+
+    #[test]
+    fn resolve_state_home_prefers_xdg_without_home() {
+        assert_eq!(
+            resolve_state_home(Some(PathBuf::from("/tmp/state")), None).expect("must resolve"),
+            PathBuf::from("/tmp/state")
+        );
+    }
+
+    #[test]
     fn summarize_codex_session_lines_extracts_id_model_effort_and_context_left() {
         let workspaces = BTreeMap::from([("/opt/app/za".to_string(), 1_700_000_000)]);
         let raw = concat!(
@@ -1314,6 +1366,26 @@ mod tests {
             .expect("must match workspace");
         assert_eq!(summary.session_id, "019cc38e-4d75-7052-b96a-b3a1e36b1868");
         assert_eq!(summary.workspace_root, "/opt/app/za");
+        assert_eq!(summary.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(summary.effort.as_deref(), Some("xhigh"));
+        let pct = summary
+            .context_left_percent
+            .expect("left percent must exist");
+        assert!(pct > 29.0 && pct < 30.0);
+    }
+
+    #[test]
+    fn summarize_codex_session_lines_handles_whitespace_and_reordered_json_fields() {
+        let workspaces = BTreeMap::from([("/opt/app/za".to_string(), 1_700_000_000)]);
+        let raw = concat!(
+            "{\"payload\":{\"cwd\":\"/opt/app/za\",\"id\":\"019cc38e-4d75-7052-b96a-b3a1e36b1868\"},\"type\": \"session_meta\"}\n",
+            "{\"payload\":{\"effort\":\"xhigh\",\"model\":\"gpt-5.4\"}, \"type\": \"turn_context\"}\n",
+            "{\"type\":\"event_msg\", \"payload\":{\"info\":{\"model_context_window\":258400,\"last_token_usage\":{\"total_tokens\":181807}},\"type\": \"token_count\"}}\n"
+        );
+        let summary = summarize_codex_session_lines(Cursor::new(raw), 1_700_000_100, &workspaces)
+            .expect("must parse")
+            .expect("must match workspace");
+        assert_eq!(summary.session_id, "019cc38e-4d75-7052-b96a-b3a1e36b1868");
         assert_eq!(summary.model.as_deref(), Some("gpt-5.4"));
         assert_eq!(summary.effort.as_deref(), Some("xhigh"));
         let pct = summary

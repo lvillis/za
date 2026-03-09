@@ -80,6 +80,8 @@ struct GitProbeResult {
 enum ProbeFailureKind {
     Authentication,
     RepositoryNotFound,
+    Proxy,
+    Tls,
     Network,
     Unknown,
 }
@@ -727,6 +729,20 @@ fn summarize_auth_probe_failure(
             "repository not found or token lacks access".to_string(),
             Some("Verify repository URL and token access scope.".to_string()),
         ),
+        ProbeFailureKind::Proxy => (
+            "proxy connectivity to GitHub failed".to_string(),
+            Some(
+                "Check HTTPS_PROXY/HTTP_PROXY/ALL_PROXY/NO_PROXY settings, proxy reachability, and any required proxy authentication."
+                    .to_string(),
+            ),
+        ),
+        ProbeFailureKind::Tls => (
+            "TLS connection to GitHub failed".to_string(),
+            Some(
+                "Check CA trust configuration, intercepting proxies, and TLS settings for github.com."
+                    .to_string(),
+            ),
+        ),
         ProbeFailureKind::Network => (
             "network connectivity to GitHub failed".to_string(),
             Some("Check DNS/proxy/firewall settings for github.com.".to_string()),
@@ -751,6 +767,22 @@ fn summarize_anonymous_probe_failure(
     exit_code: Option<i32>,
 ) -> (String, Option<String>) {
     match kind {
+        ProbeFailureKind::Proxy => (
+            "anonymous comparison probe hit a proxy error; auth verification inconclusive"
+                .to_string(),
+            Some(
+                "Retry after checking HTTPS_PROXY/HTTP_PROXY/ALL_PROXY/NO_PROXY settings and proxy authentication."
+                    .to_string(),
+            ),
+        ),
+        ProbeFailureKind::Tls => (
+            "anonymous comparison probe hit a TLS error; auth verification inconclusive"
+                .to_string(),
+            Some(
+                "Retry after checking CA trust configuration, intercepting proxies, and TLS settings for github.com."
+                    .to_string(),
+            ),
+        ),
         ProbeFailureKind::Network => (
             "anonymous comparison probe hit a network error; auth verification inconclusive"
                 .to_string(),
@@ -785,13 +817,40 @@ fn classify_probe_failure(stderr: &str) -> ProbeFailureKind {
         return ProbeFailureKind::RepositoryNotFound;
     }
     if lower.contains("authentication failed")
+        || lower.contains("http basic: access denied")
+        || lower.contains("invalid username or password")
+        || lower.contains("invalid username or token")
+        || lower.contains("could not read password")
         || lower.contains("fatal: could not read username")
+        || lower.contains("authentication required")
         || lower.contains("terminal prompts disabled")
     {
         return ProbeFailureKind::Authentication;
     }
+    if lower.contains("could not resolve proxy")
+        || lower.contains("proxy authentication required")
+        || lower.contains("received http code 407 from proxy")
+        || lower.contains("proxy connect aborted")
+        || lower.contains("failed connect to proxy")
+    {
+        return ProbeFailureKind::Proxy;
+    }
+    if lower.contains("server certificate verification failed")
+        || lower.contains("ssl certificate problem")
+        || lower.contains("tlsv")
+        || lower.contains("gnutls_handshake() failed")
+        || lower.contains("schannel")
+        || lower.contains("peer certificate cannot be authenticated")
+        || lower.contains("certificate verify failed")
+    {
+        return ProbeFailureKind::Tls;
+    }
     if lower.contains("could not resolve host")
+        || lower.contains("operation timed out")
         || lower.contains("connection timed out")
+        || lower.contains("connection refused")
+        || lower.contains("network is unreachable")
+        || lower.contains("no route to host")
         || lower.contains("failed to connect")
     {
         return ProbeFailureKind::Network;
@@ -1181,6 +1240,18 @@ mod tests {
             ),
             ProbeFailureKind::Authentication
         );
+        assert_eq!(
+            classify_probe_failure(
+                "fatal: unable to access 'https://github.com/org/repo.git/': Could not resolve proxy: corp.proxy"
+            ),
+            ProbeFailureKind::Proxy
+        );
+        assert_eq!(
+            classify_probe_failure(
+                "fatal: unable to access 'https://github.com/org/repo.git/': SSL certificate problem: self-signed certificate"
+            ),
+            ProbeFailureKind::Tls
+        );
     }
 
     #[test]
@@ -1223,6 +1294,29 @@ mod tests {
         assert_eq!(
             report.reason,
             "anonymous comparison probe hit a network error; auth verification inconclusive"
+        );
+    }
+
+    #[test]
+    fn anonymous_proxy_failure_is_inconclusive_not_success() {
+        let report = build_auth_verification_report(
+            "https://github.com/org/private.git",
+            None,
+            5,
+            &probe(true, false, Some(0), ""),
+            &probe(
+                false,
+                false,
+                Some(128),
+                "fatal: unable to access: Could not resolve proxy: corp.proxy",
+            ),
+        );
+
+        assert!(!report.ok);
+        assert!(!report.auth_verified);
+        assert_eq!(
+            report.reason,
+            "anonymous comparison probe hit a proxy error; auth verification inconclusive"
         );
     }
 

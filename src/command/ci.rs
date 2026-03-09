@@ -1124,7 +1124,7 @@ fn parse_repo_slug(input: &str) -> Option<RepoSlug> {
     if let Some(path) = trimmed.strip_prefix("git@github.com:") {
         return parse_owner_repo(path);
     }
-    if let Some((_, path)) = trimmed.split_once("github.com/") {
+    if let Some(path) = parse_github_url_path(trimmed) {
         return parse_owner_repo(path);
     }
 
@@ -1154,6 +1154,18 @@ fn parse_owner_repo(path: &str) -> Option<RepoSlug> {
         owner: owner.to_string(),
         repo: repo.to_string(),
     })
+}
+
+fn parse_github_url_path(input: &str) -> Option<&str> {
+    let (_, rest) = input.split_once("://")?;
+    let authority = rest.split('/').next()?;
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    let host = host.split(':').next().unwrap_or(host).trim();
+    if !host.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+    Some(rest[authority.len()..].trim_start_matches('/'))
 }
 
 fn default_ci_manifest_path() -> Result<PathBuf> {
@@ -1308,12 +1320,17 @@ mod tests {
 
         let slug = parse_repo_slug("git@github.com:openai/codex.git").unwrap();
         assert_eq!(slug.as_str(), "openai/codex");
+
+        let slug = parse_repo_slug("ssh://git@github.com/openai/codex.git").unwrap();
+        assert_eq!(slug.as_str(), "openai/codex");
     }
 
     #[test]
     fn parse_owner_repo_rejects_invalid_values() {
         assert!(parse_owner_repo("owner").is_none());
         assert!(parse_repo_slug("https://example.com/openai/codex").is_none());
+        assert!(parse_repo_slug("https://gist.github.com/openai/codex").is_none());
+        assert!(parse_repo_slug("https://notgithub.com/github.com/openai/codex").is_none());
         assert!(parse_repo_slug("").is_none());
     }
 
