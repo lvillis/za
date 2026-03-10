@@ -219,6 +219,7 @@ za tool uninstall codex
 ```
 
 `za tool update` is interruption-safe: pressing `Ctrl+C` aborts cleanly and temporary download directories are removed automatically (stale leftovers are cleaned on next run).
+For large GitHub release assets, `za` will use parallel HTTP range downloads when the upstream supports it, and automatically fall back to a single stream otherwise.
 
 ### Existing binaries adoption
 

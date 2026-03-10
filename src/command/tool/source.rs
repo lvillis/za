@@ -1,13 +1,46 @@
 use super::*;
-use std::sync::atomic::AtomicU64;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
+};
 
 const TEMP_DIR_PREFIX_DOWNLOAD: &str = "za-tool-download";
 const TEMP_DIR_PREFIX_CARGO_INSTALL: &str = "za-tool-cargo-install";
 const TEMP_DIR_PREFIXES: [&str; 2] = [TEMP_DIR_PREFIX_DOWNLOAD, TEMP_DIR_PREFIX_CARGO_INSTALL];
+const DOWNLOAD_READ_CHUNK_SIZE: usize = 64 * 1024;
+const PARALLEL_DOWNLOAD_MIN_BYTES: u64 = 2 * 1024 * 1024;
+const PARALLEL_DOWNLOAD_MIN_PART_BYTES: u64 = 1024 * 1024;
+const PARALLEL_DOWNLOAD_MAX_PARTS: usize = 4;
 
 static ACTIVE_TEMP_DIRS: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static TEMP_DIR_NONCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DownloadRange {
+    start: u64,
+    end: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParallelDownloadPlan {
+    total_bytes: u64,
+    parts: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DownloadProbe {
+    total_bytes: u64,
+    range_supported: bool,
+}
+
+enum ParallelDownloadError {
+    Unsupported(anyhow::Error),
+    Failed(anyhow::Error),
+}
 
 pub(super) fn unregister_temp_dir(path: &Path) {
     if let Ok(mut dirs) = ACTIVE_TEMP_DIRS.lock() {
@@ -487,74 +520,41 @@ fn download_from_url(
 
         let client = build_http_client(&url_parts.base_url, "za-tool-manager", true, proxy_scope)
             .context("build HTTP client")?;
-        let mut req = client.get(url_parts.path_and_query);
-        req = req
-            .try_header("user-agent", HTTP_USER_AGENT)
-            .context("set download user-agent")?;
-        let mut resp = req
-            .send_response_stream()
-            .with_context(|| format!("download from `{url}` ({PROXY_HINT})"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp
-                .into_text_lossy_limited(16 * 1024)
-                .unwrap_or_else(|_| "<body unavailable>".to_string());
-            bail!(
-                "download from `{url}` failed: status {} body {}",
-                status,
-                truncate_for_log(&body, 200)
-            );
-        }
-        let total_bytes = resp
-            .headers()
-            .get("content-length")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse::<u64>().ok());
-
-        let mut out = File::create(&asset_path)
-            .with_context(|| format!("create downloaded file {}", asset_path.display()))?;
-        let mut chunk = [0_u8; 64 * 1024];
-        let mut downloaded = 0_u64;
-        let start = Instant::now();
-        let mut last_report = Instant::now();
-        let use_tty_line = io::stderr().is_terminal();
-        if use_tty_line {
-            eprint!(
-                "\r{}",
-                render_download_progress(downloaded, total_bytes, start.elapsed())
-            );
-            let _ = io::stderr().flush();
-        }
-        loop {
-            ensure_not_interrupted()?;
-            let read = resp
-                .read_chunk(&mut chunk)
-                .with_context(|| format!("read bytes from `{url}`"))?;
-            if read == 0 {
-                break;
-            }
-            out.write_all(&chunk[..read])
-                .with_context(|| format!("write downloaded file {}", asset_path.display()))?;
-            downloaded = downloaded.saturating_add(read as u64);
-            report_download_progress(
-                downloaded,
-                total_bytes,
-                start.elapsed(),
-                &mut last_report,
-                false,
-                use_tty_line,
-            );
-        }
-        report_download_progress(
-            downloaded,
-            total_bytes,
-            start.elapsed(),
-            &mut last_report,
-            true,
-            use_tty_line,
+        let probe = probe_parallel_download_support(&client, &url_parts.path_and_query).unwrap_or(
+            DownloadProbe {
+                total_bytes: 0,
+                range_supported: false,
+            },
         );
-        out.flush()
-            .with_context(|| format!("flush downloaded file {}", asset_path.display()))?;
+        let total_bytes = (probe.total_bytes > 0).then_some(probe.total_bytes);
+
+        if let Some(plan) = build_parallel_download_plan(probe.total_bytes, probe.range_supported) {
+            match download_to_path_parallel(&url_parts, url, &asset_path, proxy_scope, plan) {
+                Ok(()) => {}
+                Err(ParallelDownloadError::Unsupported(err)) => {
+                    eprintln!(
+                        "↩️  Parallel download unavailable for `{}`; falling back to single stream ({err:#})",
+                        asset_name
+                    );
+                    download_to_path_single(
+                        &client,
+                        &url_parts.path_and_query,
+                        url,
+                        &asset_path,
+                        total_bytes,
+                    )?;
+                }
+                Err(ParallelDownloadError::Failed(err)) => return Err(err),
+            }
+        } else {
+            download_to_path_single(
+                &client,
+                &url_parts.path_and_query,
+                url,
+                &asset_path,
+                total_bytes,
+            )?;
+        }
         ensure_not_interrupted()?;
 
         if let Some(expected_sha256) = expected_sha256 {
@@ -583,6 +583,393 @@ fn download_from_url(
         let _ = fs::remove_dir_all(&download_root);
     }
     run
+}
+
+fn build_download_request<'a>(
+    client: &'a Client,
+    path_and_query: &str,
+    range: Option<DownloadRange>,
+) -> Result<reqx::blocking::RequestBuilder<'a>> {
+    let mut req = client
+        .get(path_and_query.to_string())
+        .auto_accept_encoding(false);
+    req = req
+        .try_header("user-agent", HTTP_USER_AGENT)
+        .context("set download user-agent")?;
+    if let Some(range) = range {
+        req = req
+            .try_header("range", &format!("bytes={}-{}", range.start, range.end))
+            .context("set HTTP range header")?;
+    }
+    Ok(req)
+}
+
+fn probe_parallel_download_support(client: &Client, path_and_query: &str) -> Option<DownloadProbe> {
+    let range = DownloadRange { start: 0, end: 0 };
+    let req = build_download_request(client, path_and_query, Some(range)).ok()?;
+    let resp = req.send_response_stream().ok()?;
+    let status = resp.status();
+    if status != 206 {
+        return Some(DownloadProbe {
+            total_bytes: 0,
+            range_supported: false,
+        });
+    }
+    let total_bytes = resp
+        .headers()
+        .get("content-range")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_content_range_total)?;
+    Some(DownloadProbe {
+        total_bytes,
+        range_supported: true,
+    })
+}
+
+fn parse_content_range_total(value: &str) -> Option<u64> {
+    let (_, total) = value.trim().split_once('/')?;
+    if total.trim() == "*" {
+        return None;
+    }
+    total.trim().parse::<u64>().ok()
+}
+
+fn build_parallel_download_plan(
+    total_bytes: u64,
+    range_supported: bool,
+) -> Option<ParallelDownloadPlan> {
+    if !range_supported || total_bytes < PARALLEL_DOWNLOAD_MIN_BYTES {
+        return None;
+    }
+    let parts = ((total_bytes / PARALLEL_DOWNLOAD_MIN_PART_BYTES) as usize)
+        .min(PARALLEL_DOWNLOAD_MAX_PARTS);
+    if parts < 2 {
+        return None;
+    }
+    Some(ParallelDownloadPlan { total_bytes, parts })
+}
+
+fn split_download_ranges(plan: ParallelDownloadPlan) -> Vec<DownloadRange> {
+    let mut ranges = Vec::with_capacity(plan.parts);
+    let base = plan.total_bytes / plan.parts as u64;
+    let remainder = plan.total_bytes % plan.parts as u64;
+    let mut start = 0_u64;
+    for index in 0..plan.parts {
+        let extra = if (index as u64) < remainder { 1 } else { 0 };
+        let len = base + extra;
+        let end = start + len.saturating_sub(1);
+        ranges.push(DownloadRange { start, end });
+        start = end.saturating_add(1);
+    }
+    ranges
+}
+
+fn download_to_path_single(
+    client: &Client,
+    path_and_query: &str,
+    url: &str,
+    asset_path: &Path,
+    known_total_bytes: Option<u64>,
+) -> Result<()> {
+    let req = build_download_request(client, path_and_query, None)?;
+    let mut resp = req
+        .send_response_stream()
+        .with_context(|| format!("download from `{url}` ({PROXY_HINT})"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp
+            .into_text_lossy_limited(16 * 1024)
+            .unwrap_or_else(|_| "<body unavailable>".to_string());
+        bail!(
+            "download from `{url}` failed: status {} body {}",
+            status,
+            truncate_for_log(&body, 200)
+        );
+    }
+    let total_bytes = known_total_bytes.or_else(|| {
+        resp.headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    });
+
+    let mut out = File::create(asset_path)
+        .with_context(|| format!("create downloaded file {}", asset_path.display()))?;
+    let mut chunk = [0_u8; DOWNLOAD_READ_CHUNK_SIZE];
+    let mut downloaded = 0_u64;
+    let start = Instant::now();
+    let mut last_report = Instant::now();
+    let use_tty_line = io::stderr().is_terminal();
+    if use_tty_line {
+        eprint!(
+            "\r{}",
+            render_download_progress(downloaded, total_bytes, start.elapsed())
+        );
+        let _ = io::stderr().flush();
+    }
+    loop {
+        ensure_not_interrupted()?;
+        let read = resp
+            .read_chunk(&mut chunk)
+            .with_context(|| format!("read bytes from `{url}`"))?;
+        if read == 0 {
+            break;
+        }
+        out.write_all(&chunk[..read])
+            .with_context(|| format!("write downloaded file {}", asset_path.display()))?;
+        downloaded = downloaded.saturating_add(read as u64);
+        report_download_progress(
+            downloaded,
+            total_bytes,
+            start.elapsed(),
+            &mut last_report,
+            false,
+            use_tty_line,
+        );
+    }
+    report_download_progress(
+        downloaded,
+        total_bytes,
+        start.elapsed(),
+        &mut last_report,
+        true,
+        use_tty_line,
+    );
+    out.flush()
+        .with_context(|| format!("flush downloaded file {}", asset_path.display()))?;
+    Ok(())
+}
+
+fn download_to_path_parallel(
+    url_parts: &UrlParts,
+    url: &str,
+    asset_path: &Path,
+    proxy_scope: za_config::ProxyScope,
+    plan: ParallelDownloadPlan,
+) -> Result<(), ParallelDownloadError> {
+    let part_paths = split_download_ranges(plan)
+        .into_iter()
+        .enumerate()
+        .map(|(index, range)| {
+            (
+                index,
+                range,
+                asset_path.with_extension(format!("part-{index}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let start = Instant::now();
+    let progress = Arc::new(AtomicU64::new(0));
+    let reporter_stop = Arc::new(AtomicBool::new(false));
+    let total_bytes = Some(plan.total_bytes);
+    let use_tty_line = io::stderr().is_terminal();
+
+    let reporter = spawn_parallel_download_reporter(
+        Arc::clone(&progress),
+        Arc::clone(&reporter_stop),
+        total_bytes,
+        start,
+        use_tty_line,
+    );
+
+    let handles = part_paths
+        .clone()
+        .into_iter()
+        .map(|(index, range, part_path)| {
+            let base_url = url_parts.base_url.clone();
+            let path_and_query = url_parts.path_and_query.clone();
+            let progress = Arc::clone(&progress);
+            let reporter_stop = Arc::clone(&reporter_stop);
+            thread::spawn(move || {
+                let result = download_range_part(
+                    &base_url,
+                    &path_and_query,
+                    range,
+                    &part_path,
+                    proxy_scope,
+                    progress,
+                );
+                if result.is_err() {
+                    reporter_stop.store(true, Ordering::SeqCst);
+                }
+                result.map(|_| (index, part_path))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut ordered_parts = vec![PathBuf::new(); part_paths.len()];
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok((index, part_path))) => ordered_parts[index] = part_path,
+            Ok(Err(err)) => {
+                reporter_stop.store(true, Ordering::SeqCst);
+                let _ = reporter.join();
+                cleanup_parallel_part_files(&part_paths);
+                return Err(err);
+            }
+            Err(_) => {
+                reporter_stop.store(true, Ordering::SeqCst);
+                let _ = reporter.join();
+                cleanup_parallel_part_files(&part_paths);
+                return Err(ParallelDownloadError::Failed(anyhow!(
+                    "parallel download worker panicked for `{url}`"
+                )));
+            }
+        }
+    }
+
+    reporter_stop.store(true, Ordering::SeqCst);
+    let _ = reporter.join();
+    let mut last_report = Instant::now();
+    report_download_progress(
+        progress.load(Ordering::SeqCst),
+        total_bytes,
+        start.elapsed(),
+        &mut last_report,
+        true,
+        use_tty_line,
+    );
+
+    merge_parallel_part_files(&ordered_parts, asset_path).map_err(ParallelDownloadError::Failed)?;
+    cleanup_parallel_part_files(&part_paths);
+    Ok(())
+}
+
+fn spawn_parallel_download_reporter(
+    progress: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    total_bytes: Option<u64>,
+    start: Instant,
+    tty_line: bool,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut last_report = Instant::now();
+        if tty_line {
+            eprint!(
+                "\r{}",
+                render_download_progress(
+                    progress.load(Ordering::SeqCst),
+                    total_bytes,
+                    start.elapsed()
+                )
+            );
+            let _ = io::stderr().flush();
+        }
+        while !stop.load(Ordering::SeqCst) {
+            report_download_progress(
+                progress.load(Ordering::SeqCst),
+                total_bytes,
+                start.elapsed(),
+                &mut last_report,
+                false,
+                tty_line,
+            );
+            thread::sleep(Duration::from_millis(150));
+        }
+    })
+}
+
+fn download_range_part(
+    base_url: &str,
+    path_and_query: &str,
+    range: DownloadRange,
+    part_path: &Path,
+    proxy_scope: za_config::ProxyScope,
+    progress: Arc<AtomicU64>,
+) -> Result<(), ParallelDownloadError> {
+    ensure_not_interrupted().map_err(ParallelDownloadError::Failed)?;
+    let client = build_http_client(base_url, "za-tool-manager", true, proxy_scope)
+        .map_err(ParallelDownloadError::Failed)?;
+    let req = build_download_request(&client, path_and_query, Some(range))
+        .map_err(ParallelDownloadError::Failed)?;
+    let mut resp = req.send_response_stream().map_err(|err| {
+        ParallelDownloadError::Failed(anyhow!(err).context(format!(
+            "download byte range {}-{} from `{}` ({PROXY_HINT})",
+            range.start, range.end, path_and_query
+        )))
+    })?;
+    if resp.status() != 206 {
+        let status = resp.status();
+        let body = resp
+            .into_text_lossy_limited(1024)
+            .unwrap_or_else(|_| "<body unavailable>".to_string());
+        return Err(ParallelDownloadError::Unsupported(anyhow!(
+            "range request {}-{} returned status {} body {}",
+            range.start,
+            range.end,
+            status,
+            truncate_for_log(&body, 120)
+        )));
+    }
+
+    let mut out = File::create(part_path)
+        .with_context(|| format!("create partial file {}", part_path.display()))
+        .map_err(ParallelDownloadError::Failed)?;
+    let mut chunk = [0_u8; DOWNLOAD_READ_CHUNK_SIZE];
+    let mut written = 0_u64;
+    let expected = range.end.saturating_sub(range.start).saturating_add(1);
+    loop {
+        ensure_not_interrupted().map_err(ParallelDownloadError::Failed)?;
+        let read = resp
+            .read_chunk(&mut chunk)
+            .with_context(|| {
+                format!(
+                    "read partial bytes {}-{} from `{}`",
+                    range.start, range.end, path_and_query
+                )
+            })
+            .map_err(ParallelDownloadError::Failed)?;
+        if read == 0 {
+            break;
+        }
+        out.write_all(&chunk[..read])
+            .with_context(|| format!("write partial file {}", part_path.display()))
+            .map_err(ParallelDownloadError::Failed)?;
+        written = written.saturating_add(read as u64);
+        progress.fetch_add(read as u64, Ordering::Relaxed);
+    }
+    out.flush()
+        .with_context(|| format!("flush partial file {}", part_path.display()))
+        .map_err(ParallelDownloadError::Failed)?;
+    if written != expected {
+        return Err(ParallelDownloadError::Unsupported(anyhow!(
+            "range request {}-{} returned {} bytes, expected {}",
+            range.start,
+            range.end,
+            written,
+            expected
+        )));
+    }
+    Ok(())
+}
+
+fn merge_parallel_part_files(part_paths: &[PathBuf], asset_path: &Path) -> Result<()> {
+    let mut out = File::create(asset_path)
+        .with_context(|| format!("create downloaded file {}", asset_path.display()))?;
+    let mut chunk = [0_u8; DOWNLOAD_READ_CHUNK_SIZE];
+    for part_path in part_paths {
+        let mut part = File::open(part_path)
+            .with_context(|| format!("open partial file {}", part_path.display()))?;
+        loop {
+            let read = part
+                .read(&mut chunk)
+                .with_context(|| format!("read partial file {}", part_path.display()))?;
+            if read == 0 {
+                break;
+            }
+            out.write_all(&chunk[..read])
+                .with_context(|| format!("write downloaded file {}", asset_path.display()))?;
+        }
+    }
+    out.flush()
+        .with_context(|| format!("flush downloaded file {}", asset_path.display()))?;
+    Ok(())
+}
+
+fn cleanup_parallel_part_files(parts: &[(usize, DownloadRange, PathBuf)]) {
+    for (_, _, part_path) in parts {
+        let _ = fs::remove_file(part_path);
+    }
 }
 
 #[cfg(test)]
@@ -844,7 +1231,11 @@ fn unique_temp_dir(prefix: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TEMP_DIR_PREFIX_DOWNLOAD, matched_temp_prefix, parse_temp_dir_pid};
+    use super::{
+        DownloadRange, ParallelDownloadPlan, TEMP_DIR_PREFIX_DOWNLOAD,
+        build_parallel_download_plan, matched_temp_prefix, parse_content_range_total,
+        parse_temp_dir_pid, split_download_ranges,
+    };
 
     #[test]
     fn parse_temp_dir_pid_accepts_expected_layout() {
@@ -878,5 +1269,44 @@ mod tests {
             Some("za-tool-cargo-install")
         );
         assert_eq!(matched_temp_prefix("za-other-1-2"), None);
+    }
+
+    #[test]
+    fn parse_content_range_total_reads_total_bytes() {
+        assert_eq!(
+            parse_content_range_total("bytes 0-0/2700000"),
+            Some(2_700_000)
+        );
+        assert_eq!(parse_content_range_total("bytes 10-19/*"), None);
+        assert_eq!(parse_content_range_total("invalid"), None);
+    }
+
+    #[test]
+    fn parallel_download_plan_requires_range_support_and_size() {
+        assert_eq!(build_parallel_download_plan(1_048_576, true), None);
+        assert_eq!(build_parallel_download_plan(8_388_608, false), None);
+        assert_eq!(
+            build_parallel_download_plan(8_388_608, true),
+            Some(ParallelDownloadPlan {
+                total_bytes: 8_388_608,
+                parts: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn split_download_ranges_covers_full_payload_without_gaps() {
+        let ranges = split_download_ranges(ParallelDownloadPlan {
+            total_bytes: 10,
+            parts: 3,
+        });
+        assert_eq!(
+            ranges,
+            vec![
+                DownloadRange { start: 0, end: 3 },
+                DownloadRange { start: 4, end: 6 },
+                DownloadRange { start: 7, end: 9 },
+            ]
+        );
     }
 }
