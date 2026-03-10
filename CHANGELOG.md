@@ -1,8 +1,18 @@
+## [0.1.28] - 2026-03-10
+
+### 🚀 Features
+
+- *(diff)* Add github-style stat blocks
+- *(diff)* Add adaptive large-change risk threshold
 ## [0.1.27] - 2026-03-10
 
 ### 🚀 Features
 
 - *(tool)* Add parallel range downloads with fallback
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.27
 ## [0.1.26] - 2026-03-10
 
 ### 🚀 Features
