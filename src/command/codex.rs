@@ -500,15 +500,15 @@ mod tests {
     use super::{
         CodexStopOutput, CodexTopApp, CodexTopRow, FileSessionState, OtelEventRecord,
         OtelLiveState, OtelSessionState, SESSION_HASH_LEN, SessionFileTracker, SessionRecord,
-        TmuxSessionInfo, TopRowsInput, TopStreamState, TopView, activity_age_label,
-        apply_session_log_line, best_tracker_match_for_record, build_shell_exec_command,
-        build_top_rows, calculate_context_left_percent, config_overrides_otel,
-        ensure_local_listener_no_proxy, is_tmux_no_server, is_tmux_session_absent,
-        parse_legacy_codex_context_left_percent_lines, parse_otlp_session_events,
-        parse_tmux_codex_window_ids, parse_tmux_sessions, render_stop_message, resolve_state_home,
-        sanitize_session_label, session_status_label, shell_escape, summarize_codex_session_lines,
-        tmux_panes_include_listener_endpoint, tmux_terminal_overrides_disable_alt_screen,
-        workspace_hash,
+        TmuxSessionInfo, TopRowsInput, TopStreamFilter, TopStreamState, TopView,
+        activity_age_label, apply_session_log_line, best_tracker_match_for_record,
+        build_shell_exec_command, build_top_rows, calculate_context_left_percent,
+        config_overrides_otel, ensure_local_listener_no_proxy, is_tmux_no_server,
+        is_tmux_session_absent, parse_legacy_codex_context_left_percent_lines,
+        parse_otlp_session_events, parse_tmux_codex_window_ids, parse_tmux_sessions,
+        render_stop_message, resolve_state_home, sanitize_session_label, session_status_label,
+        shell_escape, summarize_codex_session_lines, tmux_panes_include_listener_endpoint,
+        tmux_terminal_overrides_disable_alt_screen, workspace_hash,
     };
     use std::{
         collections::{BTreeMap, BTreeSet, VecDeque},
@@ -1113,7 +1113,10 @@ mod tests {
             selected: 0,
             scroll_offset: 3,
             viewport_rows: 10,
+            detail_scroll_offset: 0,
+            detail_viewport_rows: 6,
             follow: true,
+            filter: TopStreamFilter::All,
         });
 
         app.rebind_stream_session_if_needed();

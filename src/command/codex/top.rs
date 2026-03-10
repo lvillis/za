@@ -222,7 +222,30 @@ pub(super) struct TopStreamState {
     pub(super) selected: usize,
     pub(super) scroll_offset: usize,
     pub(super) viewport_rows: usize,
+    pub(super) detail_scroll_offset: usize,
+    pub(super) detail_viewport_rows: usize,
     pub(super) follow: bool,
+    pub(super) filter: TopStreamFilter,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum TopStreamFilter {
+    #[default]
+    All,
+    Api,
+    Sse,
+    Tool,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TopStreamMetrics {
+    total_events: usize,
+    api_events: usize,
+    sse_events: usize,
+    tool_events: usize,
+    error_events: usize,
+    last_event_unix: Option<u64>,
 }
 
 struct TopListenerHandle {
@@ -663,6 +686,42 @@ fn otlp_event_has_error(attributes: &[OtlpAttribute]) -> bool {
     })
 }
 
+impl TopStreamFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Api => "api",
+            Self::Sse => "sse",
+            Self::Tool => "tool",
+            Self::Error => "error",
+        }
+    }
+
+    fn matches(self, event: &OtelEventRecord) -> bool {
+        match self {
+            Self::All => true,
+            Self::Api => is_api_event_name(&event.event_name),
+            Self::Sse => is_sse_event_name(&event.event_name),
+            Self::Tool => is_tool_event_name(&event.event_name),
+            Self::Error => event.tool_error,
+        }
+    }
+}
+
+fn is_api_event_name(event_name: &str) -> bool {
+    event_name.ends_with("api_request")
+}
+
+fn is_sse_event_name(event_name: &str) -> bool {
+    event_name.ends_with("sse_event")
+}
+
+fn is_tool_event_name(event_name: &str) -> bool {
+    event_name.ends_with("tool_result")
+        || event_name.ends_with("tool_call")
+        || event_name.contains(".tool_")
+}
+
 impl CodexTopApp {
     pub(super) fn new(current_workspace_root: PathBuf, show_all: bool, show_history: bool) -> Self {
         Self {
@@ -805,13 +864,10 @@ impl CodexTopApp {
         if event.event_name.ends_with("api_request") {
             session.api_requests += 1;
         }
-        if event.event_name.ends_with("sse_event") {
+        if is_sse_event_name(&event.event_name) {
             session.sse_events += 1;
         }
-        if event.event_name.ends_with("tool_result")
-            || event.event_name.ends_with("tool_call")
-            || event.event_name.contains(".tool_")
-        {
+        if is_tool_event_name(&event.event_name) {
             session.tool_calls += 1;
             if event.tool_error {
                 session.tool_errors += 1;
@@ -825,27 +881,41 @@ impl CodexTopApp {
                 .max(event.observed_unix),
         );
 
-        let session_events = self
-            .otel_state
-            .session_events
-            .entry(event.session_id.clone())
-            .or_default();
-        session_events.push_back(OtelEventRecord {
+        let record = OtelEventRecord {
             observed_unix: event.observed_unix,
             event_name: event.event_name.clone(),
             tool_error: event.tool_error,
             attributes: event.attributes,
             body: event.body,
-        });
+        };
+        let session_events = self
+            .otel_state
+            .session_events
+            .entry(event.session_id.clone())
+            .or_default();
+        let matches_stream_filter = matches!(
+            &self.view,
+            TopView::Stream(stream)
+                if stream.follow
+                    && stream.session_id == event.session_id
+                    && stream.filter.matches(&record)
+        );
+        session_events.push_back(record);
         while session_events.len() > TOP_STREAM_EVENT_CAP {
             session_events.pop_front();
         }
 
-        if let TopView::Stream(stream) = &mut self.view
-            && stream.follow
-            && stream.session_id == event.session_id
-        {
-            stream.selected = session_events.len().saturating_sub(1);
+        if matches_stream_filter {
+            let visible_len = session_events
+                .iter()
+                .filter(|record| {
+                    matches!(&self.view, TopView::Stream(stream) if stream.filter.matches(record))
+                })
+                .count();
+            self.update_stream_state(|stream| {
+                stream.selected = visible_len.saturating_sub(1);
+                stream.detail_scroll_offset = 0;
+            });
         }
     }
 
@@ -934,10 +1004,11 @@ impl CodexTopApp {
     }
 
     fn handle_stream_key(&mut self, code: KeyCode) {
-        let (session_id, viewport_rows, selected, follow) = match &self.view {
+        let (session_id, viewport_rows, detail_viewport_rows, selected, follow) = match &self.view {
             TopView::Stream(stream) => (
                 stream.session_id.clone(),
                 stream.viewport_rows,
+                stream.detail_viewport_rows,
                 stream.selected,
                 stream.follow,
             ),
@@ -951,24 +1022,28 @@ impl CodexTopApp {
                 self.update_stream_state(|stream| {
                     stream.follow = false;
                     stream.selected = selected.saturating_add(1).min(event_len.saturating_sub(1));
+                    stream.detail_scroll_offset = 0;
                 });
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.update_stream_state(|stream| {
                     stream.follow = false;
                     stream.selected = selected.saturating_sub(1);
+                    stream.detail_scroll_offset = 0;
                 });
             }
             KeyCode::Home | KeyCode::Char('g') => {
                 self.update_stream_state(|stream| {
                     stream.follow = false;
                     stream.selected = 0;
+                    stream.detail_scroll_offset = 0;
                 });
             }
             KeyCode::End | KeyCode::Char('G') => {
                 self.update_stream_state(|stream| {
                     stream.follow = true;
                     stream.selected = event_len.saturating_sub(1);
+                    stream.detail_scroll_offset = 0;
                 });
             }
             KeyCode::PageDown => {
@@ -978,6 +1053,7 @@ impl CodexTopApp {
                     stream.selected = selected
                         .saturating_add(step)
                         .min(event_len.saturating_sub(1));
+                    stream.detail_scroll_offset = 0;
                 });
             }
             KeyCode::PageUp => {
@@ -985,6 +1061,7 @@ impl CodexTopApp {
                 self.update_stream_state(|stream| {
                     stream.follow = false;
                     stream.selected = selected.saturating_sub(step);
+                    stream.detail_scroll_offset = 0;
                 });
             }
             KeyCode::Char('f') => {
@@ -993,6 +1070,7 @@ impl CodexTopApp {
                     stream.follow = next_follow;
                     if next_follow {
                         stream.selected = event_len.saturating_sub(1);
+                        stream.detail_scroll_offset = 0;
                     }
                 });
                 self.status_message = Some(if next_follow {
@@ -1000,6 +1078,21 @@ impl CodexTopApp {
                 } else {
                     "stream follow paused".to_string()
                 });
+            }
+            KeyCode::Char('0') => self.set_stream_filter(TopStreamFilter::All),
+            KeyCode::Char('a') => self.set_stream_filter(TopStreamFilter::Api),
+            KeyCode::Char('s') => self.set_stream_filter(TopStreamFilter::Sse),
+            KeyCode::Char('t') => self.set_stream_filter(TopStreamFilter::Tool),
+            KeyCode::Char('e') => self.set_stream_filter(TopStreamFilter::Error),
+            KeyCode::Char('[') => self.scroll_stream_detail_lines(-1),
+            KeyCode::Char(']') => self.scroll_stream_detail_lines(1),
+            KeyCode::Char('{') => {
+                let step = detail_viewport_rows.saturating_sub(1).max(1) as isize;
+                self.scroll_stream_detail_lines(-step);
+            }
+            KeyCode::Char('}') => {
+                let step = detail_viewport_rows.saturating_sub(1).max(1) as isize;
+                self.scroll_stream_detail_lines(step);
             }
             _ => {}
         }
@@ -1026,7 +1119,10 @@ impl CodexTopApp {
             selected,
             scroll_offset: 0,
             viewport_rows: 10,
+            detail_scroll_offset: 0,
+            detail_viewport_rows: 6,
             follow: true,
+            filter: TopStreamFilter::All,
         });
     }
 
@@ -1071,6 +1167,7 @@ impl CodexTopApp {
                 stream.selected.min(next_event_len.saturating_sub(1))
             };
             stream.scroll_offset = 0;
+            stream.detail_scroll_offset = 0;
         });
         self.status_message = Some(format!(
             "stream rebound to live OTel session {}",
@@ -1079,7 +1176,11 @@ impl CodexTopApp {
     }
 
     fn stream_event_len(&self, session_id: &str) -> usize {
-        self.stream_event_vec(session_id).len()
+        let filter = match &self.view {
+            TopView::Stream(stream) => stream.filter,
+            TopView::Summary => TopStreamFilter::All,
+        };
+        self.stream_event_vec(session_id, filter).len()
     }
 
     fn update_stream_state(&mut self, update: impl FnOnce(&mut TopStreamState)) {
@@ -1088,12 +1189,82 @@ impl CodexTopApp {
         }
     }
 
-    fn stream_event_vec(&self, session_id: &str) -> Vec<OtelEventRecord> {
+    fn stream_event_vec(&self, session_id: &str, filter: TopStreamFilter) -> Vec<OtelEventRecord> {
         self.otel_state
             .session_events
             .get(session_id)
-            .map(|events| events.iter().cloned().collect::<Vec<_>>())
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|event| filter.matches(event))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default()
+    }
+
+    fn stream_metrics(&self, session_id: &str) -> TopStreamMetrics {
+        let Some(events) = self.otel_state.session_events.get(session_id) else {
+            return TopStreamMetrics::default();
+        };
+        let mut metrics = TopStreamMetrics::default();
+        for event in events {
+            metrics.total_events += 1;
+            metrics.last_event_unix = Some(
+                metrics
+                    .last_event_unix
+                    .unwrap_or_default()
+                    .max(event.observed_unix),
+            );
+            if is_api_event_name(&event.event_name) {
+                metrics.api_events += 1;
+            }
+            if is_sse_event_name(&event.event_name) {
+                metrics.sse_events += 1;
+            }
+            if is_tool_event_name(&event.event_name) {
+                metrics.tool_events += 1;
+            }
+            if event.tool_error {
+                metrics.error_events += 1;
+            }
+        }
+        metrics
+    }
+
+    fn set_stream_filter(&mut self, filter: TopStreamFilter) {
+        let (session_id, follow, selected) = match &self.view {
+            TopView::Stream(stream) => (stream.session_id.clone(), stream.follow, stream.selected),
+            TopView::Summary => return,
+        };
+        let event_len = self.stream_event_vec(&session_id, filter).len();
+        self.update_stream_state(|stream| {
+            stream.filter = filter;
+            stream.selected = if follow {
+                event_len.saturating_sub(1)
+            } else {
+                selected.min(event_len.saturating_sub(1))
+            };
+            stream.scroll_offset = 0;
+            stream.detail_scroll_offset = 0;
+        });
+        self.status_message = Some(format!(
+            "stream filter: {} (0 all, a api, s sse, t tool, e error)",
+            filter.label()
+        ));
+    }
+
+    fn scroll_stream_detail_lines(&mut self, delta: isize) {
+        self.update_stream_state(|stream| {
+            if delta.is_negative() {
+                stream.detail_scroll_offset = stream
+                    .detail_scroll_offset
+                    .saturating_sub(delta.unsigned_abs());
+            } else {
+                stream.detail_scroll_offset =
+                    stream.detail_scroll_offset.saturating_add(delta as usize);
+            }
+        });
     }
 }
 
@@ -1794,7 +1965,9 @@ fn draw_stream_tui(
         tmux_running,
         live_otel,
         follow,
+        filter,
         scroll_offset,
+        detail_scroll_offset,
         selected,
     ) = match &app.view {
         TopView::Stream(stream) => (
@@ -1805,13 +1978,16 @@ fn draw_stream_tui(
             stream.tmux_running,
             stream.live_otel,
             stream.follow,
+            stream.filter,
             stream.scroll_offset,
+            stream.detail_scroll_offset,
             stream.selected,
         ),
         TopView::Summary => return,
     };
 
-    let events = app.stream_event_vec(&session_id);
+    let metrics = app.stream_metrics(&session_id);
+    let events = app.stream_event_vec(&session_id, filter);
     let resolved_selected = if follow {
         events.len().saturating_sub(1)
     } else {
@@ -1824,9 +2000,9 @@ fn draw_stream_tui(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Min(8),
-            Constraint::Length(8),
+            Constraint::Length(9),
         ])
         .split(frame.area());
 
@@ -1844,8 +2020,10 @@ fn draw_stream_tui(
             ),
             Span::raw("  "),
             Span::raw(format!(
-                "events={}  follow={}  listener={}",
+                "visible={}  total={}  filter={}  follow={}  listener={}",
                 events.len(),
+                metrics.total_events,
+                filter.label(),
                 if follow { "on" } else { "off" },
                 truncate_end(&listener.endpoint, 24)
             )),
@@ -1878,11 +2056,21 @@ fn draw_stream_tui(
                 "no"
             }
         ))),
+        Line::from(Span::raw(format!(
+            "api={}  sse={}  tool={}  errors={}  last={}",
+            metrics.api_events,
+            metrics.sse_events,
+            metrics.tool_events,
+            metrics.error_events,
+            activity_age_label(metrics.last_event_unix),
+        ))),
     ])
     .block(Block::default().borders(Borders::ALL).title("Event Stream"));
     frame.render_widget(overview, chunks[0]);
 
-    let stream_block = Block::default().borders(Borders::ALL).title("Events");
+    let stream_block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!("Events [{}]", filter.label()));
     let inner = stream_block.inner(chunks[1]);
     frame.render_widget(stream_block, chunks[1]);
     let stream_chunks = Layout::default()
@@ -1898,7 +2086,11 @@ fn draw_stream_tui(
 
     let items = if events.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
-            "No live OTel events captured for this session yet.",
+            if metrics.total_events == 0 {
+                "No live OTel events captured for this session yet."
+            } else {
+                "No OTel events matched the current filter. Press `0` for all events."
+            },
             Style::default().fg(Color::DarkGray),
         )))]
     } else {
@@ -1917,19 +2109,43 @@ fn draw_stream_tui(
         stream.viewport_rows = usize::from(stream_chunks[1].height.max(1));
     });
 
+    let detail_block = Block::default().borders(Borders::ALL).title("Event Detail");
+    let detail_inner = detail_block.inner(chunks[2]);
+    let detail_width = usize::from(detail_inner.width.max(1));
+    let detail_height = usize::from(detail_inner.height.max(1));
     let detail = events
         .get(resolved_selected)
-        .map(|event| stream_detail_lines(event, &app.status_message))
+        .map(|event| {
+            stream_detail_lines(
+                event,
+                filter,
+                resolved_selected.saturating_add(1),
+                events.len(),
+                detail_width,
+                &app.status_message,
+            )
+        })
         .unwrap_or_else(|| {
-            vec![
-                Line::from("Esc back  f follow  j/k move  PgUp/PgDn page  q quit"),
-                Line::from(app.status_message.clone().unwrap_or_else(|| {
-                    "Waiting for the selected session to emit new OTel events.".to_string()
-                })),
-            ]
+            stream_empty_detail_lines(
+                filter,
+                metrics.total_events,
+                detail_width,
+                &app.status_message,
+            )
         });
-    let detail =
-        Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title("Event Detail"));
+    let max_detail_scroll = detail.len().saturating_sub(detail_height);
+    let resolved_detail_scroll = detail_scroll_offset.min(max_detail_scroll);
+    app.update_stream_state(|stream| {
+        stream.detail_scroll_offset = resolved_detail_scroll;
+        stream.detail_viewport_rows = detail_height;
+    });
+    let detail = Paragraph::new(detail)
+        .scroll((resolved_detail_scroll.min(u16::MAX as usize) as u16, 0))
+        .block(detail_block.title(format!(
+            "Event Detail {}/{}",
+            resolved_detail_scroll.saturating_add(1).min(max_detail_scroll.saturating_add(1)),
+            max_detail_scroll.saturating_add(1)
+        )));
     frame.render_widget(detail, chunks[2]);
 }
 
@@ -1994,32 +2210,170 @@ fn stream_event_snippet(event: &OtelEventRecord) -> String {
 
 fn stream_detail_lines(
     event: &OtelEventRecord,
+    filter: TopStreamFilter,
+    selected_index: usize,
+    visible_events: usize,
+    width: usize,
     status_message: &Option<String>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.push(Line::from(format!(
-        "event={}  active={}  error={}  attrs={}  Esc back  f follow  q quit",
-        event.event_name,
-        activity_age_label(Some(event.observed_unix)),
-        if event.tool_error { "yes" } else { "no" },
-        event.attributes.len(),
-    )));
+    push_wrapped_text(
+        &mut lines,
+        &format!(
+            "event={}  active={}  error={}  attrs={}  selected={}/{}  filter={}  Esc back  f follow  0/a/s/t/e  [/] detail  {{/}} page  q quit",
+            event.event_name,
+            activity_age_label(Some(event.observed_unix)),
+            if event.tool_error { "yes" } else { "no" },
+            event.attributes.len(),
+            selected_index,
+            visible_events,
+            filter.label(),
+        ),
+        width,
+    );
     if let Some(body) = &event.body {
-        lines.push(Line::from(format!("body={}", truncate_end(body, 120))));
+        push_wrapped_key_value(&mut lines, "body=", body, width);
     }
-    let mut attr_lines = Vec::new();
-    for (key, value) in &event.attributes {
-        attr_lines.push(format!("{key}={value}"));
-    }
-    if attr_lines.is_empty() {
-        lines.push(Line::from("attributes: -"));
+    if event.attributes.is_empty() {
+        push_wrapped_text(&mut lines, "attributes: -", width);
     } else {
-        for chunk in attr_lines.chunks(2).take(4) {
-            lines.push(Line::from(chunk.join("    ")));
+        push_wrapped_text(&mut lines, "attributes:", width);
+        for (key, value) in &event.attributes {
+            push_wrapped_key_value(&mut lines, &format!("  {key}="), value, width);
         }
     }
     if let Some(message) = status_message {
-        lines.push(Line::from(message.clone()));
+        push_wrapped_key_value(&mut lines, "note=", message, width);
     }
     lines
+}
+
+fn stream_empty_detail_lines(
+    filter: TopStreamFilter,
+    total_events: usize,
+    width: usize,
+    status_message: &Option<String>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    push_wrapped_text(
+        &mut lines,
+        "Esc back  f follow  j/k move  PgUp/PgDn page  0/a/s/t/e filter  [/] detail  {/} page  q quit",
+        width,
+    );
+    let message = status_message.clone().unwrap_or_else(|| {
+        if total_events == 0 {
+            "Waiting for the selected session to emit new OTel events.".to_string()
+        } else {
+            format!(
+                "Filter `{}` matched no events. Press `0` to show all captured events.",
+                filter.label()
+            )
+        }
+    });
+    push_wrapped_key_value(&mut lines, "note=", &message, width);
+    lines
+}
+
+fn push_wrapped_text(lines: &mut Vec<Line<'static>>, text: &str, width: usize) {
+    for line in wrap_plain_text(text, width) {
+        lines.push(Line::from(line));
+    }
+}
+
+fn push_wrapped_key_value(lines: &mut Vec<Line<'static>>, prefix: &str, value: &str, width: usize) {
+    let prefix_width = prefix.chars().count();
+    let content_width = width.saturating_sub(prefix_width).max(1);
+    let continuation = " ".repeat(prefix_width);
+    let chunks = wrap_plain_text(value, content_width);
+    if chunks.is_empty() {
+        lines.push(Line::from(prefix.to_string()));
+        return;
+    }
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        if index == 0 {
+            lines.push(Line::from(format!("{prefix}{chunk}")));
+        } else {
+            lines.push(Line::from(format!("{continuation}{chunk}")));
+        }
+    }
+}
+
+fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for raw_line in text.split('\n') {
+        if raw_line.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for ch in raw_line.chars() {
+            if current_width == width {
+                lines.push(current);
+                current = String::new();
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += 1;
+        }
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_stream_filter_matches_expected_event_categories() {
+        let api = fixture_event("codex.api_request", false, 10);
+        let sse = fixture_event("codex.sse_event", false, 11);
+        let tool = fixture_event("codex.tool_result", false, 12);
+        let err = fixture_event("codex.websocket_event", true, 13);
+
+        assert!(TopStreamFilter::All.matches(&api));
+        assert!(TopStreamFilter::Api.matches(&api));
+        assert!(!TopStreamFilter::Api.matches(&sse));
+        assert!(TopStreamFilter::Sse.matches(&sse));
+        assert!(TopStreamFilter::Tool.matches(&tool));
+        assert!(TopStreamFilter::Error.matches(&err));
+        assert!(!TopStreamFilter::Tool.matches(&err));
+    }
+
+    #[test]
+    fn stream_metrics_counts_visible_signal_types() {
+        let mut app = CodexTopApp::new(PathBuf::from("/tmp/workspace"), false, false);
+        app.otel_state.session_events.insert(
+            "session-1".to_string(),
+            VecDeque::from(vec![
+                fixture_event("codex.api_request", false, 10),
+                fixture_event("codex.sse_event", false, 11),
+                fixture_event("codex.tool_call", false, 12),
+                fixture_event("codex.websocket_event", true, 13),
+            ]),
+        );
+
+        let metrics = app.stream_metrics("session-1");
+        assert_eq!(metrics.total_events, 4);
+        assert_eq!(metrics.api_events, 1);
+        assert_eq!(metrics.sse_events, 1);
+        assert_eq!(metrics.tool_events, 1);
+        assert_eq!(metrics.error_events, 1);
+        assert_eq!(metrics.last_event_unix, Some(13));
+    }
+
+    fn fixture_event(event_name: &str, tool_error: bool, observed_unix: u64) -> OtelEventRecord {
+        OtelEventRecord {
+            observed_unix,
+            event_name: event_name.to_string(),
+            tool_error,
+            attributes: BTreeMap::new(),
+            body: None,
+        }
+    }
 }
