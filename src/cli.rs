@@ -20,6 +20,24 @@ pub enum Commands {
         /// Include per-file additions/deletions in JSON output.
         #[arg(long)]
         files: bool,
+        /// Only print status/scope/path rows, without numeric diff columns.
+        #[arg(long)]
+        name_only: bool,
+        /// Only include staged changes.
+        #[arg(long)]
+        staged: bool,
+        /// Only include unstaged changes.
+        #[arg(long)]
+        unstaged: bool,
+        /// Only include untracked changes.
+        #[arg(long)]
+        untracked: bool,
+        /// Restrict results to paths matching this gitignore-style glob. Repeatable.
+        #[arg(long, value_name = "GLOB")]
+        path: Vec<String>,
+        /// Hide files carrying the selected review risk tag. Repeatable.
+        #[arg(long, value_enum, value_name = "RISK")]
+        exclude_risk: Vec<DiffRiskFilter>,
     },
     /// Generate `CONTEXT.md`
     Gen {
@@ -423,18 +441,57 @@ pub enum ConfigKey {
     IdeOrphanTtlMinutes,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum DiffRiskFilter {
+    Binary,
+    Ci,
+    Config,
+    Generated,
+    Large,
+    Lockfile,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CiCommands, Cli, CodexCommands, Commands, GhCommands, GitAuthCommands};
+    use super::{
+        CiCommands, Cli, CodexCommands, Commands, DiffRiskFilter, GhCommands, GitAuthCommands,
+    };
     use clap::Parser;
 
     #[test]
-    fn diff_parses_json_and_files_flags() {
-        let cli = Cli::try_parse_from(["za", "diff", "--json", "--files"]).expect("must parse");
+    fn diff_parses_review_filters() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "diff",
+            "--json",
+            "--files",
+            "--name-only",
+            "--staged",
+            "--path",
+            "src/**",
+            "--exclude-risk",
+            "generated",
+        ])
+        .expect("must parse");
         match cli.cmd {
-            Commands::Diff { json, files } => {
+            Commands::Diff {
+                json,
+                files,
+                name_only,
+                staged,
+                unstaged,
+                untracked,
+                path,
+                exclude_risk,
+            } => {
                 assert!(json);
                 assert!(files);
+                assert!(name_only);
+                assert!(staged);
+                assert!(!unstaged);
+                assert!(!untracked);
+                assert_eq!(path, vec!["src/**"]);
+                assert_eq!(exclude_risk, vec![DiffRiskFilter::Generated]);
             }
             _ => panic!("unexpected command"),
         }

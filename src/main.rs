@@ -9,8 +9,34 @@ fn main() -> Result<()> {
 
     let args = cli::Cli::parse();
     match args.cmd {
-        cli::Commands::Diff { json, files } => {
-            let exit_code = command::diff::run(json, files)?;
+        cli::Commands::Diff {
+            json,
+            files,
+            name_only,
+            staged,
+            unstaged,
+            untracked,
+            path,
+            exclude_risk,
+        } => {
+            let exit_code = command::diff::run(command::diff::DiffRunOptions {
+                json,
+                files,
+                name_only,
+                path_patterns: path,
+                scopes: [
+                    (staged, command::diff::DiffScope::Staged),
+                    (unstaged, command::diff::DiffScope::Unstaged),
+                    (untracked, command::diff::DiffScope::Untracked),
+                ]
+                .into_iter()
+                .filter_map(|(enabled, scope)| enabled.then_some(scope))
+                .collect(),
+                exclude_risks: exclude_risk
+                    .into_iter()
+                    .map(command::diff::DiffRiskKind::from)
+                    .collect(),
+            })?;
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }

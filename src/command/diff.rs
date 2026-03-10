@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
+use crossterm::terminal;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
@@ -11,12 +13,65 @@ use std::{
 const DIFF_STAT_BLOCK_COUNT: usize = 5;
 const DIFF_STAT_FILLED_BLOCK: &str = "\u{25A0}";
 const DIFF_STAT_EMPTY_BLOCK: &str = "\u{25A1}";
+const PATH_COLUMN_MIN_WIDTH: usize = 24;
+const PATH_COLUMN_MAX_WIDTH: usize = 72;
+const LARGE_DIFF_THRESHOLD_FALLBACK: u64 = 400;
+const LARGE_DIFF_THRESHOLD_MIN: u64 = 200;
+const LARGE_DIFF_THRESHOLD_MAX: u64 = 1200;
+const LARGE_DIFF_HISTORY_COMMITS: usize = 200;
+const LARGE_DIFF_HISTORY_MIN_SAMPLES: usize = 32;
+const LARGE_DIFF_HISTORY_PERCENTILE: usize = 90;
+const GENERATED_MARKERS: &[&str] = &[
+    "/dist/",
+    "/build/",
+    "/generated/",
+    "/vendor/",
+    ".generated.",
+    ".min.",
+];
+const LOCKFILE_NAMES: &[&str] = &[
+    "Cargo.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "poetry.lock",
+    "uv.lock",
+    "go.sum",
+    "composer.lock",
+];
+const CONFIG_NAMES: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "justfile",
+    ".justfile",
+    "Dockerfile",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yml",
+    "compose.yaml",
+    ".env",
+    ".env.example",
+    ".gitignore",
+    ".dockerignore",
+];
 
-pub fn run(json: bool, files: bool) -> Result<i32> {
+#[derive(Debug, Clone, Default)]
+pub struct DiffRunOptions {
+    pub json: bool,
+    pub files: bool,
+    pub name_only: bool,
+    pub path_patterns: Vec<String>,
+    pub scopes: Vec<DiffScope>,
+    pub exclude_risks: Vec<DiffRiskKind>,
+}
+
+pub fn run(options: DiffRunOptions) -> Result<i32> {
     let repo_root = resolve_repo_root()?;
-    let report = collect_workspace_diff(&repo_root, files || !json)?;
+    let filters = DiffFilterSpec::from_run_options(&options, &repo_root)?;
+    let report = collect_workspace_diff(&repo_root, options.files || !options.json, &filters)?;
 
-    if json {
+    if options.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&report).context("serialize diff output")?
@@ -24,7 +79,15 @@ pub fn run(json: bool, files: bool) -> Result<i32> {
     } else {
         print!(
             "{}",
-            render_diff_report(&report, color_enabled(), unicode_diff_stat_enabled())
+            render_diff_report(
+                &report,
+                RenderOptions {
+                    use_color: color_enabled(),
+                    use_unicode_stat: unicode_diff_stat_enabled(),
+                    name_only: options.name_only,
+                    terminal_width: terminal_width(),
+                },
+            )
         );
     }
 
@@ -33,10 +96,34 @@ pub fn run(json: bool, files: bool) -> Result<i32> {
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
-enum DiffScope {
+pub enum DiffScope {
     Staged,
     Unstaged,
     Untracked,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffRiskKind {
+    Binary,
+    Ci,
+    Config,
+    Generated,
+    Large,
+    Lockfile,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum DiffRiskLevel {
+    High,
+    Medium,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DiffRisk {
+    kind: DiffRiskKind,
+    level: DiffRiskLevel,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -59,12 +146,20 @@ struct DiffFileStat {
     path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    renamed_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    renamed_to: Option<String>,
     additions: u64,
     deletions: u64,
     binary: bool,
     status: DiffStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary_scope: Option<DiffScope>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     scopes: Vec<DiffScope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    risks: Vec<DiffRisk>,
 }
 
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
@@ -79,13 +174,64 @@ struct DiffSection {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct DiffWorkspaceOutput {
+    schema_version: u8,
     repo_root: String,
     head: Option<String>,
     clean: bool,
+    filters: DiffFilterSummary,
+    risk_policy: DiffRiskPolicy,
+    workspace_total: DiffSection,
     staged: DiffSection,
     unstaged: DiffSection,
     untracked: DiffSection,
     total: DiffSection,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+struct DiffFilterSummary {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    scopes: Vec<DiffScope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    path_patterns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    exclude_risks: Vec<DiffRiskKind>,
+}
+
+#[derive(Debug, Clone)]
+struct DiffFilterSpec {
+    summary: DiffFilterSummary,
+    path_matcher: Option<Gitignore>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DiffRiskPolicy {
+    large_threshold: u64,
+    large_threshold_source: DiffLargeThresholdSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    large_threshold_history_samples: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    large_threshold_history_commits: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DiffLargeThresholdSource {
+    FixedFallback,
+    HistoryP90,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HistoricalDiffSamples {
+    totals: Vec<u64>,
+    commits: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RenderOptions {
+    use_color: bool,
+    use_unicode_stat: bool,
+    name_only: bool,
+    terminal_width: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -134,9 +280,14 @@ fn resolve_repo_root_from(cwd: &Path) -> Result<PathBuf> {
     bail!("`git rev-parse --show-toplevel` failed: {}", stderr.trim())
 }
 
-fn collect_workspace_diff(repo_root: &Path, include_files: bool) -> Result<DiffWorkspaceOutput> {
+fn collect_workspace_diff(
+    repo_root: &Path,
+    include_files: bool,
+    filters: &DiffFilterSpec,
+) -> Result<DiffWorkspaceOutput> {
     let head = git_head_short(repo_root)?;
-    let staged_entries = collect_git_diff_entries(
+    let risk_policy = detect_risk_policy(repo_root)?;
+    let raw_staged_entries = collect_git_diff_entries(
         repo_root,
         &["diff", "--cached", "--numstat", "-z", "-M", "--root", "--"],
         &[
@@ -151,28 +302,52 @@ fn collect_workspace_diff(repo_root: &Path, include_files: bool) -> Result<DiffW
         NumstatPathMode::Native,
         DiffScope::Staged,
     )?;
-    let unstaged_entries = collect_git_diff_entries(
+    let raw_unstaged_entries = collect_git_diff_entries(
         repo_root,
         &["diff", "--numstat", "-z", "-M", "--"],
         &["diff", "--name-status", "-z", "-M", "--"],
         NumstatPathMode::Native,
         DiffScope::Unstaged,
     )?;
-    let untracked_entries = collect_untracked_entries(repo_root)?;
+    let raw_untracked_entries = collect_untracked_entries(repo_root)?;
+    let mut raw_staged_entries = raw_staged_entries;
+    let mut raw_unstaged_entries = raw_unstaged_entries;
+    let mut raw_untracked_entries = raw_untracked_entries;
+    finalize_entries(&mut raw_staged_entries, &risk_policy);
+    finalize_entries(&mut raw_unstaged_entries, &risk_policy);
+    finalize_entries(&mut raw_untracked_entries, &risk_policy);
+    let workspace_total = build_total_section(
+        [
+            &raw_staged_entries,
+            &raw_unstaged_entries,
+            &raw_untracked_entries,
+        ],
+        false,
+        &risk_policy,
+    );
+    let clean = workspace_total.files == 0;
 
-    let staged = build_diff_section(staged_entries.clone(), include_files);
-    let unstaged = build_diff_section(unstaged_entries.clone(), include_files);
-    let untracked = build_diff_section(untracked_entries.clone(), include_files);
+    let staged_entries = apply_filters(raw_staged_entries, filters);
+    let unstaged_entries = apply_filters(raw_unstaged_entries, filters);
+    let untracked_entries = apply_filters(raw_untracked_entries, filters);
+
+    let staged = build_diff_section(staged_entries.clone(), include_files, &risk_policy);
+    let unstaged = build_diff_section(unstaged_entries.clone(), include_files, &risk_policy);
+    let untracked = build_diff_section(untracked_entries.clone(), include_files, &risk_policy);
     let total = build_total_section(
         [&staged_entries, &unstaged_entries, &untracked_entries],
         include_files,
+        &risk_policy,
     );
-    let clean = total.files == 0;
 
     Ok(DiffWorkspaceOutput {
+        schema_version: 1,
         repo_root: repo_root.display().to_string(),
         head,
         clean,
+        filters: filters.summary.clone(),
+        risk_policy,
+        workspace_total,
         staged,
         unstaged,
         untracked,
@@ -180,7 +355,12 @@ fn collect_workspace_diff(repo_root: &Path, include_files: bool) -> Result<DiffW
     })
 }
 
-fn build_diff_section(mut entries: Vec<DiffFileStat>, include_files: bool) -> DiffSection {
+fn build_diff_section(
+    mut entries: Vec<DiffFileStat>,
+    include_files: bool,
+    risk_policy: &DiffRiskPolicy,
+) -> DiffSection {
+    finalize_entries(&mut entries, risk_policy);
     sort_section_entries(&mut entries);
     let additions = entries.iter().map(|entry| entry.additions).sum();
     let deletions = entries.iter().map(|entry| entry.deletions).sum();
@@ -198,7 +378,11 @@ fn build_diff_section(mut entries: Vec<DiffFileStat>, include_files: bool) -> Di
     }
 }
 
-fn build_total_section(sections: [&Vec<DiffFileStat>; 3], include_files: bool) -> DiffSection {
+fn build_total_section(
+    sections: [&Vec<DiffFileStat>; 3],
+    include_files: bool,
+    risk_policy: &DiffRiskPolicy,
+) -> DiffSection {
     let mut merged = BTreeMap::<String, DiffFileStat>::new();
     for section in sections {
         for entry in section {
@@ -207,11 +391,15 @@ fn build_total_section(sections: [&Vec<DiffFileStat>; 3], include_files: bool) -
                 .or_insert_with(|| DiffFileStat {
                     path: entry.path.clone(),
                     previous_path: entry.previous_path.clone(),
+                    renamed_from: None,
+                    renamed_to: None,
                     additions: 0,
                     deletions: 0,
                     binary: false,
                     status: entry.status,
+                    primary_scope: None,
                     scopes: Vec::new(),
+                    risks: Vec::new(),
                 });
             aggregate.previous_path = aggregate
                 .previous_path
@@ -230,6 +418,7 @@ fn build_total_section(sections: [&Vec<DiffFileStat>; 3], include_files: bool) -
     }
 
     let mut entries = merged.into_values().collect::<Vec<_>>();
+    finalize_entries(&mut entries, risk_policy);
     sort_review_entries(&mut entries);
     let additions = entries.iter().map(|entry| entry.additions).sum();
     let deletions = entries.iter().map(|entry| entry.deletions).sum();
@@ -244,6 +433,233 @@ fn build_total_section(sections: [&Vec<DiffFileStat>; 3], include_files: bool) -
         deletions,
         binary_files,
         file_stats: entries,
+    }
+}
+
+impl DiffFilterSpec {
+    fn from_run_options(options: &DiffRunOptions, repo_root: &Path) -> Result<Self> {
+        let summary = DiffFilterSummary {
+            scopes: normalize_scope_filters(&options.scopes),
+            path_patterns: options.path_patterns.clone(),
+            exclude_risks: normalize_risk_filters(&options.exclude_risks),
+        };
+        let path_matcher = build_path_matcher(repo_root, &summary.path_patterns)?;
+        Ok(Self {
+            summary,
+            path_matcher,
+        })
+    }
+}
+
+impl DiffRiskPolicy {
+    fn fallback() -> Self {
+        Self {
+            large_threshold: LARGE_DIFF_THRESHOLD_FALLBACK,
+            large_threshold_source: DiffLargeThresholdSource::FixedFallback,
+            large_threshold_history_samples: None,
+            large_threshold_history_commits: None,
+        }
+    }
+}
+
+fn detect_risk_policy(repo_root: &Path) -> Result<DiffRiskPolicy> {
+    let Some(history) = collect_historical_diff_samples(repo_root)? else {
+        return Ok(DiffRiskPolicy::fallback());
+    };
+    if history.totals.len() < LARGE_DIFF_HISTORY_MIN_SAMPLES {
+        return Ok(DiffRiskPolicy::fallback());
+    }
+
+    let large_threshold = compute_large_diff_threshold(&history.totals);
+    Ok(DiffRiskPolicy {
+        large_threshold,
+        large_threshold_source: DiffLargeThresholdSource::HistoryP90,
+        large_threshold_history_samples: Some(history.totals.len()),
+        large_threshold_history_commits: Some(history.commits),
+    })
+}
+
+fn collect_historical_diff_samples(repo_root: &Path) -> Result<Option<HistoricalDiffSamples>> {
+    let commit_limit = LARGE_DIFF_HISTORY_COMMITS.to_string();
+    let output = git_output(
+        repo_root,
+        &[
+            "log",
+            "--no-merges",
+            "--no-renames",
+            "--numstat",
+            "-z",
+            "--format=%x1e",
+            "-n",
+            &commit_limit,
+            "--",
+        ],
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_unborn_head(&stderr) || stderr.contains("does not have any commits yet") {
+            return Ok(None);
+        }
+        return Ok(None);
+    }
+
+    let history = parse_historical_diff_samples(&output.stdout)?;
+    if history.commits == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(history))
+    }
+}
+
+fn parse_historical_diff_samples(raw: &[u8]) -> Result<HistoricalDiffSamples> {
+    let mut history = HistoricalDiffSamples::default();
+    for token in raw.split(|byte| *byte == b'\0') {
+        if token.is_empty() {
+            continue;
+        }
+
+        let mut token = String::from_utf8_lossy(token).into_owned();
+        let commit_markers = token.matches('\u{1e}').count();
+        if commit_markers > 0 {
+            history.commits += commit_markers;
+            token.retain(|ch| ch != '\u{1e}');
+        }
+
+        let token = token.trim_matches(|ch| matches!(ch, '\n' | '\r'));
+        if token.is_empty() {
+            continue;
+        }
+
+        let mut fields = token.splitn(3, '\t');
+        let Some(additions) = fields.next() else {
+            continue;
+        };
+        let Some(deletions) = fields.next() else {
+            continue;
+        };
+        let Some(path) = fields.next() else {
+            continue;
+        };
+        if path.trim().is_empty() || additions == "-" || deletions == "-" {
+            continue;
+        }
+
+        let additions = additions
+            .parse::<u64>()
+            .with_context(|| format!("parse historical git additions from `{additions}`"))?;
+        let deletions = deletions
+            .parse::<u64>()
+            .with_context(|| format!("parse historical git deletions from `{deletions}`"))?;
+        let total = additions.saturating_add(deletions);
+        if total > 0 {
+            history.totals.push(total);
+        }
+    }
+    Ok(history)
+}
+
+fn compute_large_diff_threshold(samples: &[u64]) -> u64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let percentile_index = ((sorted.len() * LARGE_DIFF_HISTORY_PERCENTILE).saturating_sub(1)) / 100;
+    sorted[percentile_index].clamp(LARGE_DIFF_THRESHOLD_MIN, LARGE_DIFF_THRESHOLD_MAX)
+}
+
+fn build_path_matcher(repo_root: &Path, patterns: &[String]) -> Result<Option<Gitignore>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+
+    let mut builder = GitignoreBuilder::new(repo_root);
+    for pattern in patterns {
+        builder
+            .add_line(None, pattern)
+            .with_context(|| format!("invalid `za diff --path` pattern `{pattern}`"))?;
+    }
+
+    Ok(Some(
+        builder
+            .build()
+            .context("compile `za diff --path` matchers")?,
+    ))
+}
+
+fn normalize_scope_filters(scopes: &[DiffScope]) -> Vec<DiffScope> {
+    let mut normalized = scopes.to_vec();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+fn normalize_risk_filters(risks: &[DiffRiskKind]) -> Vec<DiffRiskKind> {
+    let mut normalized = risks.to_vec();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+fn apply_filters(entries: Vec<DiffFileStat>, filters: &DiffFilterSpec) -> Vec<DiffFileStat> {
+    entries
+        .into_iter()
+        .filter(|entry| entry_matches_filters(entry, filters))
+        .collect()
+}
+
+fn entry_matches_filters(entry: &DiffFileStat, filters: &DiffFilterSpec) -> bool {
+    if !filters.summary.scopes.is_empty()
+        && !entry
+            .scopes
+            .iter()
+            .any(|scope| filters.summary.scopes.contains(scope))
+    {
+        return false;
+    }
+
+    if let Some(path_matcher) = &filters.path_matcher {
+        let relative_path = Path::new(&entry.path);
+        if !path_matcher.matched(relative_path, false).is_ignore()
+            && !entry.previous_path.as_ref().is_some_and(|previous_path| {
+                path_matcher
+                    .matched(Path::new(previous_path), false)
+                    .is_ignore()
+            })
+        {
+            return false;
+        }
+    }
+
+    if !filters.summary.exclude_risks.is_empty()
+        && entry
+            .risks
+            .iter()
+            .any(|risk| filters.summary.exclude_risks.contains(&risk.kind))
+    {
+        return false;
+    }
+
+    true
+}
+
+fn finalize_entries(entries: &mut [DiffFileStat], risk_policy: &DiffRiskPolicy) {
+    for entry in entries {
+        entry.primary_scope = primary_scope_for(&entry.scopes);
+        entry.renamed_from = matches!(entry.status, DiffStatus::Renamed | DiffStatus::Copied)
+            .then(|| entry.previous_path.clone())
+            .flatten();
+        entry.renamed_to = entry.renamed_from.as_ref().map(|_| entry.path.clone());
+        entry.risks = detect_risks(entry, risk_policy);
+    }
+}
+
+fn primary_scope_for(scopes: &[DiffScope]) -> Option<DiffScope> {
+    if scopes.contains(&DiffScope::Unstaged) {
+        Some(DiffScope::Unstaged)
+    } else if scopes.contains(&DiffScope::Staged) {
+        Some(DiffScope::Staged)
+    } else if scopes.contains(&DiffScope::Untracked) {
+        Some(DiffScope::Untracked)
+    } else {
+        None
     }
 }
 
@@ -304,11 +720,15 @@ fn collect_untracked_entries(repo_root: &Path) -> Result<Vec<DiffFileStat>> {
             entries.push(DiffFileStat {
                 path: entry.path,
                 previous_path: None,
+                renamed_from: None,
+                renamed_to: None,
                 additions: entry.additions,
                 deletions: entry.deletions,
                 binary: entry.binary,
                 status: DiffStatus::Untracked,
+                primary_scope: Some(DiffScope::Untracked),
                 scopes: vec![DiffScope::Untracked],
+                risks: Vec::new(),
             });
         }
     }
@@ -402,11 +822,15 @@ fn merge_diff_entries(
             DiffFileStat {
                 path: entry.path,
                 previous_path: entry.previous_path,
+                renamed_from: None,
+                renamed_to: None,
                 additions: entry.additions,
                 deletions: entry.deletions,
                 binary: entry.binary,
                 status: DiffStatus::Unknown,
+                primary_scope: Some(scope),
                 scopes: vec![scope],
+                risks: Vec::new(),
             },
         );
     }
@@ -417,14 +841,19 @@ fn merge_diff_entries(
             .or_insert_with(|| DiffFileStat {
                 path: entry.path.clone(),
                 previous_path: entry.previous_path.clone(),
+                renamed_from: None,
+                renamed_to: None,
                 additions: 0,
                 deletions: 0,
                 binary: false,
                 status: entry.status,
+                primary_scope: Some(scope),
                 scopes: vec![scope],
+                risks: Vec::new(),
             });
         file.status = entry.status;
         file.previous_path = file.previous_path.clone().or(entry.previous_path);
+        file.primary_scope = Some(primary_scope_for(&file.scopes).unwrap_or(scope));
         if !file.scopes.contains(&scope) {
             file.scopes.push(scope);
         }
@@ -504,12 +933,137 @@ fn parse_diff_status(code: &str) -> DiffStatus {
     }
 }
 
+impl From<crate::cli::DiffRiskFilter> for DiffRiskKind {
+    fn from(value: crate::cli::DiffRiskFilter) -> Self {
+        match value {
+            crate::cli::DiffRiskFilter::Binary => Self::Binary,
+            crate::cli::DiffRiskFilter::Ci => Self::Ci,
+            crate::cli::DiffRiskFilter::Config => Self::Config,
+            crate::cli::DiffRiskFilter::Generated => Self::Generated,
+            crate::cli::DiffRiskFilter::Large => Self::Large,
+            crate::cli::DiffRiskFilter::Lockfile => Self::Lockfile,
+        }
+    }
+}
+
 fn merge_status(lhs: DiffStatus, rhs: DiffStatus) -> DiffStatus {
     if diff_status_rank(rhs) < diff_status_rank(lhs) {
         rhs
     } else {
         lhs
     }
+}
+
+fn detect_risks(entry: &DiffFileStat, risk_policy: &DiffRiskPolicy) -> Vec<DiffRisk> {
+    let mut risks = Vec::new();
+    let normalized_path = entry.path.to_ascii_lowercase();
+    let path_components = Path::new(&entry.path)
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .map(|component| component.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let file_name = Path::new(&entry.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&entry.path);
+    let file_name_lower = file_name.to_ascii_lowercase();
+    let total = review_impact(entry);
+
+    if entry.binary {
+        risks.push(DiffRisk {
+            kind: DiffRiskKind::Binary,
+            level: DiffRiskLevel::High,
+        });
+    }
+    if normalized_path.starts_with(".github/workflows/")
+        || normalized_path.contains("/.github/workflows/")
+        || normalized_path.ends_with(".github/workflows")
+    {
+        risks.push(DiffRisk {
+            kind: DiffRiskKind::Ci,
+            level: DiffRiskLevel::High,
+        });
+    }
+    if LOCKFILE_NAMES
+        .iter()
+        .any(|name| file_name_lower == name.to_ascii_lowercase())
+    {
+        risks.push(DiffRisk {
+            kind: DiffRiskKind::Lockfile,
+            level: DiffRiskLevel::Medium,
+        });
+    }
+    if CONFIG_NAMES.iter().any(|name| {
+        let lower = name.to_ascii_lowercase();
+        file_name_lower == lower || normalized_path.ends_with(&format!("/{lower}"))
+    }) {
+        risks.push(DiffRisk {
+            kind: DiffRiskKind::Config,
+            level: if entry.status == DiffStatus::Deleted {
+                DiffRiskLevel::High
+            } else {
+                DiffRiskLevel::Medium
+            },
+        });
+    }
+    if GENERATED_MARKERS
+        .iter()
+        .any(|marker| normalized_path.contains(marker))
+        || path_components.iter().any(|component| {
+            matches!(
+                component.as_str(),
+                "dist" | "build" | "generated" | "vendor"
+            )
+        })
+        || normalized_path.ends_with(".pb.go")
+        || normalized_path.ends_with(".generated.rs")
+    {
+        risks.push(DiffRisk {
+            kind: DiffRiskKind::Generated,
+            level: DiffRiskLevel::Medium,
+        });
+    }
+    if total >= risk_policy.large_threshold {
+        risks.push(DiffRisk {
+            kind: DiffRiskKind::Large,
+            level: DiffRiskLevel::High,
+        });
+    }
+
+    risks.sort_by(|a, b| {
+        risk_sort_rank(a.kind)
+            .cmp(&risk_sort_rank(b.kind))
+            .then_with(|| a.kind.cmp(&b.kind))
+    });
+    risks.dedup_by(|lhs, rhs| lhs.kind == rhs.kind);
+    risks
+}
+
+fn risk_sort_rank(kind: DiffRiskKind) -> usize {
+    match kind {
+        DiffRiskKind::Large => 0,
+        DiffRiskKind::Binary => 1,
+        DiffRiskKind::Ci => 2,
+        DiffRiskKind::Config => 3,
+        DiffRiskKind::Lockfile => 4,
+        DiffRiskKind::Generated => 5,
+    }
+}
+
+fn risk_level_rank(level: DiffRiskLevel) -> usize {
+    match level {
+        DiffRiskLevel::High => 0,
+        DiffRiskLevel::Medium => 1,
+    }
+}
+
+fn review_risk_rank(entry: &DiffFileStat) -> usize {
+    entry
+        .risks
+        .iter()
+        .map(|risk| risk_level_rank(risk.level) * 10 + risk_sort_rank(risk.kind))
+        .min()
+        .unwrap_or(usize::MAX)
 }
 
 fn diff_status_rank(status: DiffStatus) -> usize {
@@ -528,8 +1082,9 @@ fn diff_status_rank(status: DiffStatus) -> usize {
 
 fn sort_section_entries(entries: &mut [DiffFileStat]) {
     entries.sort_by(|a, b| {
-        review_impact(b)
-            .cmp(&review_impact(a))
+        review_risk_rank(a)
+            .cmp(&review_risk_rank(b))
+            .then_with(|| review_impact(b).cmp(&review_impact(a)))
             .then_with(|| diff_status_rank(a.status).cmp(&diff_status_rank(b.status)))
             .then_with(|| a.path.cmp(&b.path))
     });
@@ -539,6 +1094,7 @@ fn sort_review_entries(entries: &mut [DiffFileStat]) {
     entries.sort_by(|a, b| {
         review_scope_rank(a)
             .cmp(&review_scope_rank(b))
+            .then_with(|| review_risk_rank(a).cmp(&review_risk_rank(b)))
             .then_with(|| review_impact(b).cmp(&review_impact(a)))
             .then_with(|| diff_status_rank(a.status).cmp(&diff_status_rank(b.status)))
             .then_with(|| a.path.cmp(&b.path))
@@ -623,6 +1179,13 @@ fn color_enabled() -> bool {
     io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
 }
 
+fn terminal_width() -> Option<usize> {
+    io::stdout()
+        .is_terminal()
+        .then(|| terminal::size().ok().map(|(width, _)| width as usize))
+        .flatten()
+}
+
 fn unicode_diff_stat_enabled() -> bool {
     io::stdout().is_terminal()
         && env::var_os("NO_COLOR").is_none()
@@ -636,11 +1199,8 @@ fn unicode_diff_stat_enabled() -> bool {
             })
 }
 
-fn render_diff_report(
-    report: &DiffWorkspaceOutput,
-    use_color: bool,
-    use_unicode_stat: bool,
-) -> String {
+fn render_diff_report(report: &DiffWorkspaceOutput, options: RenderOptions) -> String {
+    let use_color = options.use_color;
     let repo_name = Path::new(&report.repo_root)
         .file_name()
         .and_then(|name| name.to_str())
@@ -654,12 +1214,27 @@ fn render_diff_report(
         style_head(report.head.as_deref().unwrap_or("(unborn)"), use_color),
     ));
 
+    let filter_summary = render_filter_summary(&report.filters, use_color);
+    if !filter_summary.is_empty() {
+        lines.push(filter_summary);
+    }
+
     if report.clean {
         lines.push(format!(
             "{} {}",
             style_dim("status", use_color),
             "working tree clean"
         ));
+        return lines.join("\n") + "\n";
+    }
+
+    if report.total.files == 0 {
+        lines.push(format!(
+            "{} {}",
+            style_dim("status", use_color),
+            "no changes matched current filters"
+        ));
+        lines.push(render_workspace_summary(report, use_color));
         return lines.join("\n") + "\n";
     }
 
@@ -694,22 +1269,36 @@ fn render_diff_report(
     if !scope_summary.is_empty() {
         lines.push(scope_summary);
     }
+    if report.filters != DiffFilterSummary::default()
+        && report.total.files != report.workspace_total.files
+    {
+        let workspace_file_summary = format!(
+            "{} {}",
+            report.workspace_total.files,
+            pluralize(
+                report.workspace_total.files,
+                "workspace file",
+                "workspace files"
+            )
+        );
+        lines.push(format!(
+            "{} {} {} {}",
+            style_dim("matching", use_color),
+            report.total.files,
+            style_dim("of", use_color),
+            workspace_file_summary
+        ));
+    }
+    let attention_summary =
+        render_attention_summary(&report.total.file_stats, &report.risk_policy, use_color);
+    if !attention_summary.is_empty() {
+        lines.push(attention_summary);
+    }
 
     let review_entries = &report.total.file_stats;
     if !review_entries.is_empty() {
         lines.push(String::new());
-        let max_stat_total = review_entries
-            .iter()
-            .map(|entry| entry.additions.saturating_add(entry.deletions))
-            .max()
-            .unwrap_or_default();
-        let path_width = review_entries
-            .iter()
-            .map(review_path_plain)
-            .map(|path| path.chars().count())
-            .max()
-            .unwrap_or_default()
-            .min(72);
+        let path_width = path_column_width(review_entries, options);
         let scope_width = review_entries
             .iter()
             .map(review_scope_label)
@@ -717,50 +1306,282 @@ fn render_diff_report(
             .max()
             .unwrap_or_default()
             .max(9);
-        lines.push(format!(
-            "{}  {}  {}{}  {}  {}  {}",
-            style_dim("st", use_color),
-            style_dim(&format!("{:<scope_width$}", "scope"), use_color),
-            style_dim("file", use_color),
-            " ".repeat(path_width.saturating_sub(4)),
-            style_dim(&format!("{:>8}", "+add"), use_color),
-            style_dim(&format!("{:>8}", "-del"), use_color),
-            style_dim(&format!("{:<DIFF_STAT_BLOCK_COUNT$}", "stat"), use_color),
-        ));
-
-        for entry in review_entries {
-            let status_label = format!("{:>2}", entry.status.short_label());
-            let scope_label = review_scope_label(entry);
-            let path_plain = review_path_plain(entry);
-            let path_rendered = review_path_rendered(entry, use_color);
-            let visible_path_width = path_plain.chars().count().min(path_width);
-            let path_padding = " ".repeat(path_width.saturating_sub(visible_path_width));
-            lines.push(if entry.binary {
-                format!(
-                    "{}  {}  {}{}  {}  {}",
-                    style_status(entry.status, &status_label, use_color),
-                    style_scope(&format!("{scope_label:<scope_width$}"), entry, use_color),
-                    path_rendered,
-                    path_padding,
-                    format_binary_column("binary", use_color),
-                    render_empty_diff_stat(use_color, use_unicode_stat),
-                )
-            } else {
-                format!(
-                    "{}  {}  {}{}  {}  {}  {}",
-                    style_status(entry.status, &status_label, use_color),
-                    style_scope(&format!("{scope_label:<scope_width$}"), entry, use_color),
-                    path_rendered,
-                    path_padding,
-                    format_additions_column(&format!("+{}", entry.additions), use_color),
-                    format_deletions_column(&format!("-{}", entry.deletions), use_color),
-                    render_diff_stat_bar(entry, max_stat_total, use_color, use_unicode_stat),
-                )
-            });
+        let show_attention = show_attention_column(review_entries);
+        if options.name_only {
+            render_name_only_table(
+                &mut lines,
+                review_entries,
+                use_color,
+                path_width,
+                scope_width,
+                show_attention,
+            );
+        } else {
+            render_full_table(
+                &mut lines,
+                review_entries,
+                options,
+                path_width,
+                scope_width,
+                show_attention,
+            );
         }
     }
 
     lines.join("\n") + "\n"
+}
+
+fn render_filter_summary(filters: &DiffFilterSummary, use_color: bool) -> String {
+    let mut parts = Vec::new();
+    if !filters.scopes.is_empty() {
+        parts.push(format!(
+            "scope={}",
+            filters
+                .scopes
+                .iter()
+                .map(|scope| scope.label())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if !filters.path_patterns.is_empty() {
+        parts.push(format!("path={}", filters.path_patterns.join(",")));
+    }
+    if !filters.exclude_risks.is_empty() {
+        parts.push(format!(
+            "hide={}",
+            filters
+                .exclude_risks
+                .iter()
+                .map(|risk| risk.label())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{} {}",
+            style_dim("filter", use_color),
+            style_dim(&parts.join("  "), use_color)
+        )
+    }
+}
+
+fn render_workspace_summary(report: &DiffWorkspaceOutput, use_color: bool) -> String {
+    format!(
+        "{} {}  {}  {}{}",
+        style_dim("workspace", use_color),
+        format_args!(
+            "{} {}",
+            report.workspace_total.files,
+            pluralize(report.workspace_total.files, "file", "files")
+        ),
+        colorize_additions(format!("+{}", report.workspace_total.additions), use_color),
+        colorize_deletions(format!("-{}", report.workspace_total.deletions), use_color),
+        if report.workspace_total.binary_files > 0 {
+            format!(
+                "  {}",
+                colorize_binary(
+                    format!(
+                        "{} {}",
+                        report.workspace_total.binary_files,
+                        pluralize(report.workspace_total.binary_files, "binary", "binaries")
+                    ),
+                    use_color,
+                )
+            )
+        } else {
+            String::new()
+        }
+    )
+}
+
+fn render_attention_summary(
+    entries: &[DiffFileStat],
+    risk_policy: &DiffRiskPolicy,
+    use_color: bool,
+) -> String {
+    let mut counts = BTreeMap::<DiffRiskKind, usize>::new();
+    let mut files_with_risk = 0usize;
+    let mut summary_level = DiffRiskLevel::Medium;
+    for entry in entries {
+        if entry.risks.is_empty() {
+            continue;
+        }
+        files_with_risk += 1;
+        for risk in &entry.risks {
+            *counts.entry(risk.kind).or_default() += 1;
+            if risk.level == DiffRiskLevel::High {
+                summary_level = DiffRiskLevel::High;
+            }
+        }
+    }
+
+    if files_with_risk == 0 {
+        return String::new();
+    }
+
+    let details = counts
+        .into_iter()
+        .map(|(kind, count)| (risk_sort_rank(kind), count, kind))
+        .collect::<Vec<_>>();
+    let mut details = details;
+    details.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0).then_with(|| rhs.1.cmp(&lhs.1)));
+
+    format!(
+        "{} {} {} {}",
+        style_dim("attention", use_color),
+        style_risk_summary(
+            format!(
+                "{} {}",
+                files_with_risk,
+                pluralize(files_with_risk, "file", "files")
+            ),
+            summary_level,
+            use_color,
+        ),
+        style_dim("·", use_color),
+        details
+            .into_iter()
+            .take(3)
+            .map(|(_, count, kind)| {
+                format!("{count} {}", risk_summary_label(kind, risk_policy))
+            })
+            .collect::<Vec<_>>()
+            .join(&format!(" {} ", style_dim("·", use_color))),
+    )
+}
+
+fn risk_summary_label(kind: DiffRiskKind, risk_policy: &DiffRiskPolicy) -> String {
+    match kind {
+        DiffRiskKind::Large => format!("large>={}", risk_policy.large_threshold),
+        _ => kind.label().to_string(),
+    }
+}
+
+fn path_column_width(entries: &[DiffFileStat], options: RenderOptions) -> usize {
+    let observed = entries
+        .iter()
+        .map(review_path_plain)
+        .map(|path| path.chars().count())
+        .max()
+        .unwrap_or(PATH_COLUMN_MIN_WIDTH)
+        .min(PATH_COLUMN_MAX_WIDTH);
+    let Some(terminal_width) = options.terminal_width else {
+        return observed;
+    };
+
+    let attention_width = if show_attention_column(entries) { 3 } else { 0 };
+    let fixed_width = if options.name_only {
+        2 + attention_width + 9 + 2 + 4
+    } else {
+        2 + 2 + attention_width + 9 + 2 + 8 + 2 + 8 + 2 + DIFF_STAT_BLOCK_COUNT
+    };
+    let available = terminal_width
+        .saturating_sub(fixed_width + 4)
+        .clamp(PATH_COLUMN_MIN_WIDTH, PATH_COLUMN_MAX_WIDTH);
+    observed.min(available)
+}
+
+fn show_attention_column(entries: &[DiffFileStat]) -> bool {
+    entries.iter().any(|entry| !entry.risks.is_empty())
+}
+
+fn render_name_only_table(
+    lines: &mut Vec<String>,
+    entries: &[DiffFileStat],
+    use_color: bool,
+    path_width: usize,
+    scope_width: usize,
+    show_attention: bool,
+) {
+    lines.push(format!(
+        "{}{}  {}  {}{}",
+        style_dim("st", use_color),
+        render_attention_header(show_attention, use_color),
+        style_dim(&format!("{:<scope_width$}", "scope"), use_color),
+        style_dim("file", use_color),
+        " ".repeat(path_width.saturating_sub(4)),
+    ));
+
+    for entry in entries {
+        let status_label = format!("{:>2}", entry.status.short_label());
+        let scope_label = review_scope_label(entry);
+        let path_plain = review_path_plain_with_width(entry, path_width);
+        let path_rendered = review_path_rendered(entry, path_width, use_color);
+        let visible_path_width = path_plain.chars().count().min(path_width);
+        let path_padding = " ".repeat(path_width.saturating_sub(visible_path_width));
+        lines.push(format!(
+            "{}{}  {}  {}{}",
+            style_status(entry.status, &status_label, use_color),
+            render_attention_column(entry, show_attention, use_color),
+            style_scope(&format!("{scope_label:<scope_width$}"), entry, use_color),
+            path_rendered,
+            path_padding,
+        ));
+    }
+}
+
+fn render_full_table(
+    lines: &mut Vec<String>,
+    entries: &[DiffFileStat],
+    options: RenderOptions,
+    path_width: usize,
+    scope_width: usize,
+    show_attention: bool,
+) {
+    let use_color = options.use_color;
+    let max_stat_total = entries
+        .iter()
+        .map(|entry| entry.additions.saturating_add(entry.deletions))
+        .max()
+        .unwrap_or_default();
+    lines.push(format!(
+        "{}{}  {}  {}{}  {}  {}  {}",
+        style_dim("st", use_color),
+        render_attention_header(show_attention, use_color),
+        style_dim(&format!("{:<scope_width$}", "scope"), use_color),
+        style_dim("file", use_color),
+        " ".repeat(path_width.saturating_sub(4)),
+        style_dim(&format!("{:>8}", "+add"), use_color),
+        style_dim(&format!("{:>8}", "-del"), use_color),
+        style_dim(&format!("{:<DIFF_STAT_BLOCK_COUNT$}", "stat"), use_color),
+    ));
+
+    for entry in entries {
+        let status_label = format!("{:>2}", entry.status.short_label());
+        let scope_label = review_scope_label(entry);
+        let path_plain = review_path_plain_with_width(entry, path_width);
+        let path_rendered = review_path_rendered(entry, path_width, use_color);
+        let visible_path_width = path_plain.chars().count().min(path_width);
+        let path_padding = " ".repeat(path_width.saturating_sub(visible_path_width));
+        lines.push(if entry.binary {
+            format!(
+                "{}{}  {}  {}{}  {}  {}",
+                style_status(entry.status, &status_label, use_color),
+                render_attention_column(entry, show_attention, use_color),
+                style_scope(&format!("{scope_label:<scope_width$}"), entry, use_color),
+                path_rendered,
+                path_padding,
+                format_binary_column("binary", use_color),
+                render_empty_diff_stat(use_color, options.use_unicode_stat),
+            )
+        } else {
+            format!(
+                "{}{}  {}  {}{}  {}  {}  {}",
+                style_status(entry.status, &status_label, use_color),
+                render_attention_column(entry, show_attention, use_color),
+                style_scope(&format!("{scope_label:<scope_width$}"), entry, use_color),
+                path_rendered,
+                path_padding,
+                format_additions_column(&format!("+{}", entry.additions), use_color),
+                format_deletions_column(&format!("-{}", entry.deletions), use_color),
+                render_diff_stat_bar(entry, max_stat_total, use_color, options.use_unicode_stat),
+            )
+        });
+    }
 }
 
 fn render_scope_summary(report: &DiffWorkspaceOutput, use_color: bool) -> String {
@@ -816,24 +1637,76 @@ fn review_scope_label(entry: &DiffFileStat) -> String {
 }
 
 fn review_path_plain(entry: &DiffFileStat) -> String {
+    review_path_plain_with_width(entry, PATH_COLUMN_MAX_WIDTH)
+}
+
+fn review_path_plain_with_width(entry: &DiffFileStat, width: usize) -> String {
     if let Some(previous_path) = &entry.previous_path {
-        format!("{previous_path} -> {}", entry.path)
+        let arrow_width = 4;
+        if width <= arrow_width {
+            return truncate_middle(&format!("{previous_path} -> {}", entry.path), width);
+        }
+        let total_width = width.saturating_sub(arrow_width);
+        let previous_width = total_width / 2;
+        let current_width = total_width.saturating_sub(previous_width);
+        format!(
+            "{} -> {}",
+            truncate_middle(previous_path, previous_width.max(1)),
+            truncate_middle(&entry.path, current_width.max(1)),
+        )
     } else {
-        entry.path.clone()
+        truncate_middle(&entry.path, width)
     }
 }
 
-fn review_path_rendered(entry: &DiffFileStat, use_color: bool) -> String {
+fn review_path_rendered(entry: &DiffFileStat, width: usize, use_color: bool) -> String {
     if let Some(previous_path) = &entry.previous_path {
+        let arrow_width = 4;
+        if width <= arrow_width {
+            return style_path(
+                &truncate_middle(&format!("{previous_path} -> {}", entry.path), width),
+                use_color,
+            );
+        }
+        let total_width = width.saturating_sub(arrow_width);
+        let previous_width = total_width / 2;
+        let current_width = total_width.saturating_sub(previous_width);
         format!(
             "{} {} {}",
-            style_path(previous_path, use_color),
+            style_path(
+                &truncate_middle(previous_path, previous_width.max(1)),
+                use_color
+            ),
             style_dim("->", use_color),
-            style_path(&entry.path, use_color),
+            style_path(
+                &truncate_middle(&entry.path, current_width.max(1)),
+                use_color
+            ),
         )
     } else {
-        style_path(&entry.path, use_color)
+        style_path(&truncate_middle(&entry.path, width), use_color)
     }
+}
+
+fn truncate_middle(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    if width <= 1 {
+        return "…".to_string();
+    }
+    let prefix_width = (width - 1) / 2;
+    let suffix_width = width - 1 - prefix_width;
+    let prefix = value.chars().take(prefix_width).collect::<String>();
+    let suffix = value
+        .chars()
+        .rev()
+        .take(suffix_width)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}…{suffix}")
 }
 
 fn style_path(path: &str, use_color: bool) -> String {
@@ -848,6 +1721,32 @@ fn style_path(path: &str, use_color: bool) -> String {
             style_bold(file_name, use_color),
         ),
         None => style_bold(path, use_color),
+    }
+}
+
+fn render_attention_header(show_attention: bool, use_color: bool) -> String {
+    if !show_attention {
+        String::new()
+    } else {
+        format!("  {}", style_dim("!", use_color))
+    }
+}
+
+fn render_attention_column(entry: &DiffFileStat, show_attention: bool, use_color: bool) -> String {
+    if !show_attention {
+        return String::new();
+    }
+
+    match highest_risk_level(entry) {
+        Some(level) => format!("  {}", style_risk(risk_marker(level), level, use_color)),
+        None => format!("  {}", style_dim(" ", use_color)),
+    }
+}
+
+fn risk_marker(level: DiffRiskLevel) -> &'static str {
+    match level {
+        DiffRiskLevel::High => "!",
+        DiffRiskLevel::Medium => "~",
     }
 }
 
@@ -898,6 +1797,18 @@ fn style_bold(value: &str, use_color: bool) -> String {
     style_ansi(value, &["1"], use_color)
 }
 
+fn style_risk(value: &str, level: DiffRiskLevel, use_color: bool) -> String {
+    let codes = match level {
+        DiffRiskLevel::High => ["31", "1"],
+        DiffRiskLevel::Medium => ["35", "2"],
+    };
+    style_ansi(value, &codes, use_color)
+}
+
+fn style_risk_summary(value: String, level: DiffRiskLevel, use_color: bool) -> String {
+    style_risk(&value, level, use_color)
+}
+
 fn colorize_additions(value: String, use_color: bool) -> String {
     style_ansi(&value, &["32"], use_color)
 }
@@ -945,11 +1856,11 @@ fn render_diff_stat_bar(
     add_width = add_width.min(bar_width);
     let mut del_width = bar_width.saturating_sub(add_width);
 
-    if entry.additions > 0 && add_width == 0 {
+    if bar_width > 1 && entry.additions > 0 && add_width == 0 {
         add_width = 1;
         del_width = bar_width.saturating_sub(add_width);
     }
-    if entry.deletions > 0 && del_width == 0 {
+    if bar_width > 1 && entry.deletions > 0 && del_width == 0 {
         del_width = 1;
         add_width = bar_width.saturating_sub(del_width);
     }
@@ -994,6 +1905,33 @@ fn pluralize<'a>(value: usize, singular: &'a str, plural: &'a str) -> &'a str {
     if value == 1 { singular } else { plural }
 }
 
+fn highest_risk_level(entry: &DiffFileStat) -> Option<DiffRiskLevel> {
+    entry.risks.iter().map(|risk| risk.level).min()
+}
+
+impl DiffScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Staged => "staged",
+            Self::Unstaged => "unstaged",
+            Self::Untracked => "untracked",
+        }
+    }
+}
+
+impl DiffRiskKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Binary => "binary",
+            Self::Ci => "ci",
+            Self::Config => "config",
+            Self::Generated => "generated",
+            Self::Large => "large",
+            Self::Lockfile => "lock",
+        }
+    }
+}
+
 impl DiffStatus {
     fn short_label(self) -> &'static str {
         match self {
@@ -1013,9 +1951,12 @@ impl DiffStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        DIFF_STAT_FILLED_BLOCK, DiffFileStat, DiffScope, DiffSection, DiffStatus,
-        DiffWorkspaceOutput, NumstatPathMode, collect_workspace_diff, parse_diff_status,
-        parse_name_status_z, parse_numstat_z, render_diff_report, resolve_repo_root_from,
+        DIFF_STAT_FILLED_BLOCK, DiffFileStat, DiffFilterSpec, DiffFilterSummary,
+        DiffLargeThresholdSource, DiffRisk, DiffRiskKind, DiffRiskLevel, DiffRiskPolicy, DiffScope,
+        DiffSection, DiffStatus, DiffWorkspaceOutput, NumstatPathMode, RenderOptions,
+        collect_workspace_diff, compute_large_diff_threshold, parse_diff_status,
+        parse_historical_diff_samples, parse_name_status_z, parse_numstat_z, render_diff_report,
+        resolve_repo_root_from,
     };
     use anyhow::Result;
     use std::{
@@ -1094,6 +2035,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_historical_diff_samples_collects_commits_and_totals() {
+        let history = parse_historical_diff_samples(
+            b"\x1e\x00\n3\t1\tsrc/main.rs\x00\x1e\x00\n5\t0\tREADME.md\x00-\t-\tlogo.png\x00",
+        )
+        .expect("must parse");
+        assert_eq!(history.commits, 2);
+        assert_eq!(history.totals, vec![4, 5]);
+    }
+
+    #[test]
+    fn compute_large_diff_threshold_uses_clamped_p90() {
+        let threshold =
+            compute_large_diff_threshold(&[5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987]);
+        assert_eq!(threshold, 610);
+
+        let min_threshold = compute_large_diff_threshold(&[1, 2, 3, 4, 5]);
+        assert_eq!(min_threshold, 200);
+
+        let max_threshold = compute_large_diff_threshold(&[500, 900, 1300, 2400, 3600]);
+        assert_eq!(max_threshold, 1200);
+    }
+
+    #[test]
     fn resolve_repo_root_from_errors_outside_git_repo() {
         let dir = TempDir::new("outside").expect("temp dir");
         let err = resolve_repo_root_from(&dir.path).expect_err("must fail");
@@ -1116,7 +2080,8 @@ mod tests {
         git(&dir.path, &["add", "staged.txt"]).expect("git add staged");
         write_file(dir.path.join("draft.txt"), "note\n").expect("write untracked");
 
-        let report = collect_workspace_diff(Path::new(&dir.path), true).expect("collect diff");
+        let report = collect_workspace_diff(Path::new(&dir.path), true, &no_filters())
+            .expect("collect diff");
         assert_eq!(report.staged.files, 1);
         assert_eq!(report.staged.additions, 2);
         assert_eq!(report.unstaged.files, 1);
@@ -1140,7 +2105,8 @@ mod tests {
         write_file(dir.path.join("new.txt"), "hello\nworld\n").expect("write file");
         git(&dir.path, &["add", "new.txt"]).expect("git add");
 
-        let report = collect_workspace_diff(Path::new(&dir.path), false).expect("collect diff");
+        let report = collect_workspace_diff(Path::new(&dir.path), false, &no_filters())
+            .expect("collect diff");
         assert_eq!(report.head, None);
         assert_eq!(report.staged.files, 1);
         assert_eq!(report.staged.additions, 2);
@@ -1157,7 +2123,8 @@ mod tests {
         fs::rename(dir.path.join("src_old.rs"), dir.path.join("src_new.rs")).expect("rename file");
         git(&dir.path, &["add", "-A"]).expect("git add rename");
 
-        let report = collect_workspace_diff(Path::new(&dir.path), true).expect("collect diff");
+        let report = collect_workspace_diff(Path::new(&dir.path), true, &no_filters())
+            .expect("collect diff");
         assert_eq!(report.staged.files, 1);
         assert_eq!(report.staged.file_stats[0].status, DiffStatus::Renamed);
         assert_eq!(
@@ -1175,8 +2142,9 @@ mod tests {
         git(&dir.path, &["add", "tracked.txt"]).expect("git add");
         git(&dir.path, &["commit", "-qm", "init"]).expect("git commit");
 
-        let report = collect_workspace_diff(Path::new(&dir.path), false).expect("collect diff");
-        let rendered = render_diff_report(&report, false, false);
+        let report = collect_workspace_diff(Path::new(&dir.path), false, &no_filters())
+            .expect("collect diff");
+        let rendered = render_diff_report(&report, render_options(false, false, false));
         assert!(rendered.contains("working tree clean"));
     }
 
@@ -1190,14 +2158,16 @@ mod tests {
         write_file(dir.path.join("tracked.txt"), "one\ntwo\n").expect("modify tracked");
         write_file(dir.path.join("new.txt"), "hello\n").expect("new file");
 
-        let report = collect_workspace_diff(Path::new(&dir.path), true).expect("collect diff");
-        let rendered = render_diff_report(&report, false, false);
+        let report = collect_workspace_diff(Path::new(&dir.path), true, &no_filters())
+            .expect("collect diff");
+        let rendered = render_diff_report(&report, render_options(false, false, false));
         assert!(rendered.contains("changed 2 files"));
         assert!(rendered.contains("1 unstaged"));
         assert!(rendered.contains("1 untracked"));
         assert!(rendered.contains("st  scope"));
         assert!(rendered.contains("+add"));
         assert!(rendered.contains("-del"));
+        assert!(!rendered.contains("risk"));
         assert!(rendered.contains("stat"));
         assert!(rendered.contains(" M  unstaged"));
         assert!(rendered.contains(" ?  untracked"));
@@ -1209,9 +2179,24 @@ mod tests {
     #[test]
     fn render_diff_report_adds_ansi_colors_when_enabled() {
         let report = DiffWorkspaceOutput {
+            schema_version: 1,
             repo_root: "/tmp/repo".to_string(),
             head: Some("abc1234".to_string()),
             clean: false,
+            filters: DiffFilterSummary::default(),
+            risk_policy: DiffRiskPolicy {
+                large_threshold: 400,
+                large_threshold_source: DiffLargeThresholdSource::FixedFallback,
+                large_threshold_history_samples: None,
+                large_threshold_history_commits: None,
+            },
+            workspace_total: DiffSection {
+                files: 1,
+                additions: 3,
+                deletions: 1,
+                binary_files: 0,
+                file_stats: Vec::new(),
+            },
             staged: DiffSection {
                 files: 1,
                 additions: 3,
@@ -1220,11 +2205,18 @@ mod tests {
                 file_stats: vec![DiffFileStat {
                     path: "src/main.rs".to_string(),
                     previous_path: None,
+                    renamed_from: None,
+                    renamed_to: None,
                     additions: 3,
                     deletions: 1,
                     binary: false,
                     status: DiffStatus::Modified,
+                    primary_scope: Some(DiffScope::Staged),
                     scopes: vec![DiffScope::Staged],
+                    risks: vec![DiffRisk {
+                        kind: DiffRiskKind::Config,
+                        level: DiffRiskLevel::Medium,
+                    }],
                 }],
             },
             unstaged: DiffSection::default(),
@@ -1237,21 +2229,107 @@ mod tests {
                 file_stats: vec![DiffFileStat {
                     path: "src/main.rs".to_string(),
                     previous_path: None,
+                    renamed_from: None,
+                    renamed_to: None,
                     additions: 3,
                     deletions: 1,
                     binary: false,
                     status: DiffStatus::Modified,
+                    primary_scope: Some(DiffScope::Staged),
                     scopes: vec![DiffScope::Staged],
+                    risks: vec![DiffRisk {
+                        kind: DiffRiskKind::Config,
+                        level: DiffRiskLevel::Medium,
+                    }],
                 }],
             },
         };
 
-        let rendered = render_diff_report(&report, true, true);
+        let rendered = render_diff_report(&report, render_options(true, true, false));
         assert!(rendered.contains("\u{1b}[32m      +3\u{1b}[0m"));
         assert!(rendered.contains("\u{1b}[31m      -1\u{1b}[0m"));
         assert!(rendered.contains("\u{1b}[33;1m M\u{1b}[0m"));
         assert!(rendered.contains("\u{1b}[32m"));
         assert!(rendered.contains(DIFF_STAT_FILLED_BLOCK));
+        assert!(rendered.contains("!"));
+        assert!(!rendered.contains("risk"));
+    }
+
+    #[test]
+    fn collect_workspace_diff_applies_scope_and_path_filters() {
+        let dir = TempDir::new("filtered").expect("temp dir");
+        init_repo(&dir.path).expect("init repo");
+        write_file(dir.path.join("src/main.rs"), "fn main() {}\n").expect("write src");
+        write_file(dir.path.join("README.md"), "hello\n").expect("write readme");
+        git(&dir.path, &["add", "."]).expect("git add");
+        git(&dir.path, &["commit", "-qm", "init"]).expect("git commit");
+
+        write_file(
+            dir.path.join("src/main.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n",
+        )
+        .expect("modify src");
+        write_file(dir.path.join("README.md"), "hello\nworld\n").expect("modify readme");
+
+        let filters = DiffFilterSpec {
+            summary: DiffFilterSummary {
+                scopes: vec![DiffScope::Unstaged],
+                path_patterns: vec!["src/**".to_string()],
+                exclude_risks: Vec::new(),
+            },
+            path_matcher: super::build_path_matcher(Path::new(&dir.path), &["src/**".to_string()])
+                .expect("build matcher"),
+        };
+        let report =
+            collect_workspace_diff(Path::new(&dir.path), true, &filters).expect("collect diff");
+        assert_eq!(report.total.files, 1);
+        assert_eq!(report.total.file_stats[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn collect_workspace_diff_can_exclude_lockfiles() {
+        let dir = TempDir::new("risk-filter").expect("temp dir");
+        init_repo(&dir.path).expect("init repo");
+        write_file(
+            dir.path.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        write_file(dir.path.join("Cargo.lock"), "lock\n").expect("write lock");
+        git(&dir.path, &["add", "."]).expect("git add");
+        git(&dir.path, &["commit", "-qm", "init"]).expect("git commit");
+
+        write_file(dir.path.join("Cargo.lock"), "lock\nmore\n").expect("modify lock");
+        write_file(
+            dir.path.join(".github/workflows/ci.yml"),
+            "name: ci\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n",
+        )
+        .expect("write workflow");
+
+        let filters = DiffFilterSpec {
+            summary: DiffFilterSummary {
+                scopes: Vec::new(),
+                path_patterns: Vec::new(),
+                exclude_risks: vec![DiffRiskKind::Lockfile],
+            },
+            path_matcher: None,
+        };
+        let report =
+            collect_workspace_diff(Path::new(&dir.path), true, &filters).expect("collect diff");
+        assert!(
+            report
+                .total
+                .file_stats
+                .iter()
+                .all(|entry| entry.path != "Cargo.lock")
+        );
+        assert!(
+            report
+                .total
+                .file_stats
+                .iter()
+                .any(|entry| entry.risks.iter().any(|risk| risk.kind == DiffRiskKind::Ci))
+        );
     }
 
     fn init_repo(path: &Path) -> Result<()> {
@@ -1275,7 +2353,26 @@ mod tests {
     }
 
     fn write_file(path: PathBuf, content: &str) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(path, content)?;
         Ok(())
+    }
+
+    fn no_filters() -> DiffFilterSpec {
+        DiffFilterSpec {
+            summary: DiffFilterSummary::default(),
+            path_matcher: None,
+        }
+    }
+
+    fn render_options(use_color: bool, use_unicode_stat: bool, name_only: bool) -> RenderOptions {
+        RenderOptions {
+            use_color,
+            use_unicode_stat,
+            name_only,
+            terminal_width: Some(120),
+        }
     }
 }
