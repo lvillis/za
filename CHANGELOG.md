@@ -1,3 +1,9 @@
+## [0.1.26] - 2026-03-10
+
+### 🚀 Features
+
+- Add za diff review command
+- *(codex-top)* Add stream filters and event detail drill-down
 ## [0.1.25] - 2026-03-10
 
 ### 🐛 Bug Fixes
@@ -9,6 +15,10 @@
 
 - Harden codex, ci, and git edge-case handling
 - *(codex)* Split modules
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.25
 ## [0.1.24] - 2026-03-09
 
 ### 🚀 Features
