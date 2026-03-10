@@ -1,3 +1,14 @@
+## [0.1.25] - 2026-03-10
+
+### 🐛 Bug Fixes
+
+- *(codex)* Restore live otel streaming in top view
+- *(codex)* Preserve terminal scrollback when attaching tmux sessions
+
+### 🚜 Refactor
+
+- Harden codex, ci, and git edge-case handling
+- *(codex)* Split modules
 ## [0.1.24] - 2026-03-09
 
 ### 🚀 Features
@@ -11,6 +22,10 @@
 ### 🚜 Refactor
 
 - Unify GitHub commands under za gh
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.24
 ## [0.1.23] - 2026-03-08
 
 ### 🚀 Features
