@@ -1,9 +1,18 @@
+## [0.1.27] - 2026-03-10
+
+### 🚀 Features
+
+- *(tool)* Add parallel range downloads with fallback
 ## [0.1.26] - 2026-03-10
 
 ### 🚀 Features
 
 - Add za diff review command
 - *(codex-top)* Add stream filters and event detail drill-down
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.26
 ## [0.1.25] - 2026-03-10
 
 ### 🐛 Bug Fixes
