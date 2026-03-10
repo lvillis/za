@@ -9,6 +9,13 @@ fn main() -> Result<()> {
 
     let args = cli::Cli::parse();
     match args.cmd {
+        cli::Commands::Diff { json, files } => {
+            let exit_code = command::diff::run(json, files)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         cli::Commands::Gen {
             max_lines,
             output,

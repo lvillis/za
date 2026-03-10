@@ -135,6 +135,7 @@ za gh auth test --repo https://github.com/org/repo.git
 
 | Command | Purpose |
 | --- | --- |
+| `za diff` | Summarize current Git workspace additions/deletions for review. |
 | `za gen` | Generate project context snapshots (`CONTEXT.md`). |
 | `za tool` | Install/update/list/use/uninstall managed binaries. |
 | `za run` | Launch a tool directly with normalized proxy environment variables. |
@@ -143,6 +144,18 @@ za gh auth test --repo https://github.com/org/repo.git
 | `za gh` | Unified GitHub shortcuts for auth and Actions status. |
 | `za config` | Persist CLI config (`[auth]`, `[proxy]`, `[run]`, `[tool]`, `[update]`). |
 | `za ide` | Inspect and reconcile JetBrains remote IDE server processes. |
+
+## Workspace Diff
+
+Use `za diff` to review current workspace changes against the current Git state:
+
+```bash
+za diff
+za diff --files
+za diff --json
+```
+
+The terminal report is review-oriented: it shows one merged file list with status markers (`M/A/D/R/?`), scope labels (`staged`, `unstaged`, `untracked`), and colored `+`/`-` counts on TTY output. Binary files are counted separately and excluded from `+/-` line totals. Use `--json --files` when you also want per-file detail in machine-readable output.
 
 ## Tool Management
 

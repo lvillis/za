@@ -12,6 +12,15 @@ pub struct Cli {
 /// Sub-command definitions
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Summarize current Git workspace changes for review
+    Diff {
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+        /// Include per-file additions/deletions in JSON output.
+        #[arg(long)]
+        files: bool,
+    },
     /// Generate `CONTEXT.md`
     Gen {
         #[arg(long, default_value_t = crate::command::DEFAULT_MAX_LINES_PER_FILE)]
@@ -418,6 +427,18 @@ pub enum ConfigKey {
 mod tests {
     use super::{CiCommands, Cli, CodexCommands, Commands, GhCommands, GitAuthCommands};
     use clap::Parser;
+
+    #[test]
+    fn diff_parses_json_and_files_flags() {
+        let cli = Cli::try_parse_from(["za", "diff", "--json", "--files"]).expect("must parse");
+        match cli.cmd {
+            Commands::Diff { json, files } => {
+                assert!(json);
+                assert!(files);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
 
     #[test]
     fn codex_passthrough_args_are_captured_after_double_dash() {

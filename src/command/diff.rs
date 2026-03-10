@@ -1,0 +1,1184 @@
+use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
+use std::{
+    collections::BTreeMap,
+    env,
+    io::{self, IsTerminal},
+    path::{Path, PathBuf},
+    process::{Command, Output},
+};
+
+pub fn run(json: bool, files: bool) -> Result<i32> {
+    let repo_root = resolve_repo_root()?;
+    let report = collect_workspace_diff(&repo_root, files || !json)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("serialize diff output")?
+        );
+    } else {
+        print!("{}", render_diff_report(&report, color_enabled()));
+    }
+
+    Ok(0)
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum DiffScope {
+    Staged,
+    Unstaged,
+    Untracked,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "snake_case")]
+enum DiffStatus {
+    Added,
+    Deleted,
+    Renamed,
+    Modified,
+    Copied,
+    TypeChanged,
+    Unmerged,
+    Untracked,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+struct DiffFileStat {
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_path: Option<String>,
+    additions: u64,
+    deletions: u64,
+    binary: bool,
+    status: DiffStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    scopes: Vec<DiffScope>,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+struct DiffSection {
+    files: usize,
+    additions: u64,
+    deletions: u64,
+    binary_files: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    file_stats: Vec<DiffFileStat>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DiffWorkspaceOutput {
+    repo_root: String,
+    head: Option<String>,
+    clean: bool,
+    staged: DiffSection,
+    unstaged: DiffSection,
+    untracked: DiffSection,
+    total: DiffSection,
+}
+
+#[derive(Clone, Copy)]
+enum NumstatPathMode {
+    Native,
+    NoIndex,
+}
+
+#[derive(Debug, Clone)]
+struct RawNumstatEntry {
+    path: String,
+    previous_path: Option<String>,
+    additions: u64,
+    deletions: u64,
+    binary: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RawStatusEntry {
+    path: String,
+    previous_path: Option<String>,
+    status: DiffStatus,
+}
+
+fn resolve_repo_root() -> Result<PathBuf> {
+    let cwd = env::current_dir().context("read current working directory")?;
+    resolve_repo_root_from(&cwd)
+}
+
+fn resolve_repo_root_from(cwd: &Path) -> Result<PathBuf> {
+    let output = git_output(cwd, &["rev-parse", "--show-toplevel"])?;
+    if output.status.success() {
+        let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if root.is_empty() {
+            bail!("`git rev-parse --show-toplevel` returned an empty repository root");
+        }
+        return Ok(PathBuf::from(root));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if is_not_git_repository(&stderr) {
+        bail!(
+            "current directory is not inside a Git repository; `za diff` only works in a Git workspace"
+        );
+    }
+    bail!("`git rev-parse --show-toplevel` failed: {}", stderr.trim())
+}
+
+fn collect_workspace_diff(repo_root: &Path, include_files: bool) -> Result<DiffWorkspaceOutput> {
+    let head = git_head_short(repo_root)?;
+    let staged_entries = collect_git_diff_entries(
+        repo_root,
+        &["diff", "--cached", "--numstat", "-z", "-M", "--root", "--"],
+        &[
+            "diff",
+            "--cached",
+            "--name-status",
+            "-z",
+            "-M",
+            "--root",
+            "--",
+        ],
+        NumstatPathMode::Native,
+        DiffScope::Staged,
+    )?;
+    let unstaged_entries = collect_git_diff_entries(
+        repo_root,
+        &["diff", "--numstat", "-z", "-M", "--"],
+        &["diff", "--name-status", "-z", "-M", "--"],
+        NumstatPathMode::Native,
+        DiffScope::Unstaged,
+    )?;
+    let untracked_entries = collect_untracked_entries(repo_root)?;
+
+    let staged = build_diff_section(staged_entries.clone(), include_files);
+    let unstaged = build_diff_section(unstaged_entries.clone(), include_files);
+    let untracked = build_diff_section(untracked_entries.clone(), include_files);
+    let total = build_total_section(
+        [&staged_entries, &unstaged_entries, &untracked_entries],
+        include_files,
+    );
+    let clean = total.files == 0;
+
+    Ok(DiffWorkspaceOutput {
+        repo_root: repo_root.display().to_string(),
+        head,
+        clean,
+        staged,
+        unstaged,
+        untracked,
+        total,
+    })
+}
+
+fn build_diff_section(mut entries: Vec<DiffFileStat>, include_files: bool) -> DiffSection {
+    sort_section_entries(&mut entries);
+    let additions = entries.iter().map(|entry| entry.additions).sum();
+    let deletions = entries.iter().map(|entry| entry.deletions).sum();
+    let binary_files = entries.iter().filter(|entry| entry.binary).count();
+    let files = entries.len();
+    if !include_files {
+        entries.clear();
+    }
+    DiffSection {
+        files,
+        additions,
+        deletions,
+        binary_files,
+        file_stats: entries,
+    }
+}
+
+fn build_total_section(sections: [&Vec<DiffFileStat>; 3], include_files: bool) -> DiffSection {
+    let mut merged = BTreeMap::<String, DiffFileStat>::new();
+    for section in sections {
+        for entry in section {
+            let aggregate = merged
+                .entry(entry.path.clone())
+                .or_insert_with(|| DiffFileStat {
+                    path: entry.path.clone(),
+                    previous_path: entry.previous_path.clone(),
+                    additions: 0,
+                    deletions: 0,
+                    binary: false,
+                    status: entry.status,
+                    scopes: Vec::new(),
+                });
+            aggregate.previous_path = aggregate
+                .previous_path
+                .clone()
+                .or_else(|| entry.previous_path.clone());
+            aggregate.additions = aggregate.additions.saturating_add(entry.additions);
+            aggregate.deletions = aggregate.deletions.saturating_add(entry.deletions);
+            aggregate.binary |= entry.binary;
+            aggregate.status = merge_status(aggregate.status, entry.status);
+            for scope in &entry.scopes {
+                if !aggregate.scopes.contains(scope) {
+                    aggregate.scopes.push(*scope);
+                }
+            }
+        }
+    }
+
+    let mut entries = merged.into_values().collect::<Vec<_>>();
+    sort_review_entries(&mut entries);
+    let additions = entries.iter().map(|entry| entry.additions).sum();
+    let deletions = entries.iter().map(|entry| entry.deletions).sum();
+    let binary_files = entries.iter().filter(|entry| entry.binary).count();
+    let files = entries.len();
+    if !include_files {
+        entries.clear();
+    }
+    DiffSection {
+        files,
+        additions,
+        deletions,
+        binary_files,
+        file_stats: entries,
+    }
+}
+
+fn collect_git_diff_entries(
+    repo_root: &Path,
+    numstat_args: &[&str],
+    status_args: &[&str],
+    path_mode: NumstatPathMode,
+    scope: DiffScope,
+) -> Result<Vec<DiffFileStat>> {
+    let numstat_output = git_output(repo_root, numstat_args)?;
+    if !numstat_output.status.success() {
+        let stderr = String::from_utf8_lossy(&numstat_output.stderr);
+        bail!("`git {}` failed: {}", numstat_args.join(" "), stderr.trim());
+    }
+
+    let status_output = git_output(repo_root, status_args)?;
+    if !status_output.status.success() {
+        let stderr = String::from_utf8_lossy(&status_output.stderr);
+        bail!("`git {}` failed: {}", status_args.join(" "), stderr.trim());
+    }
+
+    let numstats = parse_numstat_z(&numstat_output.stdout, path_mode)?;
+    let statuses = parse_name_status_z(&status_output.stdout)?;
+    merge_diff_entries(numstats, statuses, scope)
+}
+
+fn collect_untracked_entries(repo_root: &Path) -> Result<Vec<DiffFileStat>> {
+    let output = git_output(
+        repo_root,
+        &["ls-files", "-z", "--others", "--exclude-standard", "--"],
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "`git ls-files -z --others --exclude-standard --` failed: {}",
+            stderr.trim()
+        );
+    }
+
+    let mut entries = Vec::new();
+    for path in parse_nul_paths(&output.stdout)? {
+        let numstat_output = git_output_allow_codes(
+            repo_root,
+            &[
+                "diff",
+                "--no-index",
+                "--numstat",
+                "-z",
+                "--",
+                "/dev/null",
+                &path,
+            ],
+            &[1],
+        )?;
+        let numstats = parse_numstat_z(&numstat_output.stdout, NumstatPathMode::NoIndex)?;
+        for entry in numstats {
+            entries.push(DiffFileStat {
+                path: entry.path,
+                previous_path: None,
+                additions: entry.additions,
+                deletions: entry.deletions,
+                binary: entry.binary,
+                status: DiffStatus::Untracked,
+                scopes: vec![DiffScope::Untracked],
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+fn parse_numstat_z(raw: &[u8], path_mode: NumstatPathMode) -> Result<Vec<RawNumstatEntry>> {
+    let mut index = 0;
+    let mut entries = Vec::new();
+    while index < raw.len() {
+        let additions = take_until(raw, &mut index, b'\t')?;
+        let deletions = take_until(raw, &mut index, b'\t')?;
+
+        let (previous_path, path) = if index < raw.len() && raw[index] == b'\0' {
+            index += 1;
+            let previous_path = take_until(raw, &mut index, b'\0')?;
+            let path = take_until(raw, &mut index, b'\0')?;
+            (
+                normalize_previous_path(previous_path, path_mode),
+                normalize_current_path(path, path_mode)?,
+            )
+        } else {
+            (
+                None,
+                normalize_current_path(take_until(raw, &mut index, b'\0')?, path_mode)?,
+            )
+        };
+
+        let binary = additions == "-" || deletions == "-";
+        let additions = if binary {
+            0
+        } else {
+            additions
+                .parse::<u64>()
+                .with_context(|| format!("parse git numstat additions from `{additions}`"))?
+        };
+        let deletions = if binary {
+            0
+        } else {
+            deletions
+                .parse::<u64>()
+                .with_context(|| format!("parse git numstat deletions from `{deletions}`"))?
+        };
+
+        entries.push(RawNumstatEntry {
+            path,
+            previous_path,
+            additions,
+            deletions,
+            binary,
+        });
+    }
+    Ok(entries)
+}
+
+fn parse_name_status_z(raw: &[u8]) -> Result<Vec<RawStatusEntry>> {
+    let mut index = 0;
+    let mut entries = Vec::new();
+    while index < raw.len() {
+        let code = take_until(raw, &mut index, b'\0')?;
+        let status = parse_diff_status(&code);
+        let (previous_path, path) = if matches!(status, DiffStatus::Renamed | DiffStatus::Copied) {
+            (
+                Some(take_until(raw, &mut index, b'\0')?),
+                take_until(raw, &mut index, b'\0')?,
+            )
+        } else {
+            (None, take_until(raw, &mut index, b'\0')?)
+        };
+
+        entries.push(RawStatusEntry {
+            path,
+            previous_path,
+            status,
+        });
+    }
+    Ok(entries)
+}
+
+fn merge_diff_entries(
+    numstats: Vec<RawNumstatEntry>,
+    statuses: Vec<RawStatusEntry>,
+    scope: DiffScope,
+) -> Result<Vec<DiffFileStat>> {
+    let mut merged = BTreeMap::<String, DiffFileStat>::new();
+
+    for entry in numstats {
+        merged.insert(
+            entry.path.clone(),
+            DiffFileStat {
+                path: entry.path,
+                previous_path: entry.previous_path,
+                additions: entry.additions,
+                deletions: entry.deletions,
+                binary: entry.binary,
+                status: DiffStatus::Unknown,
+                scopes: vec![scope],
+            },
+        );
+    }
+
+    for entry in statuses {
+        let file = merged
+            .entry(entry.path.clone())
+            .or_insert_with(|| DiffFileStat {
+                path: entry.path.clone(),
+                previous_path: entry.previous_path.clone(),
+                additions: 0,
+                deletions: 0,
+                binary: false,
+                status: entry.status,
+                scopes: vec![scope],
+            });
+        file.status = entry.status;
+        file.previous_path = file.previous_path.clone().or(entry.previous_path);
+        if !file.scopes.contains(&scope) {
+            file.scopes.push(scope);
+        }
+    }
+
+    let entries = merged.into_values().collect::<Vec<_>>();
+    for entry in &entries {
+        if entry.path.trim().is_empty() {
+            return Err(anyhow!("invalid git diff entry: empty path"));
+        }
+    }
+    Ok(entries)
+}
+
+fn take_until(raw: &[u8], index: &mut usize, delimiter: u8) -> Result<String> {
+    let start = *index;
+    while *index < raw.len() && raw[*index] != delimiter {
+        *index += 1;
+    }
+    if *index >= raw.len() {
+        bail!("invalid git -z output: missing field delimiter");
+    }
+    let value = String::from_utf8_lossy(&raw[start..*index]).to_string();
+    *index += 1;
+    Ok(value)
+}
+
+fn parse_nul_paths(raw: &[u8]) -> Result<Vec<String>> {
+    let mut index = 0;
+    let mut paths = Vec::new();
+    while index < raw.len() {
+        let path = take_until(raw, &mut index, b'\0')?;
+        if !path.is_empty() {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn normalize_current_path(path: String, path_mode: NumstatPathMode) -> Result<String> {
+    let trimmed = path.trim().to_string();
+    if trimmed.is_empty() {
+        bail!("invalid git numstat entry: empty path");
+    }
+    match path_mode {
+        NumstatPathMode::Native => Ok(trimmed),
+        NumstatPathMode::NoIndex => {
+            if trimmed == "/dev/null" {
+                bail!("invalid git no-index numstat entry: current path cannot be /dev/null");
+            }
+            Ok(trimmed)
+        }
+    }
+}
+
+fn normalize_previous_path(path: String, path_mode: NumstatPathMode) -> Option<String> {
+    let trimmed = path.trim().to_string();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match path_mode {
+        NumstatPathMode::Native => Some(trimmed),
+        NumstatPathMode::NoIndex => (trimmed != "/dev/null").then_some(trimmed),
+    }
+}
+
+fn parse_diff_status(code: &str) -> DiffStatus {
+    match code.chars().next().unwrap_or('?') {
+        'A' => DiffStatus::Added,
+        'D' => DiffStatus::Deleted,
+        'R' => DiffStatus::Renamed,
+        'M' => DiffStatus::Modified,
+        'C' => DiffStatus::Copied,
+        'T' => DiffStatus::TypeChanged,
+        'U' => DiffStatus::Unmerged,
+        _ => DiffStatus::Unknown,
+    }
+}
+
+fn merge_status(lhs: DiffStatus, rhs: DiffStatus) -> DiffStatus {
+    if diff_status_rank(rhs) < diff_status_rank(lhs) {
+        rhs
+    } else {
+        lhs
+    }
+}
+
+fn diff_status_rank(status: DiffStatus) -> usize {
+    match status {
+        DiffStatus::Deleted => 0,
+        DiffStatus::Renamed => 1,
+        DiffStatus::Added => 2,
+        DiffStatus::Modified => 3,
+        DiffStatus::Copied => 4,
+        DiffStatus::TypeChanged => 5,
+        DiffStatus::Unmerged => 6,
+        DiffStatus::Untracked => 7,
+        DiffStatus::Unknown => 8,
+    }
+}
+
+fn sort_section_entries(entries: &mut [DiffFileStat]) {
+    entries.sort_by(|a, b| {
+        review_impact(b)
+            .cmp(&review_impact(a))
+            .then_with(|| diff_status_rank(a.status).cmp(&diff_status_rank(b.status)))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+}
+
+fn sort_review_entries(entries: &mut [DiffFileStat]) {
+    entries.sort_by(|a, b| {
+        review_scope_rank(a)
+            .cmp(&review_scope_rank(b))
+            .then_with(|| review_impact(b).cmp(&review_impact(a)))
+            .then_with(|| diff_status_rank(a.status).cmp(&diff_status_rank(b.status)))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+}
+
+fn review_scope_rank(entry: &DiffFileStat) -> usize {
+    let has_unstaged = entry.scopes.contains(&DiffScope::Unstaged);
+    let has_staged = entry.scopes.contains(&DiffScope::Staged);
+    let has_untracked = entry.scopes.contains(&DiffScope::Untracked);
+    match (has_unstaged, has_untracked, has_staged) {
+        (true, _, true) => 0,
+        (true, _, false) => 1,
+        (false, true, _) => 2,
+        (false, false, true) => 3,
+        _ => 4,
+    }
+}
+
+fn review_impact(entry: &DiffFileStat) -> u64 {
+    let diff = entry.additions.saturating_add(entry.deletions);
+    if entry.binary { diff.max(1) } else { diff }
+}
+
+fn git_head_short(repo_root: &Path) -> Result<Option<String>> {
+    let output = git_output(repo_root, &["rev-parse", "--verify", "--short", "HEAD"])?;
+    if output.status.success() {
+        let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Ok((!head.is_empty()).then_some(head));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if is_unborn_head(&stderr) {
+        return Ok(None);
+    }
+    bail!(
+        "`git rev-parse --verify --short HEAD` failed: {}",
+        stderr.trim()
+    )
+}
+
+fn git_output_allow_codes(cwd: &Path, args: &[&str], allowed: &[i32]) -> Result<Output> {
+    let output = git_output(cwd, args)?;
+    if output.status.success()
+        || output
+            .status
+            .code()
+            .is_some_and(|code| allowed.contains(&code))
+    {
+        return Ok(output);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!("`git {}` failed: {}", args.join(" "), stderr.trim())
+}
+
+fn git_output(cwd: &Path, args: &[&str]) -> Result<Output> {
+    match Command::new("git").args(args).current_dir(cwd).output() {
+        Ok(output) => Ok(output),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            bail!("`za diff` requires `git`; install it first")
+        }
+        Err(err) => Err(err).with_context(|| format!("run `git {}`", args.join(" "))),
+    }
+}
+
+fn is_not_git_repository(stderr: &str) -> bool {
+    stderr
+        .trim()
+        .to_ascii_lowercase()
+        .contains("not a git repository")
+}
+
+fn is_unborn_head(stderr: &str) -> bool {
+    let lower = stderr.trim().to_ascii_lowercase();
+    lower.contains("needed a single revision")
+        || lower.contains("ambiguous argument 'head'")
+        || lower.contains("unknown revision or path not in the working tree")
+}
+
+fn color_enabled() -> bool {
+    io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
+}
+
+fn render_diff_report(report: &DiffWorkspaceOutput, use_color: bool) -> String {
+    let repo_name = Path::new(&report.repo_root)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&report.repo_root);
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "za diff  {}  {} {}",
+        style_bold(repo_name, use_color),
+        style_dim("@", use_color),
+        style_head(report.head.as_deref().unwrap_or("(unborn)"), use_color),
+    ));
+
+    if report.clean {
+        lines.push(format!(
+            "{} {}",
+            style_dim("status", use_color),
+            "working tree clean"
+        ));
+        return lines.join("\n") + "\n";
+    }
+
+    lines.push(format!(
+        "{} {}  {}  {}{}",
+        style_dim("changed", use_color),
+        format_args!(
+            "{} {}",
+            report.total.files,
+            pluralize(report.total.files, "file", "files")
+        ),
+        colorize_additions(format!("+{}", report.total.additions), use_color),
+        colorize_deletions(format!("-{}", report.total.deletions), use_color),
+        if report.total.binary_files > 0 {
+            format!(
+                "  {}",
+                colorize_binary(
+                    format!(
+                        "{} {}",
+                        report.total.binary_files,
+                        pluralize(report.total.binary_files, "binary", "binaries")
+                    ),
+                    use_color,
+                )
+            )
+        } else {
+            String::new()
+        }
+    ));
+
+    let scope_summary = render_scope_summary(report, use_color);
+    if !scope_summary.is_empty() {
+        lines.push(scope_summary);
+    }
+
+    let review_entries = &report.total.file_stats;
+    if !review_entries.is_empty() {
+        lines.push(String::new());
+        let path_width = review_entries
+            .iter()
+            .map(review_path_plain)
+            .map(|path| path.chars().count())
+            .max()
+            .unwrap_or_default()
+            .min(72);
+        let scope_width = review_entries
+            .iter()
+            .map(review_scope_label)
+            .map(|scope| scope.chars().count())
+            .max()
+            .unwrap_or_default()
+            .max(9);
+        lines.push(format!(
+            "{}  {}  {}{}  {}  {}",
+            style_dim("st", use_color),
+            style_dim(&format!("{:<scope_width$}", "scope"), use_color),
+            style_dim("file", use_color),
+            " ".repeat(path_width.saturating_sub(4)),
+            style_dim(&format!("{:>8}", "+add"), use_color),
+            style_dim(&format!("{:>8}", "-del"), use_color),
+        ));
+
+        for entry in review_entries {
+            let status_label = format!("{:>2}", entry.status.short_label());
+            let scope_label = review_scope_label(entry);
+            let path_plain = review_path_plain(entry);
+            let path_rendered = review_path_rendered(entry, use_color);
+            let visible_path_width = path_plain.chars().count().min(path_width);
+            let path_padding = " ".repeat(path_width.saturating_sub(visible_path_width));
+            lines.push(if entry.binary {
+                format!(
+                    "{}  {}  {}{}  {}",
+                    style_status(entry.status, &status_label, use_color),
+                    style_scope(&format!("{scope_label:<scope_width$}"), entry, use_color),
+                    path_rendered,
+                    path_padding,
+                    format_binary_column("binary", use_color),
+                )
+            } else {
+                format!(
+                    "{}  {}  {}{}  {}  {}",
+                    style_status(entry.status, &status_label, use_color),
+                    style_scope(&format!("{scope_label:<scope_width$}"), entry, use_color),
+                    path_rendered,
+                    path_padding,
+                    format_additions_column(&format!("+{}", entry.additions), use_color),
+                    format_deletions_column(&format!("-{}", entry.deletions), use_color),
+                )
+            });
+        }
+    }
+
+    lines.join("\n") + "\n"
+}
+
+fn render_scope_summary(report: &DiffWorkspaceOutput, use_color: bool) -> String {
+    let mut parts = Vec::new();
+    if report.unstaged.files > 0 {
+        parts.push(style_scope_summary(
+            format!(
+                "{} {}",
+                report.unstaged.files,
+                pluralize(report.unstaged.files, "unstaged", "unstaged")
+            ),
+            DiffScope::Unstaged,
+            use_color,
+        ));
+    }
+    if report.staged.files > 0 {
+        parts.push(style_scope_summary(
+            format!(
+                "{} {}",
+                report.staged.files,
+                pluralize(report.staged.files, "staged", "staged")
+            ),
+            DiffScope::Staged,
+            use_color,
+        ));
+    }
+    if report.untracked.files > 0 {
+        parts.push(style_scope_summary(
+            format!(
+                "{} {}",
+                report.untracked.files,
+                pluralize(report.untracked.files, "untracked", "untracked")
+            ),
+            DiffScope::Untracked,
+            use_color,
+        ));
+    }
+    parts.join(&format!(" {} ", style_dim("·", use_color)))
+}
+
+fn review_scope_label(entry: &DiffFileStat) -> String {
+    let mut labels = Vec::new();
+    if entry.scopes.contains(&DiffScope::Unstaged) {
+        labels.push("unstaged");
+    }
+    if entry.scopes.contains(&DiffScope::Staged) {
+        labels.push("staged");
+    }
+    if entry.scopes.contains(&DiffScope::Untracked) {
+        labels.push("untracked");
+    }
+    labels.join("+")
+}
+
+fn review_path_plain(entry: &DiffFileStat) -> String {
+    if let Some(previous_path) = &entry.previous_path {
+        format!("{previous_path} -> {}", entry.path)
+    } else {
+        entry.path.clone()
+    }
+}
+
+fn review_path_rendered(entry: &DiffFileStat, use_color: bool) -> String {
+    if let Some(previous_path) = &entry.previous_path {
+        format!(
+            "{} {} {}",
+            style_path(previous_path, use_color),
+            style_dim("->", use_color),
+            style_path(&entry.path, use_color),
+        )
+    } else {
+        style_path(&entry.path, use_color)
+    }
+}
+
+fn style_path(path: &str, use_color: bool) -> String {
+    if !use_color {
+        return path.to_string();
+    }
+
+    match path.rsplit_once('/') {
+        Some((prefix, file_name)) => format!(
+            "{}{}",
+            style_dim(&format!("{prefix}/"), use_color),
+            style_bold(file_name, use_color),
+        ),
+        None => style_bold(path, use_color),
+    }
+}
+
+fn style_status(status: DiffStatus, label: &str, use_color: bool) -> String {
+    let code = match status {
+        DiffStatus::Added => "32",
+        DiffStatus::Deleted => "31",
+        DiffStatus::Renamed => "36",
+        DiffStatus::Modified => "33",
+        DiffStatus::Copied => "36",
+        DiffStatus::TypeChanged => "35",
+        DiffStatus::Unmerged => "31",
+        DiffStatus::Untracked => "34",
+        DiffStatus::Unknown => "37",
+    };
+    style_ansi(label, &[code, "1"], use_color)
+}
+
+fn style_scope(label: &str, entry: &DiffFileStat, use_color: bool) -> String {
+    let code = if entry.scopes.contains(&DiffScope::Unstaged) {
+        "33"
+    } else if entry.scopes.contains(&DiffScope::Staged) {
+        "32"
+    } else {
+        "34"
+    };
+    style_ansi(label, &[code, "2"], use_color)
+}
+
+fn style_scope_summary(label: String, scope: DiffScope, use_color: bool) -> String {
+    let code = match scope {
+        DiffScope::Unstaged => "33",
+        DiffScope::Staged => "32",
+        DiffScope::Untracked => "34",
+    };
+    style_ansi(&label, &[code], use_color)
+}
+
+fn style_head(value: &str, use_color: bool) -> String {
+    style_ansi(value, &["2"], use_color)
+}
+
+fn style_dim(value: &str, use_color: bool) -> String {
+    style_ansi(value, &["2"], use_color)
+}
+
+fn style_bold(value: &str, use_color: bool) -> String {
+    style_ansi(value, &["1"], use_color)
+}
+
+fn colorize_additions(value: String, use_color: bool) -> String {
+    style_ansi(&value, &["32"], use_color)
+}
+
+fn colorize_deletions(value: String, use_color: bool) -> String {
+    style_ansi(&value, &["31"], use_color)
+}
+
+fn colorize_binary(value: String, use_color: bool) -> String {
+    style_ansi(&value, &["36"], use_color)
+}
+
+fn format_additions_column(value: &str, use_color: bool) -> String {
+    colorize_additions(format!("{value:>8}"), use_color)
+}
+
+fn format_deletions_column(value: &str, use_color: bool) -> String {
+    colorize_deletions(format!("{value:>8}"), use_color)
+}
+
+fn format_binary_column(value: &str, use_color: bool) -> String {
+    colorize_binary(format!("{value:>8}"), use_color)
+}
+
+fn style_ansi(value: &str, codes: &[&str], use_color: bool) -> String {
+    if !use_color {
+        return value.to_string();
+    }
+    format!("\u{1b}[{}m{}\u{1b}[0m", codes.join(";"), value)
+}
+
+fn pluralize<'a>(value: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if value == 1 { singular } else { plural }
+}
+
+impl DiffStatus {
+    fn short_label(self) -> &'static str {
+        match self {
+            Self::Added => "A",
+            Self::Deleted => "D",
+            Self::Renamed => "R",
+            Self::Modified => "M",
+            Self::Copied => "C",
+            Self::TypeChanged => "T",
+            Self::Unmerged => "U",
+            Self::Untracked => "?",
+            Self::Unknown => "!",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DiffFileStat, DiffScope, DiffSection, DiffStatus, DiffWorkspaceOutput, NumstatPathMode,
+        collect_workspace_diff, parse_diff_status, parse_name_status_z, parse_numstat_z,
+        render_diff_report, resolve_repo_root_from,
+    };
+    use anyhow::Result;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> Result<Self> {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time must be after unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "za-diff-test-{name}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path)?;
+            Ok(Self { path })
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn parse_numstat_z_normalizes_no_index_paths() {
+        let entries = parse_numstat_z(
+            b"2\t0\t\x00/dev/null\x00notes.txt\x00",
+            NumstatPathMode::NoIndex,
+        )
+        .expect("must parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "notes.txt");
+        assert_eq!(entries[0].previous_path, None);
+        assert_eq!(entries[0].additions, 2);
+        assert_eq!(entries[0].deletions, 0);
+    }
+
+    #[test]
+    fn parse_numstat_z_tracks_binary_files() {
+        let entries = parse_numstat_z(b"-\t-\tassets/logo.png\x00", NumstatPathMode::Native)
+            .expect("must parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "assets/logo.png");
+        assert!(entries[0].binary);
+    }
+
+    #[test]
+    fn parse_name_status_z_tracks_renames() {
+        let entries =
+            parse_name_status_z(b"R100\x00src/old.rs\x00src/new.rs\x00").expect("must parse");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, DiffStatus::Renamed);
+        assert_eq!(entries[0].previous_path.as_deref(), Some("src/old.rs"));
+        assert_eq!(entries[0].path, "src/new.rs");
+    }
+
+    #[test]
+    fn parse_diff_status_maps_known_codes() {
+        assert_eq!(parse_diff_status("M"), DiffStatus::Modified);
+        assert_eq!(parse_diff_status("A"), DiffStatus::Added);
+        assert_eq!(parse_diff_status("D"), DiffStatus::Deleted);
+        assert_eq!(parse_diff_status("R100"), DiffStatus::Renamed);
+        assert_eq!(parse_diff_status("T"), DiffStatus::TypeChanged);
+        assert_eq!(parse_diff_status("U"), DiffStatus::Unmerged);
+    }
+
+    #[test]
+    fn resolve_repo_root_from_errors_outside_git_repo() {
+        let dir = TempDir::new("outside").expect("temp dir");
+        let err = resolve_repo_root_from(&dir.path).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("current directory is not inside a Git repository")
+        );
+    }
+
+    #[test]
+    fn collect_workspace_diff_counts_staged_unstaged_and_untracked() {
+        let dir = TempDir::new("workspace").expect("temp dir");
+        init_repo(&dir.path).expect("init repo");
+        write_file(dir.path.join("tracked.txt"), "one\n").expect("write tracked");
+        git(&dir.path, &["add", "tracked.txt"]).expect("git add");
+        git(&dir.path, &["commit", "-qm", "init"]).expect("git commit");
+
+        write_file(dir.path.join("tracked.txt"), "one\ntwo\nthree\n").expect("modify tracked");
+        write_file(dir.path.join("staged.txt"), "alpha\nbeta\n").expect("write staged");
+        git(&dir.path, &["add", "staged.txt"]).expect("git add staged");
+        write_file(dir.path.join("draft.txt"), "note\n").expect("write untracked");
+
+        let report = collect_workspace_diff(Path::new(&dir.path), true).expect("collect diff");
+        assert_eq!(report.staged.files, 1);
+        assert_eq!(report.staged.additions, 2);
+        assert_eq!(report.unstaged.files, 1);
+        assert_eq!(report.untracked.files, 1);
+        assert_eq!(report.total.files, 3);
+        assert_eq!(report.total.additions, 5);
+        assert!(!report.clean);
+        assert!(
+            report
+                .total
+                .file_stats
+                .iter()
+                .any(|entry| entry.scopes == vec![DiffScope::Untracked])
+        );
+    }
+
+    #[test]
+    fn collect_workspace_diff_supports_unborn_head() {
+        let dir = TempDir::new("unborn").expect("temp dir");
+        init_empty_repo(&dir.path).expect("init repo");
+        write_file(dir.path.join("new.txt"), "hello\nworld\n").expect("write file");
+        git(&dir.path, &["add", "new.txt"]).expect("git add");
+
+        let report = collect_workspace_diff(Path::new(&dir.path), false).expect("collect diff");
+        assert_eq!(report.head, None);
+        assert_eq!(report.staged.files, 1);
+        assert_eq!(report.staged.additions, 2);
+        assert_eq!(report.total.files, 1);
+    }
+
+    #[test]
+    fn collect_workspace_diff_tracks_renamed_files() {
+        let dir = TempDir::new("rename").expect("temp dir");
+        init_repo(&dir.path).expect("init repo");
+        write_file(dir.path.join("src_old.rs"), "fn old() {}\n").expect("write file");
+        git(&dir.path, &["add", "src_old.rs"]).expect("git add");
+        git(&dir.path, &["commit", "-qm", "init"]).expect("git commit");
+        fs::rename(dir.path.join("src_old.rs"), dir.path.join("src_new.rs")).expect("rename file");
+        git(&dir.path, &["add", "-A"]).expect("git add rename");
+
+        let report = collect_workspace_diff(Path::new(&dir.path), true).expect("collect diff");
+        assert_eq!(report.staged.files, 1);
+        assert_eq!(report.staged.file_stats[0].status, DiffStatus::Renamed);
+        assert_eq!(
+            report.staged.file_stats[0].previous_path.as_deref(),
+            Some("src_old.rs")
+        );
+        assert_eq!(report.staged.file_stats[0].path, "src_new.rs");
+    }
+
+    #[test]
+    fn render_diff_report_mentions_clean_workspace() {
+        let dir = TempDir::new("clean").expect("temp dir");
+        init_repo(&dir.path).expect("init repo");
+        write_file(dir.path.join("tracked.txt"), "one\n").expect("write tracked");
+        git(&dir.path, &["add", "tracked.txt"]).expect("git add");
+        git(&dir.path, &["commit", "-qm", "init"]).expect("git commit");
+
+        let report = collect_workspace_diff(Path::new(&dir.path), false).expect("collect diff");
+        let rendered = render_diff_report(&report, false);
+        assert!(rendered.contains("working tree clean"));
+    }
+
+    #[test]
+    fn render_diff_report_uses_review_oriented_layout() {
+        let dir = TempDir::new("list-files").expect("temp dir");
+        init_repo(&dir.path).expect("init repo");
+        write_file(dir.path.join("tracked.txt"), "one\n").expect("write tracked");
+        git(&dir.path, &["add", "tracked.txt"]).expect("git add");
+        git(&dir.path, &["commit", "-qm", "init"]).expect("git commit");
+        write_file(dir.path.join("tracked.txt"), "one\ntwo\n").expect("modify tracked");
+        write_file(dir.path.join("new.txt"), "hello\n").expect("new file");
+
+        let report = collect_workspace_diff(Path::new(&dir.path), true).expect("collect diff");
+        let rendered = render_diff_report(&report, false);
+        assert!(rendered.contains("changed 2 files"));
+        assert!(rendered.contains("1 unstaged"));
+        assert!(rendered.contains("1 untracked"));
+        assert!(rendered.contains("st  scope"));
+        assert!(rendered.contains("+add"));
+        assert!(rendered.contains("-del"));
+        assert!(rendered.contains(" M  unstaged"));
+        assert!(rendered.contains(" ?  untracked"));
+        assert!(rendered.contains("tracked.txt"));
+        assert!(rendered.contains("new.txt"));
+    }
+
+    #[test]
+    fn render_diff_report_adds_ansi_colors_when_enabled() {
+        let report = DiffWorkspaceOutput {
+            repo_root: "/tmp/repo".to_string(),
+            head: Some("abc1234".to_string()),
+            clean: false,
+            staged: DiffSection {
+                files: 1,
+                additions: 3,
+                deletions: 1,
+                binary_files: 0,
+                file_stats: vec![DiffFileStat {
+                    path: "src/main.rs".to_string(),
+                    previous_path: None,
+                    additions: 3,
+                    deletions: 1,
+                    binary: false,
+                    status: DiffStatus::Modified,
+                    scopes: vec![DiffScope::Staged],
+                }],
+            },
+            unstaged: DiffSection::default(),
+            untracked: DiffSection::default(),
+            total: DiffSection {
+                files: 1,
+                additions: 3,
+                deletions: 1,
+                binary_files: 0,
+                file_stats: vec![DiffFileStat {
+                    path: "src/main.rs".to_string(),
+                    previous_path: None,
+                    additions: 3,
+                    deletions: 1,
+                    binary: false,
+                    status: DiffStatus::Modified,
+                    scopes: vec![DiffScope::Staged],
+                }],
+            },
+        };
+
+        let rendered = render_diff_report(&report, true);
+        assert!(rendered.contains("\u{1b}[32m      +3\u{1b}[0m"));
+        assert!(rendered.contains("\u{1b}[31m      -1\u{1b}[0m"));
+        assert!(rendered.contains("\u{1b}[33;1m M\u{1b}[0m"));
+    }
+
+    fn init_repo(path: &Path) -> Result<()> {
+        init_empty_repo(path)?;
+        git(path, &["config", "user.email", "za@example.com"])?;
+        git(path, &["config", "user.name", "za"])?;
+        Ok(())
+    }
+
+    fn init_empty_repo(path: &Path) -> Result<()> {
+        git(path, &["init", "-q"])?;
+        Ok(())
+    }
+
+    fn git(path: &Path, args: &[&str]) -> Result<()> {
+        let status = Command::new("git").args(args).current_dir(path).status()?;
+        if !status.success() {
+            anyhow::bail!("git command failed: git {}", args.join(" "));
+        }
+        Ok(())
+    }
+
+    fn write_file(path: PathBuf, content: &str) -> Result<()> {
+        fs::write(path, content)?;
+        Ok(())
+    }
+}
