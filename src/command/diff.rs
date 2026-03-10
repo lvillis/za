@@ -8,6 +8,10 @@ use std::{
     process::{Command, Output},
 };
 
+const DIFF_STAT_BLOCK_COUNT: usize = 5;
+const DIFF_STAT_FILLED_BLOCK: &str = "\u{25A0}";
+const DIFF_STAT_EMPTY_BLOCK: &str = "\u{25A1}";
+
 pub fn run(json: bool, files: bool) -> Result<i32> {
     let repo_root = resolve_repo_root()?;
     let report = collect_workspace_diff(&repo_root, files || !json)?;
@@ -18,7 +22,10 @@ pub fn run(json: bool, files: bool) -> Result<i32> {
             serde_json::to_string_pretty(&report).context("serialize diff output")?
         );
     } else {
-        print!("{}", render_diff_report(&report, color_enabled()));
+        print!(
+            "{}",
+            render_diff_report(&report, color_enabled(), unicode_diff_stat_enabled())
+        );
     }
 
     Ok(0)
@@ -616,7 +623,24 @@ fn color_enabled() -> bool {
     io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
 }
 
-fn render_diff_report(report: &DiffWorkspaceOutput, use_color: bool) -> String {
+fn unicode_diff_stat_enabled() -> bool {
+    io::stdout().is_terminal()
+        && env::var_os("NO_COLOR").is_none()
+        && ["LC_ALL", "LC_CTYPE", "LANG"]
+            .into_iter()
+            .find_map(env::var_os)
+            .and_then(|value| value.into_string().ok())
+            .is_some_and(|value| {
+                let value = value.to_ascii_lowercase();
+                value.contains("utf-8") || value.contains("utf8")
+            })
+}
+
+fn render_diff_report(
+    report: &DiffWorkspaceOutput,
+    use_color: bool,
+    use_unicode_stat: bool,
+) -> String {
     let repo_name = Path::new(&report.repo_root)
         .file_name()
         .and_then(|name| name.to_str())
@@ -674,6 +698,11 @@ fn render_diff_report(report: &DiffWorkspaceOutput, use_color: bool) -> String {
     let review_entries = &report.total.file_stats;
     if !review_entries.is_empty() {
         lines.push(String::new());
+        let max_stat_total = review_entries
+            .iter()
+            .map(|entry| entry.additions.saturating_add(entry.deletions))
+            .max()
+            .unwrap_or_default();
         let path_width = review_entries
             .iter()
             .map(review_path_plain)
@@ -689,13 +718,14 @@ fn render_diff_report(report: &DiffWorkspaceOutput, use_color: bool) -> String {
             .unwrap_or_default()
             .max(9);
         lines.push(format!(
-            "{}  {}  {}{}  {}  {}",
+            "{}  {}  {}{}  {}  {}  {}",
             style_dim("st", use_color),
             style_dim(&format!("{:<scope_width$}", "scope"), use_color),
             style_dim("file", use_color),
             " ".repeat(path_width.saturating_sub(4)),
             style_dim(&format!("{:>8}", "+add"), use_color),
             style_dim(&format!("{:>8}", "-del"), use_color),
+            style_dim(&format!("{:<DIFF_STAT_BLOCK_COUNT$}", "stat"), use_color),
         ));
 
         for entry in review_entries {
@@ -707,22 +737,24 @@ fn render_diff_report(report: &DiffWorkspaceOutput, use_color: bool) -> String {
             let path_padding = " ".repeat(path_width.saturating_sub(visible_path_width));
             lines.push(if entry.binary {
                 format!(
-                    "{}  {}  {}{}  {}",
+                    "{}  {}  {}{}  {}  {}",
                     style_status(entry.status, &status_label, use_color),
                     style_scope(&format!("{scope_label:<scope_width$}"), entry, use_color),
                     path_rendered,
                     path_padding,
                     format_binary_column("binary", use_color),
+                    render_empty_diff_stat(use_color, use_unicode_stat),
                 )
             } else {
                 format!(
-                    "{}  {}  {}{}  {}  {}",
+                    "{}  {}  {}{}  {}  {}  {}",
                     style_status(entry.status, &status_label, use_color),
                     style_scope(&format!("{scope_label:<scope_width$}"), entry, use_color),
                     path_rendered,
                     path_padding,
                     format_additions_column(&format!("+{}", entry.additions), use_color),
                     format_deletions_column(&format!("-{}", entry.deletions), use_color),
+                    render_diff_stat_bar(entry, max_stat_total, use_color, use_unicode_stat),
                 )
             });
         }
@@ -890,6 +922,67 @@ fn format_binary_column(value: &str, use_color: bool) -> String {
     colorize_binary(format!("{value:>8}"), use_color)
 }
 
+fn render_diff_stat_bar(
+    entry: &DiffFileStat,
+    max_total: u64,
+    use_color: bool,
+    use_unicode_stat: bool,
+) -> String {
+    let total = entry.additions.saturating_add(entry.deletions);
+    if total == 0 || max_total == 0 {
+        return render_empty_diff_stat(use_color, use_unicode_stat);
+    }
+
+    let mut bar_width =
+        ((total as f64 / max_total as f64) * DIFF_STAT_BLOCK_COUNT as f64).round() as usize;
+    if bar_width == 0 {
+        bar_width = 1;
+    }
+    bar_width = bar_width.min(DIFF_STAT_BLOCK_COUNT);
+
+    let mut add_width =
+        ((entry.additions as f64 / total as f64) * bar_width as f64).round() as usize;
+    add_width = add_width.min(bar_width);
+    let mut del_width = bar_width.saturating_sub(add_width);
+
+    if entry.additions > 0 && add_width == 0 {
+        add_width = 1;
+        del_width = bar_width.saturating_sub(add_width);
+    }
+    if entry.deletions > 0 && del_width == 0 {
+        del_width = 1;
+        add_width = bar_width.saturating_sub(del_width);
+    }
+
+    let (add_glyph, del_glyph, empty_glyph) = if use_unicode_stat {
+        (
+            DIFF_STAT_FILLED_BLOCK,
+            DIFF_STAT_FILLED_BLOCK,
+            DIFF_STAT_EMPTY_BLOCK,
+        )
+    } else {
+        ("+", "-", ".")
+    };
+    let add_bar = add_glyph.repeat(add_width);
+    let del_bar = del_glyph.repeat(del_width);
+    let empty_bar = empty_glyph.repeat(DIFF_STAT_BLOCK_COUNT.saturating_sub(bar_width));
+
+    let mut rendered = String::new();
+    rendered.push_str(&colorize_additions(add_bar, use_color));
+    rendered.push_str(&colorize_deletions(del_bar, use_color));
+    rendered.push_str(&style_dim(&empty_bar, use_color));
+    rendered
+}
+
+fn render_empty_diff_stat(use_color: bool, use_unicode_stat: bool) -> String {
+    let glyph = if use_unicode_stat {
+        DIFF_STAT_EMPTY_BLOCK
+    } else {
+        "."
+    };
+    style_dim(&glyph.repeat(DIFF_STAT_BLOCK_COUNT), use_color)
+}
+
 fn style_ansi(value: &str, codes: &[&str], use_color: bool) -> String {
     if !use_color {
         return value.to_string();
@@ -920,9 +1013,9 @@ impl DiffStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiffFileStat, DiffScope, DiffSection, DiffStatus, DiffWorkspaceOutput, NumstatPathMode,
-        collect_workspace_diff, parse_diff_status, parse_name_status_z, parse_numstat_z,
-        render_diff_report, resolve_repo_root_from,
+        DIFF_STAT_FILLED_BLOCK, DiffFileStat, DiffScope, DiffSection, DiffStatus,
+        DiffWorkspaceOutput, NumstatPathMode, collect_workspace_diff, parse_diff_status,
+        parse_name_status_z, parse_numstat_z, render_diff_report, resolve_repo_root_from,
     };
     use anyhow::Result;
     use std::{
@@ -1083,7 +1176,7 @@ mod tests {
         git(&dir.path, &["commit", "-qm", "init"]).expect("git commit");
 
         let report = collect_workspace_diff(Path::new(&dir.path), false).expect("collect diff");
-        let rendered = render_diff_report(&report, false);
+        let rendered = render_diff_report(&report, false, false);
         assert!(rendered.contains("working tree clean"));
     }
 
@@ -1098,17 +1191,19 @@ mod tests {
         write_file(dir.path.join("new.txt"), "hello\n").expect("new file");
 
         let report = collect_workspace_diff(Path::new(&dir.path), true).expect("collect diff");
-        let rendered = render_diff_report(&report, false);
+        let rendered = render_diff_report(&report, false, false);
         assert!(rendered.contains("changed 2 files"));
         assert!(rendered.contains("1 unstaged"));
         assert!(rendered.contains("1 untracked"));
         assert!(rendered.contains("st  scope"));
         assert!(rendered.contains("+add"));
         assert!(rendered.contains("-del"));
+        assert!(rendered.contains("stat"));
         assert!(rendered.contains(" M  unstaged"));
         assert!(rendered.contains(" ?  untracked"));
         assert!(rendered.contains("tracked.txt"));
         assert!(rendered.contains("new.txt"));
+        assert!(rendered.contains("+"));
     }
 
     #[test]
@@ -1151,10 +1246,12 @@ mod tests {
             },
         };
 
-        let rendered = render_diff_report(&report, true);
+        let rendered = render_diff_report(&report, true, true);
         assert!(rendered.contains("\u{1b}[32m      +3\u{1b}[0m"));
         assert!(rendered.contains("\u{1b}[31m      -1\u{1b}[0m"));
         assert!(rendered.contains("\u{1b}[33;1m M\u{1b}[0m"));
+        assert!(rendered.contains("\u{1b}[32m"));
+        assert!(rendered.contains(DIFF_STAT_FILLED_BLOCK));
     }
 
     fn init_repo(path: &Path) -> Result<()> {

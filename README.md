@@ -155,7 +155,7 @@ za diff --files
 za diff --json
 ```
 
-The terminal report is review-oriented: it shows one merged file list with status markers (`M/A/D/R/?`), scope labels (`staged`, `unstaged`, `untracked`), and colored `+`/`-` counts on TTY output. Binary files are counted separately and excluded from `+/-` line totals. Use `--json --files` when you also want per-file detail in machine-readable output.
+The terminal report is review-oriented: it shows one merged file list with status markers (`M/A/D/R/?`), scope labels (`staged`, `unstaged`, `untracked`), colored `+`/`-` counts on TTY output, and a compact 5-block `STAT` diffstat column so larger files stand out immediately without taking over the row. Binary files are counted separately and excluded from `+/-` line totals. Use `--json --files` when you also want per-file detail in machine-readable output.
 
 ## Tool Management
 
