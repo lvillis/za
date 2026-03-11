@@ -1,8 +1,17 @@
+## [0.1.31] - 2026-03-11
+
+### 🚜 Refactor
+
+- Polish diff, codex top, completion, and tool output
 ## [0.1.30] - 2026-03-11
 
 ### 🐛 Bug Fixes
 
 - *(completion)* Add managed activation fallback and install messaging
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.30
 ## [0.1.29] - 2026-03-11
 
 ### 🚀 Features
