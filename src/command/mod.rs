@@ -2,6 +2,7 @@
 
 pub mod ci;
 pub mod codex;
+pub mod completion;
 pub mod deps;
 pub mod diff;
 pub mod r#gen;

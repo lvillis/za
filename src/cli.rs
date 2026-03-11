@@ -12,6 +12,11 @@ pub struct Cli {
 /// Sub-command definitions
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Generate shell completion scripts
+    Completion {
+        #[command(subcommand)]
+        cmd: CompletionCommands,
+    },
     /// Summarize current Git workspace changes for review
     Diff {
         /// Print JSON output for scripting.
@@ -182,6 +187,38 @@ pub enum ToolCommands {
         /// Tool spec in `name[:version]` format.
         spec: String,
     },
+}
+
+/// `za completion` sub-commands
+#[derive(Subcommand)]
+pub enum CompletionCommands {
+    /// Print Bash completion script to stdout
+    Bash,
+    /// Print Zsh completion script to stdout
+    Zsh,
+    /// Print Fish completion script to stdout
+    Fish,
+    /// Print Elvish completion script to stdout
+    Elvish,
+    /// Print PowerShell completion script to stdout
+    Powershell,
+    /// Install a completion script into a common user-level path
+    Install {
+        #[arg(value_enum)]
+        shell: CompletionShell,
+        /// Override the install path instead of using the default shell-specific location.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+    Elvish,
+    Powershell,
 }
 
 /// `za config` sub-commands
@@ -454,9 +491,43 @@ pub enum DiffRiskFilter {
 #[cfg(test)]
 mod tests {
     use super::{
-        CiCommands, Cli, CodexCommands, Commands, DiffRiskFilter, GhCommands, GitAuthCommands,
+        CiCommands, Cli, CodexCommands, Commands, CompletionCommands, CompletionShell,
+        DiffRiskFilter, GhCommands, GitAuthCommands,
     };
     use clap::Parser;
+    use std::path::PathBuf;
+
+    #[test]
+    fn completion_parses_generate_shell_subcommand() {
+        let cli = Cli::try_parse_from(["za", "completion", "zsh"]).expect("must parse");
+        match cli.cmd {
+            Commands::Completion { cmd } => assert!(matches!(cmd, CompletionCommands::Zsh)),
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn completion_install_parses_shell_and_path() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "completion",
+            "install",
+            "fish",
+            "--path",
+            "/tmp/za.fish",
+        ])
+        .expect("must parse");
+        match cli.cmd {
+            Commands::Completion { cmd } => match cmd {
+                CompletionCommands::Install { shell, path } => {
+                    assert_eq!(shell, CompletionShell::Fish);
+                    assert_eq!(path, Some(PathBuf::from("/tmp/za.fish")));
+                }
+                _ => panic!("unexpected completion command"),
+            },
+            _ => panic!("unexpected command"),
+        }
+    }
 
     #[test]
     fn diff_parses_review_filters() {

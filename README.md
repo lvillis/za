@@ -136,6 +136,7 @@ za gh auth test --repo https://github.com/org/repo.git
 | Command | Purpose |
 | --- | --- |
 | `za diff` | Summarize current Git workspace additions/deletions for review. |
+| `za completion` | Generate shell completion scripts. |
 | `za gen` | Generate project context snapshots (`CONTEXT.md`). |
 | `za tool` | Install/update/list/use/uninstall managed binaries. |
 | `za run` | Launch a tool directly with normalized proxy environment variables. |
@@ -159,6 +160,30 @@ za diff --name-only
 ```
 
 The terminal report is review-oriented: it shows one merged file list with status markers (`M/A/D/R/?`), a narrow attention marker (`!` high, `~` medium), scope labels (`staged`, `unstaged`, `untracked`), directory-dimmed file paths, rename arrows, colored `+`/`-` counts on TTY output, and a compact 5-block `STAT` diffstat column so larger files stand out immediately without taking over the row. Risk kinds (`large`, `ci`, `config`, `lock`, `generated`, `binary`) stay in the top `attention` summary and JSON output instead of occupying a wide per-row column. The `large` cutoff is computed from recent Git history (`p90`, clamped to a sane range) and falls back to a fixed threshold when history is too shallow. Use `--path` for gitignore-style path globs, scope flags such as `--staged` / `--unstaged` / `--untracked` to narrow review focus, `--exclude-risk` to hide noisy generated or lockfile churn, and `--name-only` when you only want the review queue. Binary files are counted separately and excluded from `+/-` line totals. `--json` now carries stable filter metadata, risk policy metadata, workspace totals, renamed path fields, and per-file risk tags; use `--json --files` when you also want per-file detail in machine-readable output.
+
+## Shell Completion
+
+Use `za completion <shell>` to emit a shell-native completion script:
+
+```bash
+za completion bash
+za completion zsh
+za completion fish
+```
+
+Or let `za` install into common user-level locations:
+
+```bash
+za completion install bash
+za completion install zsh
+za completion install fish
+```
+
+Use `--path` when you want a non-default target, or for shells without a built-in install target:
+
+```bash
+za completion install powershell --path ~/.config/powershell/completions/za.ps1
+```
 
 ## Tool Management
 
