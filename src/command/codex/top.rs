@@ -174,6 +174,7 @@ pub(super) struct CodexTopRow {
     pub(super) tmux_running: bool,
     pub(super) attached_clients: usize,
     pub(super) last_activity_unix: Option<u64>,
+    pub(super) otel_last_activity_unix: Option<u64>,
     pub(super) last_event_name: Option<String>,
     pub(super) otel_events: u64,
     pub(super) api_requests: u64,
@@ -183,6 +184,7 @@ pub(super) struct CodexTopRow {
     pub(super) lifetime_tool_errors: u64,
     pub(super) sse_events: u64,
     pub(super) live_otel: bool,
+    pub(super) status_detail: String,
 }
 
 #[derive(Debug)]
@@ -1346,6 +1348,7 @@ pub(super) fn build_top_rows(input: TopRowsInput<'_>) -> Vec<CodexTopRow> {
         let managed_record = managed_assignments.get(&key);
         let tmux = managed_record.and_then(|record| tmux_sessions.get(&record.session_name));
         let tmux_running = tmux.is_some();
+        let otel_last_activity_unix = otel.and_then(|(_, session)| session.last_activity_unix);
         let live_otel = otel
             .and_then(|(_, session)| session.last_activity_unix)
             .is_some_and(|last| current_unix_seconds().saturating_sub(last) <= 5);
@@ -1354,7 +1357,7 @@ pub(super) fn build_top_rows(input: TopRowsInput<'_>) -> Vec<CodexTopRow> {
                 .state
                 .last_activity_unix
                 .or(Some(tracker.modified_unix)),
-            otel.and_then(|(_, session)| session.last_activity_unix),
+            otel_last_activity_unix,
         );
         let status = top_row_status(
             tmux_running,
@@ -1362,8 +1365,8 @@ pub(super) fn build_top_rows(input: TopRowsInput<'_>) -> Vec<CodexTopRow> {
             tmux_available,
             live_otel,
             last_activity_unix,
-        )
-        .to_string();
+            otel_last_activity_unix,
+        );
 
         let row_session_id = otel
             .map(|(session_id, _)| session_id.clone())
@@ -1384,10 +1387,11 @@ pub(super) fn build_top_rows(input: TopRowsInput<'_>) -> Vec<CodexTopRow> {
                 .clone()
                 .or_else(|| otel.and_then(|(_, session)| session.effort.clone())),
             context_left_percent: tracker.state.context_left_percent,
-            status,
+            status: status.label.to_string(),
             tmux_running,
             attached_clients: tmux.map(|info| info.attached_clients).unwrap_or(0),
             last_activity_unix,
+            otel_last_activity_unix,
             last_event_name: choose_latest_event_name(
                 tracker
                     .state
@@ -1415,6 +1419,7 @@ pub(super) fn build_top_rows(input: TopRowsInput<'_>) -> Vec<CodexTopRow> {
                 .map(|(_, session)| session.sse_events)
                 .unwrap_or_default(),
             live_otel,
+            status_detail: status.detail,
         });
         seen_keys.insert(key);
         if let Some(session_id) = row_session_id {
@@ -1426,7 +1431,22 @@ pub(super) fn build_top_rows(input: TopRowsInput<'_>) -> Vec<CodexTopRow> {
         let tmux = tmux_sessions.get(&record.session_name);
         let tmux_running = tmux.is_some();
         let otel = latest_workspace_otel_session(otel_state, &record.workspace_root);
+        let otel_last_activity_unix = otel.and_then(|(_, session)| session.last_activity_unix);
         let row_session_id = otel.map(|(session_id, _)| session_id.clone());
+        let last_activity_unix = select_latest_activity(
+            tmux.and_then(|info| info.activity_unix)
+                .or(Some(record.created_at_unix)),
+            otel_last_activity_unix,
+        );
+        let status = top_row_status(
+            tmux_running,
+            true,
+            tmux_available,
+            otel_last_activity_unix
+                .is_some_and(|last| current_unix_seconds().saturating_sub(last) <= 5),
+            last_activity_unix,
+            otel_last_activity_unix,
+        );
         rows.push(CodexTopRow {
             key: format!("managed:{}", record.session_name),
             session_id: row_session_id.clone(),
@@ -1435,14 +1455,11 @@ pub(super) fn build_top_rows(input: TopRowsInput<'_>) -> Vec<CodexTopRow> {
             model: otel.and_then(|(_, session)| session.model.clone()),
             effort: otel.and_then(|(_, session)| session.effort.clone()),
             context_left_percent: None,
-            status: session_status_label(tmux_running, true, tmux_available),
+            status: status.label.to_string(),
             tmux_running,
             attached_clients: tmux.map(|info| info.attached_clients).unwrap_or(0),
-            last_activity_unix: select_latest_activity(
-                tmux.and_then(|info| info.activity_unix)
-                    .or(Some(record.created_at_unix)),
-                otel.and_then(|(_, session)| session.last_activity_unix),
-            ),
+            last_activity_unix,
+            otel_last_activity_unix,
             last_event_name: choose_latest_event_name(
                 tmux.and_then(|info| info.activity_unix)
                     .or(Some(record.created_at_unix)),
@@ -1470,6 +1487,7 @@ pub(super) fn build_top_rows(input: TopRowsInput<'_>) -> Vec<CodexTopRow> {
             live_otel: otel
                 .and_then(|(_, session)| session.last_activity_unix)
                 .is_some_and(|last| current_unix_seconds().saturating_sub(last) <= 5),
+            status_detail: status.detail,
         });
         if let Some(session_id) = row_session_id {
             seen_keys.insert(session_id);
@@ -1487,6 +1505,14 @@ pub(super) fn build_top_rows(input: TopRowsInput<'_>) -> Vec<CodexTopRow> {
         ) {
             continue;
         }
+        let status = top_row_status(
+            false,
+            false,
+            tmux_available,
+            true,
+            otel.last_activity_unix,
+            otel.last_activity_unix,
+        );
         rows.push(CodexTopRow {
             key: session_id.clone(),
             session_id: Some(session_id.clone()),
@@ -1498,11 +1524,11 @@ pub(super) fn build_top_rows(input: TopRowsInput<'_>) -> Vec<CodexTopRow> {
             model: otel.model.clone(),
             effort: otel.effort.clone(),
             context_left_percent: None,
-            status: top_row_status(false, false, tmux_available, true, otel.last_activity_unix)
-                .to_string(),
+            status: status.label.to_string(),
             tmux_running: false,
             attached_clients: 0,
             last_activity_unix: otel.last_activity_unix,
+            otel_last_activity_unix: otel.last_activity_unix,
             last_event_name: otel.last_event_name.clone(),
             otel_events: otel.otel_events,
             api_requests: otel.api_requests,
@@ -1512,6 +1538,7 @@ pub(super) fn build_top_rows(input: TopRowsInput<'_>) -> Vec<CodexTopRow> {
             lifetime_tool_errors: 0,
             sse_events: otel.sse_events,
             live_otel: true,
+            status_detail: status.detail,
         });
     }
 
@@ -1673,41 +1700,88 @@ fn workspace_visible(
     workspace_root == Some(current_workspace_root)
 }
 
+struct TopStatusDisplay {
+    label: &'static str,
+    detail: String,
+}
+
 fn top_row_status(
     tmux_running: bool,
     managed: bool,
     tmux_available: bool,
     live_otel: bool,
     last_activity_unix: Option<u64>,
-) -> &'static str {
+    otel_last_activity_unix: Option<u64>,
+) -> TopStatusDisplay {
+    if tmux_running && live_otel {
+        return TopStatusDisplay {
+            label: "connected",
+            detail: "tmux active and live OTel is flowing".to_string(),
+        };
+    }
     if tmux_running {
-        return "running";
+        return TopStatusDisplay {
+            label: "waiting",
+            detail: otel_last_activity_unix.map_or_else(
+                || "tmux active; waiting for the first OTel event".to_string(),
+                |seen| {
+                    format!(
+                        "tmux active; last OTel event {}",
+                        activity_age_label(Some(seen))
+                    )
+                },
+            ),
+        };
     }
     if live_otel {
-        return "live";
+        return TopStatusDisplay {
+            label: "otel-only",
+            detail: "live OTel is flowing without a managed tmux session".to_string(),
+        };
     }
     if managed && !tmux_available {
-        return "unavailable";
+        return TopStatusDisplay {
+            label: "tmux-missing",
+            detail: "tmux is unavailable, so only local metadata can be inspected".to_string(),
+        };
     }
     if managed {
-        return "stale";
+        return TopStatusDisplay {
+            label: "no-otel",
+            detail: otel_last_activity_unix.map_or_else(
+                || "managed session found, but no live OTel stream is connected".to_string(),
+                |seen| {
+                    format!(
+                        "managed session inactive; last OTel event {}",
+                        activity_age_label(Some(seen))
+                    )
+                },
+            ),
+        };
     }
     let elapsed = last_activity_unix.map(|unix| current_unix_seconds().saturating_sub(unix));
     if elapsed.is_some_and(|elapsed| elapsed <= 60) {
-        "idle"
+        TopStatusDisplay {
+            label: "recent",
+            detail: "recent local session activity, but no live OTel stream".to_string(),
+        }
     } else {
-        "ended"
+        TopStatusDisplay {
+            label: "ended",
+            detail: "historical session with no active tmux or OTel stream".to_string(),
+        }
     }
 }
 
 fn top_status_rank(status: &str) -> usize {
     match status {
-        "running" => 0,
-        "live" => 1,
-        "idle" => 2,
-        "stale" => 3,
-        "unavailable" => 4,
-        _ => 5,
+        "connected" => 0,
+        "waiting" => 1,
+        "otel-only" => 2,
+        "no-otel" => 3,
+        "recent" => 4,
+        "tmux-missing" => 5,
+        _ => 6,
     }
 }
 
@@ -1742,6 +1816,50 @@ fn choose_latest_event_name(
     }
 }
 
+const TOP_STATE_COL_WIDTH: usize = 11;
+
+fn top_selected_summary_line(row: Option<&CodexTopRow>, width: usize) -> String {
+    let Some(row) = row else {
+        return "selected=none  state=waiting for a matching Codex session".to_string();
+    };
+    truncate_end(
+        &format!(
+            "selected={}  state={}  last={}  {}",
+            row.session_id.as_deref().unwrap_or("-"),
+            row.status,
+            activity_age_label(row.last_activity_unix),
+            row.status_detail
+        ),
+        width.max(1),
+    )
+}
+
+fn stream_empty_state_message(
+    row: Option<&CodexTopRow>,
+    total_events: usize,
+    filter: TopStreamFilter,
+) -> String {
+    if total_events > 0 {
+        return format!(
+            "No OTel events matched filter `{}`. Press `0` to show all captured events.",
+            filter.label()
+        );
+    }
+    match row {
+        Some(row) if row.tmux_running && !row.live_otel => {
+            "Waiting for live OTel events. The tmux session is active but no OTel traffic has arrived yet.".to_string()
+        }
+        Some(row) if row.status == "no-otel" => {
+            "No live OTel stream is connected for this managed session yet.".to_string()
+        }
+        Some(row) if row.status == "tmux-missing" => {
+            "tmux is unavailable, so only listener-side OTel events can appear here.".to_string()
+        }
+        Some(row) => format!("Waiting for OTel events. {}", row.status_detail),
+        None => "Waiting for the selected session to emit new OTel events.".to_string(),
+    }
+}
+
 fn draw_top_tui(
     frame: &mut ratatui::Frame<'_>,
     app: &mut CodexTopApp,
@@ -1755,17 +1873,14 @@ fn draw_top_tui(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Min(8),
             Constraint::Length(8),
         ])
         .split(frame.area());
 
-    let live_rows = app
-        .rows
-        .iter()
-        .filter(|row| matches!(row.status.as_str(), "running" | "live"))
-        .count();
+    let selected_row = app.rows.get(app.selected);
+    let live_rows = app.rows.iter().filter(|row| row_is_active_now(row)).count();
     let overview = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
@@ -1784,6 +1899,10 @@ fn draw_top_tui(
                 app.otel_state.total_events
             )),
         ]),
+        Line::from(Span::raw(top_selected_summary_line(
+            selected_row,
+            usize::from(chunks[0].width.saturating_sub(4)),
+        ))),
         Line::from(Span::raw(format!("listener={}", listener.endpoint))),
         Line::from(Span::raw(format!(
             "last-otel={}  current-workspace={}",
@@ -1848,9 +1967,10 @@ fn draw_top_tui(
 
 fn top_rows_header_line() -> Line<'static> {
     Line::from(format!(
-        "{:<4} {:<4} {:<6} {:<5} {:<18} {:>3} {:>5} {:>5} {:>7} {:<12} {}",
+        "{:<width$} {:<4} {:<4} {:<6} {:<5} {:<18} {:>3} {:>5} {:>5} {:>7} {:<12} {}",
+        "STATE",
         "TMUX",
-        "LIVE",
+        "OTEL",
         "ACTIVE",
         "LEFT",
         "MODEL/EFFORT",
@@ -1859,7 +1979,8 @@ fn top_rows_header_line() -> Line<'static> {
         "TLIFE",
         "ERR L/A",
         "SESSION",
-        "WORKSPACE"
+        "WORKSPACE",
+        width = TOP_STATE_COL_WIDTH,
     ))
 }
 
@@ -1873,8 +1994,13 @@ fn top_row_item(row: &CodexTopRow) -> ListItem<'static> {
     let tmux_label = if row.tmux_running { "yes" } else { "-" };
     let live_label = if row.live_otel { "yes" } else { "-" };
     let err_label = format!("{}/{}", row.live_tool_errors, row.lifetime_tool_errors);
-    let line = format!(
-        "{:<4} {:<4} {:<6} {:<5} {:<18} {:>3} {:>5} {:>5} {:>7} {:<12} {}",
+    let state_cell = format!(
+        "{:<width$}",
+        truncate_end(&row.status, TOP_STATE_COL_WIDTH),
+        width = TOP_STATE_COL_WIDTH
+    );
+    let remainder = format!(
+        " {:<4} {:<4} {:<6} {:<5} {:<18} {:>3} {:>5} {:>5} {:>7} {:<12} {}",
         tmux_label,
         live_label,
         activity_age_label(row.last_activity_unix),
@@ -1888,20 +2014,19 @@ fn top_row_item(row: &CodexTopRow) -> ListItem<'static> {
         truncate_end(&row.workspace_root, 80),
     );
     ListItem::new(Line::from(vec![
-        Span::styled(
-            format!("{:<4}", tmux_label),
-            top_status_style(&row.status, row.live_otel),
-        ),
-        Span::raw(line[4..].to_string()),
+        Span::styled(state_cell, top_status_style(&row.status, row.live_otel)),
+        Span::raw(remainder),
     ]))
 }
 
 fn top_status_style(status: &str, live_otel: bool) -> Style {
     let base = match status {
-        "running" => Style::default().fg(Color::Green),
-        "live" => Style::default().fg(Color::Cyan),
-        "idle" => Style::default().fg(Color::Yellow),
-        "stale" | "unavailable" => Style::default().fg(Color::Red),
+        "connected" => Style::default().fg(Color::Green),
+        "waiting" => Style::default().fg(Color::Yellow),
+        "otel-only" => Style::default().fg(Color::Cyan),
+        "no-otel" => Style::default().fg(Color::Magenta),
+        "recent" => Style::default().fg(Color::Yellow),
+        "tmux-missing" => Style::default().fg(Color::Red),
         _ => Style::default().fg(Color::DarkGray),
     };
     if live_otel {
@@ -1914,37 +2039,38 @@ fn top_status_style(status: &str, live_otel: bool) -> Style {
 fn top_detail_lines(row: &CodexTopRow, status_message: &Option<String>) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(Line::from(format!(
-        "status={}  tmux={}  live={}  session={}  managed={}",
+        "status={}  tmux={}  otel={}  last-otel={}  {}",
         row.status,
         if row.tmux_running { "yes" } else { "no" },
         if row.live_otel { "yes" } else { "no" },
-        row.session_id.as_deref().unwrap_or("-"),
-        row.managed_session_name.as_deref().unwrap_or("-"),
+        activity_age_label(row.otel_last_activity_unix),
+        row.status_detail,
     )));
     lines.push(Line::from(format!(
-        "workspace={}  clients={}  last={}",
-        row.workspace_root,
+        "session={}  managed={}  clients={}  workspace={}",
+        row.session_id.as_deref().unwrap_or("-"),
+        row.managed_session_name.as_deref().unwrap_or("-"),
         row.attached_clients,
+        row.workspace_root,
+    )));
+    lines.push(Line::from(format!(
+        "model={}  effort={}  left={}  last-event={}",
+        row.model.as_deref().unwrap_or("-"),
+        row.effort.as_deref().unwrap_or("-"),
+        format_left_percent(row.context_left_percent),
         row.last_event_name.as_deref().unwrap_or("-"),
     )));
     lines.push(Line::from(format!(
-        "model={}  left={}  api={}  otel={}  sse={}",
-        row.model.as_deref().unwrap_or("-"),
-        format_left_percent(row.context_left_percent),
+        "api={}  otel={}  sse={}  tool-live={}  tool-life={}",
         row.api_requests,
         row.otel_events,
         row.sse_events,
-    )));
-    lines.push(Line::from(format!(
-        "tool_live={}  tool_life={}  err_live={}  err_life={}  Enter stream  a scope  h history  q quit",
         row.live_tool_calls,
         row.lifetime_tool_calls,
-        row.live_tool_errors,
-        row.lifetime_tool_errors,
     )));
     lines.push(Line::from(format!(
-        "effort={}",
-        row.effort.as_deref().unwrap_or("-"),
+        "err-live={}  err-life={}  Enter stream  a scope  h history  q quit",
+        row.live_tool_errors, row.lifetime_tool_errors,
     )));
     if let Some(message) = status_message {
         lines.push(Line::from(message.clone()));
@@ -2009,7 +2135,32 @@ fn draw_stream_tui(
     let summary_row = app
         .rows
         .iter()
-        .find(|row| row.session_id.as_deref() == Some(session_id.as_str()));
+        .find(|row| row.session_id.as_deref() == Some(session_id.as_str()))
+        .cloned();
+    let otel_signal = summary_row
+        .as_ref()
+        .map(|row| {
+            if row.live_otel {
+                "live"
+            } else if row.otel_last_activity_unix.is_some() {
+                "stale"
+            } else {
+                "none"
+            }
+        })
+        .unwrap_or_else(|| if live_otel { "live" } else { "none" });
+    let stream_status = summary_row
+        .as_ref()
+        .map(|row| (row.status.as_str(), row.status_detail.as_str()))
+        .unwrap_or_else(|| {
+            if live_otel {
+                ("connected", "live OTel is flowing")
+            } else if tmux_running {
+                ("waiting", "tmux active; waiting for OTel traffic")
+            } else {
+                ("ended", "no active tmux or OTel stream")
+            }
+        });
     let overview = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
@@ -2032,29 +2183,41 @@ fn draw_stream_tui(
             "session={}  workspace={}",
             session_id,
             summary_row
+                .as_ref()
                 .map(|row| row.workspace_root.as_str())
                 .unwrap_or(workspace_root.as_str())
         ))),
         Line::from(Span::raw(format!(
-            "model={}  effort={}  tmux={}  live={}",
-            summary_row
-                .and_then(|row| row.model.as_deref())
-                .unwrap_or(model.as_deref().unwrap_or("-")),
-            summary_row
-                .and_then(|row| row.effort.as_deref())
-                .unwrap_or(effort.as_deref().unwrap_or("-")),
-            if summary_row.is_some_and(|row| row.tmux_running)
+            "status={}  tmux={}  otel={}  {}",
+            stream_status.0,
+            if summary_row.as_ref().is_some_and(|row| row.tmux_running)
                 || summary_row.is_none() && tmux_running
             {
                 "yes"
             } else {
                 "no"
             },
-            if summary_row.is_some_and(|row| row.live_otel) || summary_row.is_none() && live_otel {
-                "yes"
-            } else {
-                "no"
-            }
+            otel_signal,
+            truncate_end(
+                stream_status.1,
+                usize::from(chunks[0].width.saturating_sub(32)).max(12)
+            )
+        ))),
+        Line::from(Span::raw(format!(
+            "model={}  effort={}  last-otel={}",
+            summary_row
+                .as_ref()
+                .and_then(|row| row.model.as_deref())
+                .unwrap_or(model.as_deref().unwrap_or("-")),
+            summary_row
+                .as_ref()
+                .and_then(|row| row.effort.as_deref())
+                .unwrap_or(effort.as_deref().unwrap_or("-")),
+            activity_age_label(
+                summary_row
+                    .as_ref()
+                    .and_then(|row| row.otel_last_activity_unix)
+            )
         ))),
         Line::from(Span::raw(format!(
             "api={}  sse={}  tool={}  errors={}  last={}",
@@ -2086,11 +2249,7 @@ fn draw_stream_tui(
 
     let items = if events.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
-            if metrics.total_events == 0 {
-                "No live OTel events captured for this session yet."
-            } else {
-                "No OTel events matched the current filter. Press `0` for all events."
-            },
+            stream_empty_state_message(summary_row.as_ref(), metrics.total_events, filter),
             Style::default().fg(Color::DarkGray),
         )))]
     } else {
@@ -2127,6 +2286,7 @@ fn draw_stream_tui(
         })
         .unwrap_or_else(|| {
             stream_empty_detail_lines(
+                summary_row.as_ref(),
                 filter,
                 metrics.total_events,
                 detail_width,
@@ -2249,6 +2409,7 @@ fn stream_detail_lines(
 }
 
 fn stream_empty_detail_lines(
+    row: Option<&CodexTopRow>,
     filter: TopStreamFilter,
     total_events: usize,
     width: usize,
@@ -2260,16 +2421,9 @@ fn stream_empty_detail_lines(
         "Esc back  f follow  j/k move  PgUp/PgDn page  0/a/s/t/e filter  [/] detail  {/} page  q quit",
         width,
     );
-    let message = status_message.clone().unwrap_or_else(|| {
-        if total_events == 0 {
-            "Waiting for the selected session to emit new OTel events.".to_string()
-        } else {
-            format!(
-                "Filter `{}` matched no events. Press `0` to show all captured events.",
-                filter.label()
-            )
-        }
-    });
+    let message = status_message
+        .clone()
+        .unwrap_or_else(|| stream_empty_state_message(row, total_events, filter));
     push_wrapped_key_value(&mut lines, "note=", &message, width);
     lines
 }

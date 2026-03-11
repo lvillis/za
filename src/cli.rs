@@ -12,12 +12,12 @@ pub struct Cli {
 /// Sub-command definitions
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Generate shell completion scripts
+    /// Print or install shell completions
     Completion {
         #[command(subcommand)]
         cmd: CompletionCommands,
     },
-    /// Summarize current Git workspace changes for review
+    /// Review current Git workspace changes
     Diff {
         /// Print JSON output for scripting.
         #[arg(long)]
@@ -44,7 +44,7 @@ pub enum Commands {
         #[arg(long, value_enum, value_name = "RISK")]
         exclude_risk: Vec<DiffRiskFilter>,
     },
-    /// Generate `CONTEXT.md`
+    /// Generate a project context snapshot
     Gen {
         #[arg(long, default_value_t = crate::command::DEFAULT_MAX_LINES_PER_FILE)]
         max_lines: usize,
@@ -59,7 +59,7 @@ pub enum Commands {
         #[arg(long, value_name = "REF")]
         r#ref: Option<String>,
     },
-    /// Audit Rust dependency governance and maintenance signals (crates.io + GitHub)
+    /// Audit Rust dependency risk and maintenance signals
     Deps {
         /// Optional path to Cargo.toml (defaults to current workspace root).
         #[arg(long, value_name = "PATH")]
@@ -94,7 +94,7 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: ToolCommands,
     },
-    /// Run a tool with proxy environment normalization
+    /// Run a tool with normalized proxy settings
     Run {
         /// Tool name, e.g. `codex`
         tool: String,
@@ -102,7 +102,7 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Manage long-lived Codex work sessions backed by tmux
+    /// Manage tmux-backed Codex work sessions
     Codex {
         #[command(subcommand)]
         cmd: Option<CodexCommands>,
@@ -110,7 +110,7 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Update za itself from GitHub releases
+    /// Update the za binary
     Update {
         /// Install to user-level paths (`~/.local/...`) instead of system-level paths.
         #[arg(long)]
@@ -122,17 +122,17 @@ pub enum Commands {
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
     },
-    /// Manage persisted za configuration values
+    /// Manage persisted za configuration
     Config {
         #[command(subcommand)]
         cmd: Option<ConfigCommands>,
     },
-    /// Manage JetBrains remote IDE server processes
+    /// Manage JetBrains remote IDE sessions
     Ide {
         #[command(subcommand)]
         cmd: IdeCommands,
     },
-    /// Unified GitHub shortcuts (`za gh auth`, `za gh ci`)
+    /// Run GitHub auth and CI shortcuts
     #[command(visible_alias = "github")]
     Gh {
         #[command(subcommand)]
@@ -143,17 +143,17 @@ pub enum Commands {
 /// `za tool` sub-commands
 #[derive(Subcommand)]
 pub enum ToolCommands {
-    /// Install a tool, e.g. `codex` or `codex:0.104.0`
+    /// Install a tool version
     Install {
         /// Tool spec in `name[:version]` format.
         spec: String,
     },
-    /// Update a tool to latest or a target version
+    /// Update a tool version
     Update {
         /// Tool spec in `name[:version]` format.
         spec: String,
     },
-    /// List tools and installed versions
+    /// List tool versions and update status
     List {
         /// Show built-in supported tools and source policies.
         #[arg(long)]
@@ -171,18 +171,18 @@ pub enum ToolCommands {
         #[arg(long)]
         fail_on_check_errors: bool,
     },
-    /// Sync tools from a manifest file (`za.tools.toml`)
+    /// Sync tool versions from a manifest
     Sync {
         /// Manifest path.
         #[arg(long, value_name = "PATH", default_value = "za.tools.toml")]
         file: PathBuf,
     },
-    /// Select the active tool version, e.g. `codex:0.104.0`
+    /// Activate an installed tool version
     Use {
         /// Tool reference in `name:version` format.
         image: String,
     },
-    /// Uninstall a tool version or all versions, e.g. `codex:0.104.0` or `codex`
+    /// Remove one or all installed tool versions
     Uninstall {
         /// Tool spec in `name[:version]` format.
         spec: String,
@@ -192,17 +192,17 @@ pub enum ToolCommands {
 /// `za completion` sub-commands
 #[derive(Subcommand)]
 pub enum CompletionCommands {
-    /// Print Bash completion script to stdout
+    /// Print Bash completion script
     Bash,
-    /// Print Zsh completion script to stdout
+    /// Print Zsh completion script
     Zsh,
-    /// Print Fish completion script to stdout
+    /// Print Fish completion script
     Fish,
-    /// Print Elvish completion script to stdout
+    /// Print Elvish completion script
     Elvish,
-    /// Print PowerShell completion script to stdout
+    /// Print PowerShell completion script
     Powershell,
-    /// Install a completion script into a common user-level path
+    /// Install a completion script into a user-level path
     Install {
         #[arg(value_enum)]
         shell: CompletionShell,

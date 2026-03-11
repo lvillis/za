@@ -211,7 +211,7 @@ fn render_download_progress_with_total_includes_percentage() {
 fn render_download_progress_without_total_omits_percentage() {
     let line = source::render_download_progress(512, None, Duration::from_secs(1));
     assert!(!line.contains('%'));
-    assert!(line.contains("Downloaded"));
+    assert!(line.contains("download:"));
 }
 
 #[test]

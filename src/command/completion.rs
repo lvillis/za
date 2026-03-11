@@ -17,6 +17,15 @@ const BASH_COMPLETION_LOADER_CANDIDATES: &[&str] = &[
     "/etc/bash_completion",
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileChange {
+    Created,
+    Updated,
+    Unchanged,
+    Removed,
+    Absent,
+}
+
 pub fn run(cmd: CompletionCommands) -> Result<i32> {
     match cmd {
         CompletionCommands::Bash => print_completion(CompletionShell::Bash),
@@ -50,16 +59,18 @@ fn install_completion(shell: CompletionShell, path_override: Option<PathBuf>) ->
         )
     })?;
     fs::create_dir_all(parent).with_context(|| format!("create `{}`", parent.display()))?;
-    fs::write(&target_path, render_completion(shell)?)
+    let file_change = write_if_changed(&target_path, &render_completion(shell)?)
         .with_context(|| format!("write completion to `{}`", target_path.display()))?;
-    let activation = ensure_shell_activation(shell, &target_path, custom_path)?;
+    let activation = ensure_shell_activation(shell, &target_path, custom_path, file_change)?;
 
     println!(
         "installed {} completion: {}",
         shell.label(),
         target_path.display()
     );
-    println!("activation: {}", activation.summary);
+    println!("activation: {}", activation.mode);
+    println!("status: {}", activation.status);
+    println!("availability: {}", activation.availability);
     if let Some(ref location) = activation.location {
         println!("location: {}", location.display());
     }
@@ -126,23 +137,51 @@ fn resolve_data_home() -> Result<PathBuf> {
         .unwrap_or(resolve_home()?.join(".local").join("share")))
 }
 
+fn write_if_changed(target_path: &Path, content: &[u8]) -> Result<FileChange> {
+    let existing = match fs::read(target_path) {
+        Ok(bytes) => Some(bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err).with_context(|| format!("read `{}`", target_path.display())),
+    };
+    let change = match existing {
+        None => FileChange::Created,
+        Some(ref bytes) if bytes == content => FileChange::Unchanged,
+        Some(_) => FileChange::Updated,
+    };
+    if !matches!(change, FileChange::Unchanged) {
+        fs::write(target_path, content)
+            .with_context(|| format!("write `{}`", target_path.display()))?;
+    }
+    Ok(change)
+}
+
 fn ensure_shell_activation(
     shell: CompletionShell,
     target_path: &Path,
     custom_path: bool,
+    file_change: FileChange,
 ) -> Result<CompletionActivation> {
     match shell {
-        CompletionShell::Bash => configure_bash_activation(target_path, custom_path),
+        CompletionShell::Bash => configure_bash_activation(target_path, custom_path, file_change),
         CompletionShell::Zsh => {
             let rc_path = resolve_zdotdir_or_home()?.join(".zshrc");
-            upsert_managed_block(
+            let rc_change = upsert_managed_block(
                 &rc_path,
                 ZSH_COMPLETION_START_MARKER,
                 ZSH_COMPLETION_END_MARKER,
                 &zsh_activation_block(target_path),
             )?;
             Ok(CompletionActivation {
-                summary: "managed zsh rc block".to_string(),
+                mode: "managed zsh rc block".to_string(),
+                status: format!(
+                    "completion file {}; zsh rc block {}",
+                    file_change.label(),
+                    rc_change.label()
+                ),
+                availability: format!(
+                    "ready after a new zsh shell, or `source {}`",
+                    rc_path.display()
+                ),
                 location: Some(rc_path.clone()),
                 reason: Some(
                     "zsh completion needs both `fpath` and `compinit`, so `za` manages a small rc block"
@@ -155,13 +194,19 @@ fn ensure_shell_activation(
             })
         }
         CompletionShell::Fish => Ok(CompletionActivation {
-            summary: "native fish completion directory".to_string(),
+            mode: "native fish completion directory".to_string(),
+            status: format!("completion file {}", file_change.label()),
+            availability:
+                "shell-native discovery; open a new fish shell if completion is not already active"
+                    .to_string(),
             location: target_path.parent().map(Path::to_path_buf),
             reason: None,
             next_step: Some("open a new fish shell".to_string()),
         }),
         CompletionShell::Elvish => Ok(CompletionActivation {
-            summary: "manual profile sourcing".to_string(),
+            mode: "manual profile sourcing".to_string(),
+            status: format!("completion file {}", file_change.label()),
+            availability: "available after you source it from your Elvish profile".to_string(),
             location: Some(target_path.to_path_buf()),
             reason: Some("`za` does not guess an Elvish profile path automatically".to_string()),
             next_step: Some(format!(
@@ -170,7 +215,10 @@ fn ensure_shell_activation(
             )),
         }),
         CompletionShell::Powershell => Ok(CompletionActivation {
-            summary: "manual profile sourcing".to_string(),
+            mode: "manual profile sourcing".to_string(),
+            status: format!("completion file {}", file_change.label()),
+            availability: "available after you dot-source it from your PowerShell profile"
+                .to_string(),
             location: Some(target_path.to_path_buf()),
             reason: Some("`za` does not guess a PowerShell profile path automatically".to_string()),
             next_step: Some(format!(
@@ -184,6 +232,7 @@ fn ensure_shell_activation(
 fn configure_bash_activation(
     target_path: &Path,
     custom_path: bool,
+    file_change: FileChange,
 ) -> Result<CompletionActivation> {
     let rc_path = resolve_home()?.join(".bashrc");
     let default_path = default_install_path(CompletionShell::Bash)?;
@@ -191,13 +240,26 @@ fn configure_bash_activation(
         && target_path == default_path
         && let Some(loader_path) = detect_bash_completion_loader()?
     {
-        remove_managed_block(
+        let rc_change = remove_managed_block(
             &rc_path,
             BASH_COMPLETION_START_MARKER,
             BASH_COMPLETION_END_MARKER,
         )?;
         return Ok(CompletionActivation {
-            summary: "bash-completion discovery".to_string(),
+            mode: "system bash-completion loader".to_string(),
+            status: match rc_change {
+                FileChange::Removed => format!(
+                    "completion file {}; cleaned previous managed bash rc block",
+                    file_change.label()
+                ),
+                _ => format!(
+                    "completion file {}; using system-managed bash completion",
+                    file_change.label()
+                ),
+            },
+            availability:
+                "shell-native discovery; open a new bash shell if completion is not already active"
+                    .to_string(),
             location: Some(loader_path),
             reason: Some(
                 "detected a bash startup path that already loads the standard bash-completion framework"
@@ -207,7 +269,7 @@ fn configure_bash_activation(
         });
     }
 
-    upsert_managed_block(
+    let rc_change = upsert_managed_block(
         &rc_path,
         BASH_COMPLETION_START_MARKER,
         BASH_COMPLETION_END_MARKER,
@@ -221,7 +283,13 @@ fn configure_bash_activation(
             .to_string()
     };
     Ok(CompletionActivation {
-        summary: "managed bash rc block".to_string(),
+        mode: "managed bash rc block".to_string(),
+        status: format!(
+            "completion file {}; bash rc block {}",
+            file_change.label(),
+            rc_change.label()
+        ),
+        availability: format!("ready after a new bash shell, or `. {}`", rc_path.display()),
         location: Some(rc_path.clone()),
         reason: Some(reason),
         next_step: Some(format!(
@@ -236,14 +304,14 @@ fn upsert_managed_block(
     start_marker: &str,
     end_marker: &str,
     body: &str,
-) -> Result<()> {
+) -> Result<FileChange> {
     let existing = match fs::read_to_string(target_path) {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(err).with_context(|| format!("read `{}`", target_path.display())),
     };
     let block = format!("{start_marker}\n{body}\n{end_marker}");
-    let updated = if let Some(start) = existing.find(start_marker) {
+    let (updated, change) = if let Some(start) = existing.find(start_marker) {
         let end = existing[start..]
             .find(end_marker)
             .map(|offset| start + offset + end_marker.len())
@@ -253,28 +321,45 @@ fn upsert_managed_block(
                     target_path.display()
                 )
             })?;
-        format!(
+        let updated = format!(
             "{}{}{}",
             &existing[..start],
             block,
             &existing[end..].trim_start_matches('\n')
-        )
+        );
+        let change = if updated == existing {
+            FileChange::Unchanged
+        } else {
+            FileChange::Updated
+        };
+        (updated, change)
     } else if existing.trim().is_empty() {
-        format!("{block}\n")
+        (format!("{block}\n"), FileChange::Created)
     } else {
-        format!("{}\n\n{block}\n", existing.trim_end())
+        (
+            format!("{}\n\n{block}\n", existing.trim_end()),
+            FileChange::Created,
+        )
     };
-    fs::write(target_path, updated).with_context(|| format!("write `{}`", target_path.display()))
+    if !matches!(change, FileChange::Unchanged) {
+        fs::write(target_path, updated)
+            .with_context(|| format!("write `{}`", target_path.display()))?;
+    }
+    Ok(change)
 }
 
-fn remove_managed_block(target_path: &Path, start_marker: &str, end_marker: &str) -> Result<()> {
+fn remove_managed_block(
+    target_path: &Path,
+    start_marker: &str,
+    end_marker: &str,
+) -> Result<FileChange> {
     let existing = match fs::read_to_string(target_path) {
         Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(FileChange::Absent),
         Err(err) => return Err(err).with_context(|| format!("read `{}`", target_path.display())),
     };
     let Some(start) = existing.find(start_marker) else {
-        return Ok(());
+        return Ok(FileChange::Absent);
     };
     let end = existing[start..]
         .find(end_marker)
@@ -293,7 +378,9 @@ fn remove_managed_block(target_path: &Path, start_marker: &str, end_marker: &str
         (false, true) => format!("{prefix}\n"),
         (false, false) => format!("{prefix}\n\n{suffix}\n"),
     };
-    fs::write(target_path, updated).with_context(|| format!("write `{}`", target_path.display()))
+    fs::write(target_path, updated)
+        .with_context(|| format!("write `{}`", target_path.display()))?;
+    Ok(FileChange::Removed)
 }
 
 fn detect_bash_completion_loader() -> Result<Option<PathBuf>> {
@@ -394,10 +481,24 @@ impl CompletionShell {
 }
 
 struct CompletionActivation {
-    summary: String,
+    mode: String,
+    status: String,
+    availability: String,
     location: Option<PathBuf>,
     reason: Option<String>,
     next_step: Option<String>,
+}
+
+impl FileChange {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Updated => "updated",
+            Self::Unchanged => "unchanged",
+            Self::Removed => "removed",
+            Self::Absent => "unchanged",
+        }
+    }
 }
 
 impl From<CompletionShell> for Shell {

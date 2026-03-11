@@ -86,6 +86,7 @@ pub fn run(options: DiffRunOptions) -> Result<i32> {
                     use_unicode_stat: unicode_diff_stat_enabled(),
                     name_only: options.name_only,
                     terminal_width: terminal_width(),
+                    interactive: io::stdout().is_terminal(),
                 },
             )
         );
@@ -232,6 +233,22 @@ struct RenderOptions {
     use_unicode_stat: bool,
     name_only: bool,
     terminal_width: Option<usize>,
+    interactive: bool,
+}
+
+#[derive(Clone, Copy)]
+enum DiffScopeLabelMode {
+    Full,
+    Compact,
+}
+
+#[derive(Clone, Copy)]
+struct DiffTableLayout {
+    path_width: usize,
+    scope_width: usize,
+    show_attention: bool,
+    show_stat: bool,
+    scope_mode: DiffScopeLabelMode,
 }
 
 #[derive(Clone, Copy)]
@@ -1042,9 +1059,9 @@ fn detect_risks(entry: &DiffFileStat, risk_policy: &DiffRiskPolicy) -> Vec<DiffR
 fn risk_sort_rank(kind: DiffRiskKind) -> usize {
     match kind {
         DiffRiskKind::Large => 0,
-        DiffRiskKind::Binary => 1,
+        DiffRiskKind::Config => 1,
         DiffRiskKind::Ci => 2,
-        DiffRiskKind::Config => 3,
+        DiffRiskKind::Binary => 3,
         DiffRiskKind::Lockfile => 4,
         DiffRiskKind::Generated => 5,
     }
@@ -1092,10 +1109,11 @@ fn sort_section_entries(entries: &mut [DiffFileStat]) {
 
 fn sort_review_entries(entries: &mut [DiffFileStat]) {
     entries.sort_by(|a, b| {
-        review_scope_rank(a)
-            .cmp(&review_scope_rank(b))
-            .then_with(|| review_risk_rank(a).cmp(&review_risk_rank(b)))
+        review_risk_rank(a)
+            .cmp(&review_risk_rank(b))
+            .then_with(|| review_category_rank(a).cmp(&review_category_rank(b)))
             .then_with(|| review_impact(b).cmp(&review_impact(a)))
+            .then_with(|| review_scope_rank(a).cmp(&review_scope_rank(b)))
             .then_with(|| diff_status_rank(a.status).cmp(&diff_status_rank(b.status)))
             .then_with(|| a.path.cmp(&b.path))
     });
@@ -1117,6 +1135,85 @@ fn review_scope_rank(entry: &DiffFileStat) -> usize {
 fn review_impact(entry: &DiffFileStat) -> u64 {
     let diff = entry.additions.saturating_add(entry.deletions);
     if entry.binary { diff.max(1) } else { diff }
+}
+
+fn review_category_rank(entry: &DiffFileStat) -> usize {
+    let path = entry.path.to_ascii_lowercase();
+    if is_config_like_path(&path) || is_ci_like_path(&path) {
+        return 0;
+    }
+    if is_source_like_path(&path) {
+        return 1;
+    }
+    if is_test_like_path(&path) {
+        return 2;
+    }
+    if is_doc_like_path(&path) {
+        return 3;
+    }
+    if entry.risks.iter().any(|risk| {
+        matches!(
+            risk.kind,
+            DiffRiskKind::Binary | DiffRiskKind::Generated | DiffRiskKind::Lockfile
+        )
+    }) {
+        return 5;
+    }
+    4
+}
+
+fn is_ci_like_path(path: &str) -> bool {
+    path.starts_with(".github/workflows/")
+        || path.starts_with(".gitlab-ci")
+        || path.ends_with("/ci.yml")
+        || path.ends_with("/ci.yaml")
+}
+
+fn is_config_like_path(path: &str) -> bool {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    CONFIG_NAMES
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(file_name))
+        || path.ends_with(".toml")
+        || path.ends_with(".yaml")
+        || path.ends_with(".yml")
+        || path.ends_with(".json")
+        || path.ends_with(".env")
+        || path.ends_with(".ini")
+        || path.ends_with(".cfg")
+        || path.ends_with(".conf")
+        || path.ends_with(".service")
+        || path.ends_with(".sh")
+}
+
+fn is_source_like_path(path: &str) -> bool {
+    path.starts_with("src/")
+        || path.starts_with("app/")
+        || path.starts_with("lib/")
+        || [
+            ".rs", ".go", ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".swift", ".rb",
+            ".php", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs",
+        ]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+}
+
+fn is_test_like_path(path: &str) -> bool {
+    path.starts_with("tests/")
+        || path.contains("/tests/")
+        || path.contains("/test/")
+        || path.ends_with("_test.rs")
+        || path.ends_with(".spec.ts")
+        || path.ends_with(".spec.js")
+        || path.ends_with(".test.ts")
+        || path.ends_with(".test.js")
+}
+
+fn is_doc_like_path(path: &str) -> bool {
+    path.starts_with("docs/")
+        || path.ends_with(".md")
+        || path.ends_with(".rst")
+        || path.ends_with(".txt")
 }
 
 fn git_head_short(repo_root: &Path) -> Result<Option<String>> {
@@ -1298,33 +1395,11 @@ fn render_diff_report(report: &DiffWorkspaceOutput, options: RenderOptions) -> S
     let review_entries = &report.total.file_stats;
     if !review_entries.is_empty() {
         lines.push(String::new());
-        let path_width = path_column_width(review_entries, options);
-        let scope_width = review_entries
-            .iter()
-            .map(review_scope_label)
-            .map(|scope| scope.chars().count())
-            .max()
-            .unwrap_or_default()
-            .max(9);
-        let show_attention = show_attention_column(review_entries);
+        let layout = diff_table_layout(review_entries, options);
         if options.name_only {
-            render_name_only_table(
-                &mut lines,
-                review_entries,
-                use_color,
-                path_width,
-                scope_width,
-                show_attention,
-            );
+            render_name_only_table(&mut lines, review_entries, use_color, layout);
         } else {
-            render_full_table(
-                &mut lines,
-                review_entries,
-                options,
-                path_width,
-                scope_width,
-                show_attention,
-            );
+            render_full_table(&mut lines, review_entries, options, layout);
         }
     }
 
@@ -1461,7 +1536,42 @@ fn risk_summary_label(kind: DiffRiskKind, risk_policy: &DiffRiskPolicy) -> Strin
     }
 }
 
-fn path_column_width(entries: &[DiffFileStat], options: RenderOptions) -> usize {
+fn diff_table_layout(entries: &[DiffFileStat], options: RenderOptions) -> DiffTableLayout {
+    let show_attention = show_attention_column(entries);
+    let scope_mode = match options.terminal_width {
+        Some(width) if width < 112 => DiffScopeLabelMode::Compact,
+        None if !options.interactive => DiffScopeLabelMode::Compact,
+        _ => DiffScopeLabelMode::Full,
+    };
+    let show_stat =
+        options.interactive && !options.name_only && options.terminal_width.unwrap_or(120) >= 96;
+    let scope_width = entries
+        .iter()
+        .map(|entry| review_scope_label(entry, scope_mode))
+        .map(|scope| scope.chars().count())
+        .max()
+        .unwrap_or_default()
+        .max(match scope_mode {
+            DiffScopeLabelMode::Full => 9,
+            DiffScopeLabelMode::Compact => 5,
+        });
+    let path_width = path_column_width(entries, options, scope_width, show_attention, show_stat);
+    DiffTableLayout {
+        path_width,
+        scope_width,
+        show_attention,
+        show_stat,
+        scope_mode,
+    }
+}
+
+fn path_column_width(
+    entries: &[DiffFileStat],
+    options: RenderOptions,
+    scope_width: usize,
+    show_attention: bool,
+    show_stat: bool,
+) -> usize {
     let observed = entries
         .iter()
         .map(review_path_plain)
@@ -1473,11 +1583,13 @@ fn path_column_width(entries: &[DiffFileStat], options: RenderOptions) -> usize 
         return observed;
     };
 
-    let attention_width = if show_attention_column(entries) { 3 } else { 0 };
+    let attention_width = if show_attention { 3 } else { 0 };
     let fixed_width = if options.name_only {
-        2 + attention_width + 9 + 2 + 4
+        2 + attention_width + scope_width + 2 + 4
+    } else if show_stat {
+        2 + 2 + attention_width + scope_width + 2 + 8 + 2 + 8 + 2 + DIFF_STAT_BLOCK_COUNT
     } else {
-        2 + 2 + attention_width + 9 + 2 + 8 + 2 + 8 + 2 + DIFF_STAT_BLOCK_COUNT
+        2 + 2 + attention_width + scope_width + 2 + 8 + 2 + 8
     };
     let available = terminal_width
         .saturating_sub(fixed_width + 4)
@@ -1493,31 +1605,36 @@ fn render_name_only_table(
     lines: &mut Vec<String>,
     entries: &[DiffFileStat],
     use_color: bool,
-    path_width: usize,
-    scope_width: usize,
-    show_attention: bool,
+    layout: DiffTableLayout,
 ) {
     lines.push(format!(
         "{}{}  {}  {}{}",
         style_dim("st", use_color),
-        render_attention_header(show_attention, use_color),
-        style_dim(&format!("{:<scope_width$}", "scope"), use_color),
+        render_attention_header(layout.show_attention, use_color),
+        style_dim(
+            &format!("{:<width$}", "scope", width = layout.scope_width),
+            use_color
+        ),
         style_dim("file", use_color),
-        " ".repeat(path_width.saturating_sub(4)),
+        " ".repeat(layout.path_width.saturating_sub(4)),
     ));
 
     for entry in entries {
         let status_label = format!("{:>2}", entry.status.short_label());
-        let scope_label = review_scope_label(entry);
-        let path_plain = review_path_plain_with_width(entry, path_width);
-        let path_rendered = review_path_rendered(entry, path_width, use_color);
-        let visible_path_width = path_plain.chars().count().min(path_width);
-        let path_padding = " ".repeat(path_width.saturating_sub(visible_path_width));
+        let scope_label = review_scope_label(entry, layout.scope_mode);
+        let path_plain = review_path_plain_with_width(entry, layout.path_width);
+        let path_rendered = review_path_rendered(entry, layout.path_width, use_color);
+        let visible_path_width = path_plain.chars().count().min(layout.path_width);
+        let path_padding = " ".repeat(layout.path_width.saturating_sub(visible_path_width));
         lines.push(format!(
             "{}{}  {}  {}{}",
             style_status(entry.status, &status_label, use_color),
-            render_attention_column(entry, show_attention, use_color),
-            style_scope(&format!("{scope_label:<scope_width$}"), entry, use_color),
+            render_attention_column(entry, layout.show_attention, use_color),
+            style_scope(
+                &format!("{scope_label:<width$}", width = layout.scope_width),
+                entry,
+                use_color
+            ),
             path_rendered,
             path_padding,
         ));
@@ -1528,9 +1645,7 @@ fn render_full_table(
     lines: &mut Vec<String>,
     entries: &[DiffFileStat],
     options: RenderOptions,
-    path_width: usize,
-    scope_width: usize,
-    show_attention: bool,
+    layout: DiffTableLayout,
 ) {
     let use_color = options.use_color;
     let max_stat_total = entries
@@ -1538,48 +1653,102 @@ fn render_full_table(
         .map(|entry| entry.additions.saturating_add(entry.deletions))
         .max()
         .unwrap_or_default();
-    lines.push(format!(
-        "{}{}  {}  {}{}  {}  {}  {}",
-        style_dim("st", use_color),
-        render_attention_header(show_attention, use_color),
-        style_dim(&format!("{:<scope_width$}", "scope"), use_color),
-        style_dim("file", use_color),
-        " ".repeat(path_width.saturating_sub(4)),
-        style_dim(&format!("{:>8}", "+add"), use_color),
-        style_dim(&format!("{:>8}", "-del"), use_color),
-        style_dim(&format!("{:<DIFF_STAT_BLOCK_COUNT$}", "stat"), use_color),
-    ));
+    lines.push(if layout.show_stat {
+        format!(
+            "{}{}  {}  {}{}  {}  {}  {}",
+            style_dim("st", use_color),
+            render_attention_header(layout.show_attention, use_color),
+            style_dim(
+                &format!("{:<width$}", "scope", width = layout.scope_width),
+                use_color
+            ),
+            style_dim("file", use_color),
+            " ".repeat(layout.path_width.saturating_sub(4)),
+            colorize_additions(format!("{:>8}", "+add"), use_color),
+            colorize_deletions(format!("{:>8}", "-del"), use_color),
+            style_dim(&format!("{:<DIFF_STAT_BLOCK_COUNT$}", "stat"), use_color),
+        )
+    } else {
+        format!(
+            "{}{}  {}  {}{}  {}  {}",
+            style_dim("st", use_color),
+            render_attention_header(layout.show_attention, use_color),
+            style_dim(
+                &format!("{:<width$}", "scope", width = layout.scope_width),
+                use_color
+            ),
+            style_dim("file", use_color),
+            " ".repeat(layout.path_width.saturating_sub(4)),
+            colorize_additions(format!("{:>8}", "+add"), use_color),
+            colorize_deletions(format!("{:>8}", "-del"), use_color),
+        )
+    });
 
     for entry in entries {
         let status_label = format!("{:>2}", entry.status.short_label());
-        let scope_label = review_scope_label(entry);
-        let path_plain = review_path_plain_with_width(entry, path_width);
-        let path_rendered = review_path_rendered(entry, path_width, use_color);
-        let visible_path_width = path_plain.chars().count().min(path_width);
-        let path_padding = " ".repeat(path_width.saturating_sub(visible_path_width));
-        lines.push(if entry.binary {
+        let scope_label = review_scope_label(entry, layout.scope_mode);
+        let path_plain = review_path_plain_with_width(entry, layout.path_width);
+        let path_rendered = review_path_rendered(entry, layout.path_width, use_color);
+        let visible_path_width = path_plain.chars().count().min(layout.path_width);
+        let path_padding = " ".repeat(layout.path_width.saturating_sub(visible_path_width));
+        lines.push(if entry.binary && layout.show_stat {
             format!(
                 "{}{}  {}  {}{}  {}  {}",
                 style_status(entry.status, &status_label, use_color),
-                render_attention_column(entry, show_attention, use_color),
-                style_scope(&format!("{scope_label:<scope_width$}"), entry, use_color),
+                render_attention_column(entry, layout.show_attention, use_color),
+                style_scope(
+                    &format!("{scope_label:<width$}", width = layout.scope_width),
+                    entry,
+                    use_color
+                ),
                 path_rendered,
                 path_padding,
                 format_binary_column("binary", use_color),
                 render_empty_diff_stat(use_color, options.use_unicode_stat),
             )
-        } else {
+        } else if entry.binary {
             format!(
-                "{}{}  {}  {}{}  {}  {}  {}",
+                "{}{}  {}  {}{}  {}  {}",
                 style_status(entry.status, &status_label, use_color),
-                render_attention_column(entry, show_attention, use_color),
-                style_scope(&format!("{scope_label:<scope_width$}"), entry, use_color),
+                render_attention_column(entry, layout.show_attention, use_color),
+                style_scope(
+                    &format!("{scope_label:<width$}", width = layout.scope_width),
+                    entry,
+                    use_color
+                ),
+                path_rendered,
+                path_padding,
+                format_binary_column("binary", use_color),
+                style_dim(&format!("{:>8}", "-"), use_color),
+            )
+        } else {
+            let base = format!(
+                "{}{}  {}  {}{}  {}  {}",
+                style_status(entry.status, &status_label, use_color),
+                render_attention_column(entry, layout.show_attention, use_color),
+                style_scope(
+                    &format!("{scope_label:<width$}", width = layout.scope_width),
+                    entry,
+                    use_color
+                ),
                 path_rendered,
                 path_padding,
                 format_additions_column(&format!("+{}", entry.additions), use_color),
                 format_deletions_column(&format!("-{}", entry.deletions), use_color),
-                render_diff_stat_bar(entry, max_stat_total, use_color, options.use_unicode_stat),
-            )
+            );
+            if layout.show_stat {
+                format!(
+                    "{base}  {}",
+                    render_diff_stat_bar(
+                        entry,
+                        max_stat_total,
+                        use_color,
+                        options.use_unicode_stat
+                    )
+                )
+            } else {
+                base
+            }
         });
     }
 }
@@ -1622,16 +1791,25 @@ fn render_scope_summary(report: &DiffWorkspaceOutput, use_color: bool) -> String
     parts.join(&format!(" {} ", style_dim("·", use_color)))
 }
 
-fn review_scope_label(entry: &DiffFileStat) -> String {
+fn review_scope_label(entry: &DiffFileStat, mode: DiffScopeLabelMode) -> String {
     let mut labels = Vec::new();
     if entry.scopes.contains(&DiffScope::Unstaged) {
-        labels.push("unstaged");
+        labels.push(match mode {
+            DiffScopeLabelMode::Full => "unstaged",
+            DiffScopeLabelMode::Compact => "u",
+        });
     }
     if entry.scopes.contains(&DiffScope::Staged) {
-        labels.push("staged");
+        labels.push(match mode {
+            DiffScopeLabelMode::Full => "staged",
+            DiffScopeLabelMode::Compact => "s",
+        });
     }
     if entry.scopes.contains(&DiffScope::Untracked) {
-        labels.push("untracked");
+        labels.push(match mode {
+            DiffScopeLabelMode::Full => "untracked",
+            DiffScopeLabelMode::Compact => "?",
+        });
     }
     labels.join("+")
 }
@@ -1644,18 +1822,19 @@ fn review_path_plain_with_width(entry: &DiffFileStat, width: usize) -> String {
     if let Some(previous_path) = &entry.previous_path {
         let arrow_width = 4;
         if width <= arrow_width {
-            return truncate_middle(&format!("{previous_path} -> {}", entry.path), width);
+            return truncate_path_tail(&entry.path, width);
         }
         let total_width = width.saturating_sub(arrow_width);
-        let previous_width = total_width / 2;
-        let current_width = total_width.saturating_sub(previous_width);
+        let current_width = ((total_width as f64) * 0.6).round() as usize;
+        let current_width = current_width.clamp(1, total_width.saturating_sub(1).max(1));
+        let previous_width = total_width.saturating_sub(current_width);
         format!(
             "{} -> {}",
-            truncate_middle(previous_path, previous_width.max(1)),
-            truncate_middle(&entry.path, current_width.max(1)),
+            truncate_path_tail(previous_path, previous_width.max(1)),
+            truncate_path_tail(&entry.path, current_width.max(1)),
         )
     } else {
-        truncate_middle(&entry.path, width)
+        truncate_path_tail(&entry.path, width)
     }
 }
 
@@ -1663,50 +1842,48 @@ fn review_path_rendered(entry: &DiffFileStat, width: usize, use_color: bool) -> 
     if let Some(previous_path) = &entry.previous_path {
         let arrow_width = 4;
         if width <= arrow_width {
-            return style_path(
-                &truncate_middle(&format!("{previous_path} -> {}", entry.path), width),
-                use_color,
-            );
+            return style_path(&truncate_path_tail(&entry.path, width), use_color);
         }
         let total_width = width.saturating_sub(arrow_width);
-        let previous_width = total_width / 2;
-        let current_width = total_width.saturating_sub(previous_width);
+        let current_width = ((total_width as f64) * 0.6).round() as usize;
+        let current_width = current_width.clamp(1, total_width.saturating_sub(1).max(1));
+        let previous_width = total_width.saturating_sub(current_width);
         format!(
             "{} {} {}",
             style_path(
-                &truncate_middle(previous_path, previous_width.max(1)),
+                &truncate_path_tail(previous_path, previous_width.max(1)),
                 use_color
             ),
             style_dim("->", use_color),
             style_path(
-                &truncate_middle(&entry.path, current_width.max(1)),
+                &truncate_path_tail(&entry.path, current_width.max(1)),
                 use_color
             ),
         )
     } else {
-        style_path(&truncate_middle(&entry.path, width), use_color)
+        style_path(&truncate_path_tail(&entry.path, width), use_color)
     }
 }
 
-fn truncate_middle(value: &str, width: usize) -> String {
+fn truncate_path_tail(value: &str, width: usize) -> String {
     if value.chars().count() <= width {
         return value.to_string();
     }
     if width <= 1 {
         return "…".to_string();
     }
-    let prefix_width = (width - 1) / 2;
-    let suffix_width = width - 1 - prefix_width;
-    let prefix = value.chars().take(prefix_width).collect::<String>();
     let suffix = value
         .chars()
         .rev()
-        .take(suffix_width)
+        .take(width.saturating_sub(1))
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
         .collect::<String>();
-    format!("{prefix}…{suffix}")
+    if let Some(offset) = suffix.find('/') {
+        return format!("…{}", &suffix[offset..]);
+    }
+    format!("…{suffix}")
 }
 
 fn style_path(path: &str, use_color: bool) -> String {
@@ -2373,6 +2550,7 @@ mod tests {
             use_unicode_stat,
             name_only,
             terminal_width: Some(120),
+            interactive: true,
         }
     }
 }

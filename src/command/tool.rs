@@ -96,6 +96,51 @@ fn prepare_interruptible_tool_operation() -> Result<()> {
     Ok(())
 }
 
+fn print_tool_stage(stage: &str, message: impl AsRef<str>) {
+    if io::stdout().is_terminal() {
+        println!("{} {stage:<8} {}", tool_stage_icon(stage), message.as_ref());
+    } else {
+        println!("{stage:<8} {}", message.as_ref());
+    }
+}
+
+fn tool_stage_icon(stage: &str) -> &'static str {
+    match stage {
+        "resolve" => "🔎",
+        "update" => "⬆️",
+        "source" => "📦",
+        "install" => "📥",
+        "activate" => "✅",
+        "prune" => "🧹",
+        "next" => "ℹ️",
+        "done" => "✅",
+        _ => "•",
+    }
+}
+
+fn install_source_failure_guidance(err: &anyhow::Error) -> Option<&'static str> {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    if message.contains("timed out")
+        || message.contains("connection")
+        || message.contains("dns")
+        || message.contains("proxy")
+        || message.contains("status 5")
+    {
+        return Some("retryable failure: network or proxy access to the upstream release failed");
+    }
+    if message.contains("status 404")
+        || message.contains("missing valid sha256 digest")
+        || message.contains("sha256 mismatch")
+        || message.contains("unsupported tool")
+        || message.contains("does not contain expected asset")
+    {
+        return Some(
+            "non-retryable failure: source policy or upstream release contents need attention",
+        );
+    }
+    None
+}
+
 pub(super) fn is_interrupt_requested() -> bool {
     INTERRUPT_REQUESTED.load(Ordering::SeqCst)
 }
@@ -260,9 +305,15 @@ pub fn update_self(user: bool, check: bool, version: Option<String>) -> Result<i
     }
     let removed = prune_non_active_versions(&home, &installed)?;
     if !removed.is_empty() {
-        println!("🧹 Removed old versions for `za`: {}", removed.join(", "));
+        print_tool_stage(
+            "prune",
+            format!("removed old `za` versions: {}", removed.join(", ")),
+        );
     }
-    println!("✅ Self-update complete: {}", installed.image());
+    print_tool_stage(
+        "done",
+        format!("self-update complete: {}", installed.image()),
+    );
     Ok(0)
 }
 
@@ -651,7 +702,10 @@ fn install(
     } else if let Some(adopted) = adoption.as_ref() {
         adopted.version.clone()
     } else if action == ToolAction::Update {
-        println!("🔎 Resolving latest release for `{}`...", requested.name);
+        print_tool_stage(
+            "resolve",
+            format!("latest version for `{}`", requested.name),
+        );
         resolve_requested_version(&requested.name, None, proxy_scope)?
     } else {
         resolve_requested_version(&requested.name, None, proxy_scope)?
@@ -669,16 +723,16 @@ fn install(
                 if normalize_version(current) == normalize_version(&tool.version)
                     && already_installed =>
             {
-                println!(
-                    "✅ `{}` is already up-to-date at {}",
-                    tool.name, tool.version
+                print_tool_stage(
+                    "update",
+                    format!("`{}` already at {}", tool.name, tool.version),
                 );
             }
-            Some(current) => println!(
-                "⬆️  Updating `{}`: {} -> {}",
-                tool.name, current, tool.version
+            Some(current) => print_tool_stage(
+                "update",
+                format!("`{}` {} -> {}", tool.name, current, tool.version),
             ),
-            None => println!("⬆️  Updating `{}` to {}", tool.name, tool.version),
+            None => print_tool_stage("update", format!("`{}` -> {}", tool.name, tool.version)),
         }
     }
 
@@ -688,6 +742,10 @@ fn install(
         }
 
         let source = if let Some(adopted) = adoption.filter(|a| a.version == tool.version) {
+            print_tool_stage(
+                "source",
+                format!("adopting existing binary {}", adopted.path.display()),
+            );
             copy_executable(&adopted.path, &dst)?;
             InstallSource {
                 kind: SOURCE_KIND_ADOPTED,
@@ -695,10 +753,19 @@ fn install(
             }
         } else {
             ensure_not_interrupted()?;
-            if action == ToolAction::Update {
-                println!("⬇️  Downloading `{}` {} ...", tool.name, tool.version);
-            }
-            let src = resolve_install_source(&tool, proxy_scope)?;
+            print_tool_stage(
+                "source",
+                format!("fetching `{}` {}", tool.name, tool.version),
+            );
+            let src = match resolve_install_source(&tool, proxy_scope) {
+                Ok(src) => src,
+                Err(err) => {
+                    return Err(match install_source_failure_guidance(&err) {
+                        Some(guidance) => err.context(guidance),
+                        None => err,
+                    });
+                }
+            };
             ensure_not_interrupted()?;
             copy_executable(&src.path, &dst)?;
             InstallSource {
@@ -707,32 +774,44 @@ fn install(
             }
         };
         write_manifest(home, &tool, &source)?;
-        println!("📥 Installed {} from {}", tool.image(), source.detail);
+        print_tool_stage(
+            "install",
+            format!("{} from {}", tool.image(), source.detail),
+        );
     } else {
         ensure_manifest(home, &tool)?;
-        println!("📦 Already installed: {}", tool.image());
+        print_tool_stage("install", format!("already installed {}", tool.image()));
     }
 
     let should_activate = action == ToolAction::Update || previous_active.is_none();
     if should_activate {
         activate_tool(home, &tool)?;
-        println!(
-            "✅ Active version set: {} (bin: {})",
-            tool.image(),
-            home.bin_path(&tool.name).display()
+        print_tool_stage(
+            "activate",
+            format!(
+                "{} (bin: {})",
+                tool.image(),
+                home.bin_path(&tool.name).display()
+            ),
         );
         if action == ToolAction::Update && prune_after_update_activation {
             let removed = prune_non_active_versions(home, &tool)?;
             if !removed.is_empty() {
-                println!(
-                    "🧹 Removed old versions for `{}`: {}",
-                    tool.name,
-                    removed.join(", ")
+                print_tool_stage(
+                    "prune",
+                    format!(
+                        "removed old `{}` versions: {}",
+                        tool.name,
+                        removed.join(", ")
+                    ),
                 );
             }
         }
     } else if !already_installed {
-        println!("ℹ️  Run `za tool use {}` to activate it.", tool.image());
+        print_tool_stage(
+            "next",
+            format!("run `za tool use {}` to activate it", tool.image()),
+        );
     }
 
     Ok(tool)

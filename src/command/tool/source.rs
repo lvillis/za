@@ -517,9 +517,15 @@ fn download_from_url(
         let url_parts = parse_url_parts(url)?;
         let asset_name = url_parts.file_name.clone();
         let asset_path = download_root.join(&asset_name);
+        let interactive = io::stderr().is_terminal();
 
         let client = build_http_client(&url_parts.base_url, "za-tool-manager", true, proxy_scope)
             .context("build HTTP client")?;
+        print_download_stage(
+            interactive,
+            "download",
+            format!("probing server capabilities for `{asset_name}`"),
+        );
         let probe = probe_parallel_download_support(&client, &url_parts.path_and_query).unwrap_or(
             DownloadProbe {
                 total_bytes: 0,
@@ -529,13 +535,27 @@ fn download_from_url(
         let total_bytes = (probe.total_bytes > 0).then_some(probe.total_bytes);
 
         if let Some(plan) = build_parallel_download_plan(probe.total_bytes, probe.range_supported) {
+            print_download_stage(
+                interactive,
+                "download",
+                format!(
+                    "parallel transfer ({} parts, {})",
+                    plan.parts,
+                    format_bytes_u64(plan.total_bytes)
+                ),
+            );
             match download_to_path_parallel(&url_parts, url, &asset_path, proxy_scope, plan) {
                 Ok(()) => {}
                 Err(ParallelDownloadError::Unsupported(err)) => {
-                    eprintln!(
-                        "↩️  Parallel download unavailable for `{}`; falling back to single stream ({err:#})",
-                        asset_name
+                    print_download_stage(
+                        interactive,
+                        "download",
+                        format!(
+                            "range transfer unavailable for `{}`; retrying with single stream ({err:#})",
+                            asset_name
+                        ),
                     );
+                    print_download_stage(interactive, "download", "single-stream transfer");
                     download_to_path_single(
                         &client,
                         &url_parts.path_and_query,
@@ -547,6 +567,7 @@ fn download_from_url(
                 Err(ParallelDownloadError::Failed(err)) => return Err(err),
             }
         } else {
+            print_download_stage(interactive, "download", "single-stream transfer");
             download_to_path_single(
                 &client,
                 &url_parts.path_and_query,
@@ -558,10 +579,13 @@ fn download_from_url(
         ensure_not_interrupted()?;
 
         if let Some(expected_sha256) = expected_sha256 {
+            print_download_stage(interactive, "verify", "sha256");
             verify_sha256_file(&asset_path, expected_sha256)?;
+            print_download_stage(interactive, "verify", "sha256 ok");
         }
 
         let executable_path = if is_tar_gz_asset(&asset_name) {
+            print_download_stage(interactive, "extract", &asset_name);
             extract_tar_gz_executable(tool, &asset_path, &download_root)?
         } else {
             asset_path
@@ -703,7 +727,7 @@ fn download_to_path_single(
     if use_tty_line {
         eprint!(
             "\r{}",
-            render_download_progress(downloaded, total_bytes, start.elapsed())
+            render_download_progress_line(downloaded, total_bytes, start.elapsed(), true)
         );
         let _ = io::stderr().flush();
     }
@@ -847,10 +871,11 @@ fn spawn_parallel_download_reporter(
         if tty_line {
             eprint!(
                 "\r{}",
-                render_download_progress(
+                render_download_progress_line(
                     progress.load(Ordering::SeqCst),
                     total_bytes,
-                    start.elapsed()
+                    start.elapsed(),
+                    true
                 )
             );
             let _ = io::stderr().flush();
@@ -1049,6 +1074,27 @@ fn format_bytes_f64(bytes: f64) -> String {
     }
 }
 
+fn print_download_stage(interactive: bool, stage: &str, message: impl AsRef<str>) {
+    if interactive {
+        eprintln!(
+            "{} {stage}: {}",
+            download_stage_icon(stage),
+            message.as_ref()
+        );
+    } else {
+        eprintln!("{stage}: {}", message.as_ref());
+    }
+}
+
+fn download_stage_icon(stage: &str) -> &'static str {
+    match stage {
+        "download" => "⬇️",
+        "verify" => "🔐",
+        "extract" => "📦",
+        _ => "•",
+    }
+}
+
 pub(super) fn render_download_progress(
     downloaded: u64,
     total_bytes: Option<u64>,
@@ -1064,17 +1110,31 @@ pub(super) fn render_download_progress(
         Some(total) if total > 0 => {
             let pct = (downloaded as f64 / total as f64 * 100.0).clamp(0.0, 100.0);
             format!(
-                "⬇️  Downloaded {} / {} ({pct:.1}%, {}/s)",
+                "download: {} / {} ({pct:.1}%, {}/s)",
                 format_bytes_u64(downloaded),
                 format_bytes_u64(total),
                 format_bytes_f64(rate)
             )
         }
         _ => format!(
-            "⬇️  Downloaded {} ({}/s)",
+            "download: {} ({}/s)",
             format_bytes_u64(downloaded),
             format_bytes_f64(rate)
         ),
+    }
+}
+
+fn render_download_progress_line(
+    downloaded: u64,
+    total_bytes: Option<u64>,
+    elapsed: Duration,
+    interactive: bool,
+) -> String {
+    let line = render_download_progress(downloaded, total_bytes, elapsed);
+    if interactive {
+        format!("{} {line}", download_stage_icon("download"))
+    } else {
+        line
     }
 }
 
@@ -1090,7 +1150,7 @@ fn report_download_progress(
     if !force && now.duration_since(*last_report) < Duration::from_secs(1) {
         return;
     }
-    let line = render_download_progress(downloaded, total_bytes, elapsed);
+    let line = render_download_progress_line(downloaded, total_bytes, elapsed, tty_line);
     if tty_line {
         if force {
             eprint!("\r{line}\n");

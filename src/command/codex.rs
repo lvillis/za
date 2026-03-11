@@ -1055,10 +1055,11 @@ mod tests {
             model: Some("gpt-5.4".to_string()),
             effort: Some("xhigh".to_string()),
             context_left_percent: None,
-            status: "LIVE".to_string(),
+            status: "connected".to_string(),
             tmux_running: true,
             attached_clients: 1,
             last_activity_unix: Some(now),
+            otel_last_activity_unix: Some(now),
             last_event_name: Some("codex.conversation_turn_complete".to_string()),
             otel_events: 2,
             api_requests: 1,
@@ -1068,6 +1069,7 @@ mod tests {
             lifetime_tool_errors: 0,
             sse_events: 1,
             live_otel: true,
+            status_detail: "tmux active and live OTel is flowing".to_string(),
         }];
         app.otel_state.sessions.insert(
             "latest-id".to_string(),

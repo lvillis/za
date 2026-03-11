@@ -159,7 +159,7 @@ za diff --exclude-risk generated --exclude-risk lockfile
 za diff --name-only
 ```
 
-The terminal report is review-oriented: it shows one merged file list with status markers (`M/A/D/R/?`), a narrow attention marker (`!` high, `~` medium), scope labels (`staged`, `unstaged`, `untracked`), directory-dimmed file paths, rename arrows, colored `+`/`-` counts on TTY output, and a compact 5-block `STAT` diffstat column so larger files stand out immediately without taking over the row. Risk kinds (`large`, `ci`, `config`, `lock`, `generated`, `binary`) stay in the top `attention` summary and JSON output instead of occupying a wide per-row column. The `large` cutoff is computed from recent Git history (`p90`, clamped to a sane range) and falls back to a fixed threshold when history is too shallow. Use `--path` for gitignore-style path globs, scope flags such as `--staged` / `--unstaged` / `--untracked` to narrow review focus, `--exclude-risk` to hide noisy generated or lockfile churn, and `--name-only` when you only want the review queue. Binary files are counted separately and excluded from `+/-` line totals. `--json` now carries stable filter metadata, risk policy metadata, workspace totals, renamed path fields, and per-file risk tags; use `--json --files` when you also want per-file detail in machine-readable output.
+The terminal report is review-oriented: it shows one merged file list with status markers (`M/A/D/R/?`), a narrow attention marker (`!` high, `~` medium), scope labels (`staged`, `unstaged`, `untracked`), directory-dimmed file paths, rename arrows, colored `+`/`-` counts on TTY output, and a compact 5-block `STAT` diffstat column so larger files stand out immediately without taking over the row. On narrower terminals, scope labels compact automatically and file paths bias toward the trailing path/file name so the part you actually review stays visible; redirected non-TTY output drops the stat bar and stays plain. Risk kinds (`large`, `ci`, `config`, `lock`, `generated`, `binary`) stay in the top `attention` summary and JSON output instead of occupying a wide per-row column. The `large` cutoff is computed from recent Git history (`p90`, clamped to a sane range) and falls back to a fixed threshold when history is too shallow. Use `--path` for gitignore-style path globs, scope flags such as `--staged` / `--unstaged` / `--untracked` to narrow review focus, `--exclude-risk` to hide noisy generated or lockfile churn, and `--name-only` when you only want the review queue. Binary files are counted separately and excluded from `+/-` line totals. `--json` now carries stable filter metadata, risk policy metadata, workspace totals, renamed path fields, and per-file risk tags; use `--json --files` when you also want per-file detail in machine-readable output.
 
 ## Shell Completion
 
@@ -179,7 +179,7 @@ za completion install zsh
 za completion install fish
 ```
 
-`za completion install` prints the activation strategy it chose. Bash prefers native `bash-completion` discovery when a loader is detected and falls back to a managed `~/.bashrc` block otherwise; zsh uses a managed `~/.zshrc` block so `fpath` and `compinit` are wired consistently.
+`za completion install` now prints the activation mode, change status, and availability. Bash prefers the system `bash-completion` loader when a loader is detected and falls back to a managed `~/.bashrc` block otherwise; zsh uses a managed `~/.zshrc` block so `fpath` and `compinit` are wired consistently.
 
 Use `--path` when you want a non-default target, or for shells without a built-in install target:
 
@@ -248,8 +248,8 @@ za tool uninstall codex:0.104.0
 za tool uninstall codex
 ```
 
-`za tool update` is interruption-safe: pressing `Ctrl+C` aborts cleanly and temporary download directories are removed automatically (stale leftovers are cleaned on next run).
-For large GitHub release assets, `za` will use parallel HTTP range downloads when the upstream supports it, and automatically fall back to a single stream otherwise.
+`za tool update` is interruption-safe: pressing `Ctrl+C` aborts cleanly and temporary download directories are removed automatically (stale leftovers are cleaned on next run). Install and update output is stage-oriented (`resolve`, `source`, `install`, `activate`, `prune`) so it is obvious where a run is spending time.
+For large GitHub release assets, `za` will use parallel HTTP range downloads when the upstream supports it, emit explicit `download` / `verify` / `extract` stages, and automatically fall back to a single stream otherwise.
 
 ### Existing binaries adoption
 
