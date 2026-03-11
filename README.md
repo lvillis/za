@@ -179,6 +179,8 @@ za completion install zsh
 za completion install fish
 ```
 
+`za completion install` prints the activation strategy it chose. Bash prefers native `bash-completion` discovery when a loader is detected and falls back to a managed `~/.bashrc` block otherwise; zsh uses a managed `~/.zshrc` block so `fpath` and `compinit` are wired consistently.
+
 Use `--path` when you want a non-default target, or for shells without a built-in install target:
 
 ```bash
