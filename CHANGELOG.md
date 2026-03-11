@@ -1,8 +1,17 @@
+## [0.1.30] - 2026-03-11
+
+### 🐛 Bug Fixes
+
+- *(completion)* Add managed activation fallback and install messaging
 ## [0.1.29] - 2026-03-11
 
 ### 🚀 Features
 
 - *(completion)* Add shell completion install support
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.29
 ## [0.1.28] - 2026-03-10
 
 ### 🚀 Features
