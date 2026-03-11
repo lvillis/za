@@ -1,9 +1,18 @@
+## [0.1.29] - 2026-03-11
+
+### 🚀 Features
+
+- *(completion)* Add shell completion install support
 ## [0.1.28] - 2026-03-10
 
 ### 🚀 Features
 
 - *(diff)* Add github-style stat blocks
 - *(diff)* Add adaptive large-change risk threshold
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.28
 ## [0.1.27] - 2026-03-10
 
 ### 🚀 Features
