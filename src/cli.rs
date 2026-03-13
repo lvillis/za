@@ -86,7 +86,7 @@ pub enum Commands {
         #[arg(long)]
         fail_on_high: bool,
     },
-    /// Manage versioned CLI tools
+    /// Manage CLI tools in the current scope
     Tool {
         /// Use user-level paths (`~/.local/...`) instead of system-level paths.
         #[arg(long)]
@@ -143,33 +143,58 @@ pub enum Commands {
 /// `za tool` sub-commands
 #[derive(Subcommand)]
 pub enum ToolCommands {
-    /// Install a tool version
+    /// Install a tool and make it active in this scope
+    #[command(alias = "pull")]
     Install {
-        /// Tool spec in `name[:version]` format.
-        spec: String,
-    },
-    /// Update a tool version
-    Update {
-        /// Tool spec in `name[:version]` format.
-        spec: String,
-    },
-    /// List tool versions and update status
-    List {
-        /// Show built-in supported tools and source policies.
+        /// Tool name, e.g. `codex`
+        tool: String,
+        /// Install a specific version instead of the latest release.
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+        /// Adopt an existing unmanaged binary already present in this scope.
         #[arg(long)]
-        supported: bool,
-        /// Query upstream releases and show whether updates are available.
-        #[arg(long)]
-        updates: bool,
+        adopt: bool,
+    },
+    /// List managed tools and availability in this scope
+    #[command(name = "ls", alias = "list")]
+    Ls {
+        /// Tool names. Only valid together with `--outdated`.
+        tools: Vec<String>,
         /// Print JSON output for scripting.
         #[arg(long)]
         json: bool,
-        /// Return non-zero when updates are available (requires `--updates`).
+        /// List built-in supported tools and source policies.
+        #[arg(long)]
+        supported: bool,
+        /// Check managed tools for newer upstream versions.
+        #[arg(long)]
+        outdated: bool,
+        /// Return non-zero when updates are available. Requires `--outdated`.
         #[arg(long)]
         fail_on_updates: bool,
-        /// Return non-zero when update checks fail (requires `--updates`).
+        /// Return non-zero when update checks fail. Requires `--outdated`.
         #[arg(long)]
         fail_on_check_errors: bool,
+    },
+    /// Update tools to the newest available version
+    Update {
+        /// Tool names. Omit to update all managed tools in this scope.
+        tools: Vec<String>,
+        /// Pin the update target to a specific version. Requires exactly one tool.
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+    },
+    /// Show detailed managed state for one tool
+    #[command(alias = "inspect")]
+    Show {
+        /// Tool name, e.g. `codex`
+        tool: String,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+        /// Only print the active managed executable path.
+        #[arg(long)]
+        path: bool,
     },
     /// Sync tool versions from a manifest
     Sync {
@@ -177,15 +202,48 @@ pub enum ToolCommands {
         #[arg(long, value_name = "PATH", default_value = "za.tools.toml")]
         file: PathBuf,
     },
-    /// Activate an installed tool version
-    Use {
-        /// Tool reference in `name:version` format.
-        image: String,
-    },
     /// Remove one or all installed tool versions
+    #[command(alias = "rm")]
     Uninstall {
-        /// Tool spec in `name[:version]` format.
-        spec: String,
+        /// Tool name, e.g. `codex`
+        tool: String,
+        /// Remove only one version instead of all managed versions.
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+    },
+    /// Print the active managed executable path for one tool
+    #[command(hide = true)]
+    Which {
+        /// Tool name, e.g. `codex`
+        tool: String,
+    },
+    /// List built-in supported tools and source policies
+    #[command(hide = true)]
+    Catalog {
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check installed tools for newer upstream versions
+    #[command(hide = true)]
+    Outdated {
+        /// Tool names. Omit to check all managed tools in this scope.
+        tools: Vec<String>,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+        /// Return non-zero when updates are available.
+        #[arg(long)]
+        fail_on_updates: bool,
+        /// Return non-zero when update checks fail.
+        #[arg(long)]
+        fail_on_check_errors: bool,
+    },
+    /// Adopt an existing unmanaged binary already present in this scope
+    #[command(hide = true)]
+    Adopt {
+        /// Tool name, e.g. `codex`
+        tool: String,
     },
 }
 
@@ -492,7 +550,7 @@ pub enum DiffRiskFilter {
 mod tests {
     use super::{
         CiCommands, Cli, CodexCommands, Commands, CompletionCommands, CompletionShell,
-        DiffRiskFilter, GhCommands, GitAuthCommands,
+        DiffRiskFilter, GhCommands, GitAuthCommands, ToolCommands,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -525,6 +583,110 @@ mod tests {
                 }
                 _ => panic!("unexpected completion command"),
             },
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn tool_install_parses_version_flag() {
+        let cli = Cli::try_parse_from(["za", "tool", "install", "codex", "--version", "0.105.0"])
+            .expect("must parse");
+        match cli.cmd {
+            Commands::Tool { user, cmd } => {
+                assert!(!user);
+                assert!(matches!(
+                    cmd,
+                    ToolCommands::Install {
+                        tool,
+                        version: Some(version),
+                        adopt: false,
+                    } if tool == "codex" && version == "0.105.0"
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn tool_update_parses_multiple_tools() {
+        let cli = Cli::try_parse_from(["za", "tool", "--user", "update", "codex", "rg"])
+            .expect("must parse");
+        match cli.cmd {
+            Commands::Tool { user, cmd } => {
+                assert!(user);
+                assert!(matches!(
+                    cmd,
+                    ToolCommands::Update { tools, version: None } if tools == vec!["codex", "rg"]
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn tool_outdated_parses_policy_flags() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "tool",
+            "ls",
+            "--json",
+            "--outdated",
+            "--fail-on-updates",
+            "codex",
+        ])
+        .expect("must parse");
+        match cli.cmd {
+            Commands::Tool { cmd, .. } => {
+                assert!(matches!(
+                    cmd,
+                    ToolCommands::Ls {
+                        tools,
+                        json: true,
+                        supported: false,
+                        outdated: true,
+                        fail_on_updates: true,
+                        fail_on_check_errors: false,
+                    } if tools == vec!["codex"]
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn tool_show_parses_path_flag() {
+        let cli =
+            Cli::try_parse_from(["za", "tool", "show", "codex", "--path"]).expect("must parse");
+        match cli.cmd {
+            Commands::Tool { cmd, .. } => {
+                assert!(matches!(
+                    cmd,
+                    ToolCommands::Show {
+                        tool,
+                        json: false,
+                        path: true,
+                    } if tool == "codex"
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn tool_install_parses_adopt_flag() {
+        let cli =
+            Cli::try_parse_from(["za", "tool", "install", "codex", "--adopt"]).expect("must parse");
+        match cli.cmd {
+            Commands::Tool { cmd, .. } => {
+                assert!(matches!(
+                    cmd,
+                    ToolCommands::Install {
+                        tool,
+                        version: None,
+                        adopt: true,
+                    } if tool == "codex"
+                ));
+            }
             _ => panic!("unexpected command"),
         }
     }

@@ -46,7 +46,9 @@ pub(crate) fn resolve_executable_path(name: &str) -> Result<PathBuf> {
         return Ok(path);
     }
 
-    bail!("tool `{name}` is not installed or active. install with `za tool install {name}` first")
+    bail!(
+        "tool `{name}` is not installed or active. install it with `za tool install {name}` first"
+    )
 }
 
 fn resolve_user_managed_active(name: &str) -> Result<Option<PathBuf>> {

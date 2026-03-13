@@ -53,7 +53,7 @@ za gen
 za gen --max-lines 800 --include-binary --output docs/CONTEXT.md
 ```
 
-### 2) Manage tool versions
+### 2) Manage CLI tools
 
 ```bash
 za tool install codex
@@ -64,9 +64,10 @@ za tool install tcping
 za tool install dust
 za tool install just
 
-za tool list
-za tool list --updates
+za tool ls
+za tool ls --outdated
 za tool update codex
+za tool show codex
 za run codex
 ```
 
@@ -138,7 +139,7 @@ za gh auth test --repo https://github.com/org/repo.git
 | `za diff` | Summarize current Git workspace additions/deletions for review. |
 | `za completion` | Generate shell completion scripts. |
 | `za gen` | Generate project context snapshots (`CONTEXT.md`). |
-| `za tool` | Install/update/list/use/uninstall managed binaries. |
+| `za tool` | Tool management with `install`, `update`, `ls`, `show`, and `uninstall`. |
 | `za run` | Launch a tool directly with normalized proxy environment variables. |
 | `za codex` | Manage long-lived Codex tmux sessions for the current workspace. |
 | `za deps` | Audit Rust dependency governance and maintenance risk. |
@@ -205,8 +206,8 @@ za completion install powershell --path ~/.config/powershell/completions/za.ps1
 Run:
 
 ```bash
-za tool list --supported
-za tool list --supported --json
+za tool ls --supported
+za tool ls --supported --json
 ```
 
 Current built-in tool policies:
@@ -224,36 +225,45 @@ Current built-in tool policies:
 ### Common workflows
 
 ```bash
-# install a specific version
-za tool install codex:0.105.0
+# install the latest release and make it active
+za tool install codex
 
-# switch active version
-za tool use codex:0.105.0
+# install a specific version and make it active
+za tool install codex --version 0.105.0
 
-# check updates (human + json)
-za tool list --updates
-za tool list --updates --json
+# inspect the current managed state
+za tool ls
+za tool show codex
+za tool show codex --path
+
+# check for newer upstream releases (human + json)
+za tool ls --outdated
+za tool ls --outdated --json
 
 # CI-friendly exit codes:
 # 20 => updates available
 # 21 => update checks failed
-za tool list --updates --fail-on-updates
-za tool list --updates --fail-on-check-errors
+za tool ls --outdated --fail-on-updates
+za tool ls --outdated --fail-on-check-errors
 
-# update keeps active binary current and auto-prunes old versions
+# update one tool or refresh everything managed in this scope
 za tool update codex
+za tool update
 
-# uninstall one or all versions
-za tool uninstall codex:0.104.0
+# adopt an existing unmanaged binary already on disk
+za tool install codex --adopt
+
+# uninstall one version or all managed versions
+za tool uninstall codex --version 0.104.0
 za tool uninstall codex
 ```
 
-`za tool update` is interruption-safe: pressing `Ctrl+C` aborts cleanly and temporary download directories are removed automatically (stale leftovers are cleaned on next run). Install and update output is stage-oriented (`resolve`, `source`, `install`, `activate`, `prune`) so it is obvious where a run is spending time.
+`za tool install` and `za tool update` are interruption-safe: pressing `Ctrl+C` aborts cleanly and temporary download directories are removed automatically (stale leftovers are cleaned on next run). Output is stage-oriented (`resolve`, `source`, `install`, `activate`, `prune`) so it is obvious where a run is spending time.
 For large GitHub release assets, `za` will use parallel HTTP range downloads when the upstream supports it, emit explicit `download` / `verify` / `extract` stages, and automatically fall back to a single stream otherwise.
 
 ### Existing binaries adoption
 
-If a supported unmanaged binary is already present in scope bin path (for example `/usr/local/bin/codex`), `za tool install <tool>` adopts it first by detecting local version.
+If a supported unmanaged binary is already present in scope bin path (for example `/usr/local/bin/codex`), use `za tool install <tool> --adopt` to move it into the managed store and make it active.
 
 ### Direct launch
 

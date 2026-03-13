@@ -7,6 +7,7 @@ mod source;
 use anyhow::{Context, Result, anyhow, bail};
 use flate2::read::GzDecoder;
 use fs4::fs_std::FileExt;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use regex::Regex;
 use reqx::{
     advanced::{ClientProfile, RedirectPolicy},
@@ -36,8 +37,8 @@ use tar::Archive;
 use std::os::unix::fs::PermissionsExt;
 
 #[cfg(test)]
-use self::listing::{LatestCheck, list_update_status};
-use self::listing::{UnmanagedBinary, list};
+use self::listing::{LatestCheck, latest_check_progress_message, list_update_status};
+use self::listing::{UnmanagedBinary, list_installed, list_outdated, show_catalog, show_tool};
 use self::policy::{
     GithubReleasePolicy, ToolPolicy, canonical_tool_name as canonical_tool_name_impl,
     find_tool_policy, supported_tool_names_csv, tool_policies,
@@ -50,6 +51,9 @@ const GITHUB_API_BASE: &str = "https://api.github.com";
 const HTTP_USER_AGENT: &str = "za-tool-manager/0.1";
 const MANIFEST_FILE: &str = "manifest.json";
 const LOCK_FILE: &str = ".tool.lock";
+const CURRENT_TMP_FILE_MARKER: &str = ".tmp-current-";
+const SELF_UPDATE_BACKUP_DIR: &str = ".self-update";
+const SELF_UPDATE_BACKUP_PREFIX: &str = "za-self-backup-";
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 const SOURCE_KIND_DOWNLOAD: &str = "download";
 const SOURCE_KIND_CARGO_INSTALL: &str = "cargo-install";
@@ -118,6 +122,31 @@ fn tool_stage_icon(stage: &str) -> &'static str {
     }
 }
 
+fn new_tool_progress_bar(
+    stage: &str,
+    total: usize,
+    message: impl Into<String>,
+) -> Option<ProgressBar> {
+    if total == 0 || !io::stderr().is_terminal() {
+        return None;
+    }
+
+    let progress = ProgressBar::new(total as u64);
+    progress.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+    progress.set_style(
+        ProgressStyle::with_template(
+            "{spinner} {prefix} [{bar:18.cyan/blue}] {pos}/{len} {wide_msg}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("=> ")
+        .tick_strings(&["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]),
+    );
+    progress.enable_steady_tick(Duration::from_millis(80));
+    progress.set_prefix(format!("{} {stage}", tool_stage_icon(stage)));
+    progress.set_message(message.into());
+    Some(progress)
+}
+
 fn install_source_failure_guidance(err: &anyhow::Error) -> Option<&'static str> {
     let message = format!("{err:#}").to_ascii_lowercase();
     if message.contains("timed out")
@@ -171,30 +200,7 @@ impl ToolScope {
     }
 }
 
-pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
-    prepare_interruptible_tool_operation()?;
-
-    let scope = ToolScope::from_flags(user);
-    let home = ToolHome::detect(scope)?;
-
-    if let ToolCommands::List {
-        supported,
-        updates,
-        json,
-        fail_on_updates,
-        fail_on_check_errors,
-    } = cmd
-    {
-        return list(
-            &home,
-            supported,
-            updates,
-            json,
-            fail_on_updates,
-            fail_on_check_errors,
-        );
-    }
-
+fn ensure_tool_home_ready(home: &ToolHome, scope: ToolScope) -> Result<ToolLock> {
     if let Err(err) = home.ensure_layout() {
         if scope == ToolScope::Global {
             return Err(err).with_context(|| {
@@ -204,43 +210,143 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
         }
         return Err(err);
     }
-    let _lock = match ToolLock::acquire(&home) {
-        Ok(lock) => lock,
-        Err(err) if scope == ToolScope::Global => {
-            return Err(err).with_context(|| {
-                "cannot acquire global tool lock. retry with `za tool --user ...` or run with elevated privileges"
-                    .to_string()
-            });
-        }
-        Err(err) => return Err(err),
-    };
+    match ToolLock::acquire(home) {
+        Ok(lock) => Ok(lock),
+        Err(err) if scope == ToolScope::Global => Err(err).with_context(|| {
+            "cannot acquire global tool lock. retry with `za tool --user ...` or run with elevated privileges"
+                .to_string()
+        }),
+        Err(err) => Err(err),
+    }
+}
+
+fn run_mutating_tool_command<F>(home: &ToolHome, scope: ToolScope, action: F) -> Result<i32>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let _lock = ensure_tool_home_ready(home, scope)?;
+    action()?;
+    Ok(0)
+}
+
+fn run_ls_command(
+    home: &ToolHome,
+    tools: &[String],
+    json: bool,
+    supported: bool,
+    outdated: bool,
+    fail_on_updates: bool,
+    fail_on_check_errors: bool,
+) -> Result<i32> {
+    if supported && outdated {
+        bail!("`--supported` cannot be combined with `--outdated`");
+    }
+    if supported && !tools.is_empty() {
+        bail!("`za tool ls --supported` does not accept tool names");
+    }
+    if supported && (fail_on_updates || fail_on_check_errors) {
+        bail!("`--fail-on-updates`/`--fail-on-check-errors` require `--outdated`");
+    }
+    if !outdated && (fail_on_updates || fail_on_check_errors) {
+        bail!("`--fail-on-updates`/`--fail-on-check-errors` require `--outdated`");
+    }
+
+    if supported {
+        return show_catalog(json);
+    }
+    if outdated {
+        return list_outdated(home, tools, json, fail_on_updates, fail_on_check_errors);
+    }
+    if !tools.is_empty() {
+        bail!("`za tool ls` does not accept tool names; use `za tool show <tool>`");
+    }
+    list_installed(home, json)
+}
+
+pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
+    prepare_interruptible_tool_operation()?;
+
+    let scope = ToolScope::from_flags(user);
+    let home = ToolHome::detect(scope)?;
+    cleanup_legacy_current_dir_artifacts(&home)?;
 
     match cmd {
-        ToolCommands::Install { spec } => {
-            let _ = install(
-                &home,
-                &spec,
-                ToolAction::Install,
-                false,
-                za_config::ProxyScope::Tool,
-            )?;
+        ToolCommands::Ls {
+            tools,
+            json,
+            supported,
+            outdated,
+            fail_on_updates,
+            fail_on_check_errors,
+        } => run_ls_command(
+            &home,
+            &tools,
+            json,
+            supported,
+            outdated,
+            fail_on_updates,
+            fail_on_check_errors,
+        ),
+        ToolCommands::Show { tool, json, path } => {
+            if path {
+                print_active_managed_path(&home, &tool)?;
+                Ok(0)
+            } else {
+                show_tool(&home, &tool, json)
+            }
         }
-        ToolCommands::Update { spec } => {
-            let _ = install(
-                &home,
-                &spec,
-                ToolAction::Update,
-                true,
-                za_config::ProxyScope::Tool,
-            )?;
+        ToolCommands::Install {
+            tool,
+            version,
+            adopt,
+        } => {
+            let home_for_action = home.clone();
+            run_mutating_tool_command(&home, scope, move || {
+                install_tools(
+                    &home_for_action,
+                    std::slice::from_ref(&tool),
+                    version.as_deref(),
+                    adopt,
+                )
+            })
         }
-        ToolCommands::Sync { file } => sync_manifest(&home, &file)?,
-        ToolCommands::Use { image } => use_tool(&home, &image)?,
-        ToolCommands::Uninstall { spec } => uninstall(&home, &spec)?,
-        ToolCommands::List { .. } => unreachable!("list handled before mutable operations"),
-    };
-
-    Ok(0)
+        ToolCommands::Update { tools, version } => {
+            let home_for_action = home.clone();
+            run_mutating_tool_command(&home, scope, move || {
+                install_tools(&home_for_action, &tools, version.as_deref(), false)
+            })
+        }
+        ToolCommands::Sync { file } => {
+            let home_for_action = home.clone();
+            run_mutating_tool_command(&home, scope, move || sync_manifest(&home_for_action, &file))
+        }
+        ToolCommands::Uninstall { tool, version } => {
+            let home_for_action = home.clone();
+            run_mutating_tool_command(&home, scope, move || {
+                uninstall(
+                    &home_for_action,
+                    ToolSpec::from_args(&tool, version.as_deref())?,
+                )
+            })
+        }
+        ToolCommands::Which { tool } => {
+            print_active_managed_path(&home, &tool)?;
+            Ok(0)
+        }
+        ToolCommands::Catalog { json } => show_catalog(json),
+        ToolCommands::Outdated {
+            tools,
+            json,
+            fail_on_updates,
+            fail_on_check_errors,
+        } => list_outdated(&home, &tools, json, fail_on_updates, fail_on_check_errors),
+        ToolCommands::Adopt { tool } => {
+            let home_for_action = home.clone();
+            run_mutating_tool_command(&home, scope, move || {
+                install_tools(&home_for_action, std::slice::from_ref(&tool), None, true)
+            })
+        }
+    }
 }
 
 pub fn update_self(user: bool, check: bool, version: Option<String>) -> Result<i32> {
@@ -248,6 +354,7 @@ pub fn update_self(user: bool, check: bool, version: Option<String>) -> Result<i
 
     let scope = ToolScope::from_flags(user);
     let home = ToolHome::detect(scope)?;
+    cleanup_legacy_current_dir_artifacts(&home)?;
 
     if check {
         return check_self_update(&version);
@@ -281,10 +388,8 @@ pub fn update_self(user: bool, check: bool, version: Option<String>) -> Result<i
 
     let installed = install(
         &home,
-        &target_spec,
-        ToolAction::Update,
-        false,
-        za_config::ProxyScope::Update,
+        ToolSpec::parse(&target_spec)?,
+        InstallOptions::update(za_config::ProxyScope::Update).with_prune(false),
     )?;
     if let Err(err) = verify_self_update(&home, &installed) {
         let rollback_res =
@@ -346,10 +451,9 @@ fn backup_existing_self_binary(home: &ToolHome) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
 
-    fs::create_dir_all(&home.current_dir)?;
-    let backup = home
-        .current_dir
-        .join(format!("za-self-backup-{}", std::process::id()));
+    let backup_dir = home.self_update_backup_dir();
+    fs::create_dir_all(&backup_dir)?;
+    let backup = backup_dir.join(format!("{SELF_UPDATE_BACKUP_PREFIX}{}", std::process::id()));
     fs::copy(&bin, &backup).with_context(|| {
         format!(
             "backup current za binary {} -> {}",
@@ -434,6 +538,45 @@ enum ToolAction {
     Update,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdoptionMode {
+    Disallow,
+    Require,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InstallOptions {
+    action: ToolAction,
+    adoption: AdoptionMode,
+    prune_after_activation: bool,
+    proxy_scope: za_config::ProxyScope,
+}
+
+impl InstallOptions {
+    fn update(proxy_scope: za_config::ProxyScope) -> Self {
+        Self {
+            action: ToolAction::Update,
+            adoption: AdoptionMode::Disallow,
+            prune_after_activation: true,
+            proxy_scope,
+        }
+    }
+
+    fn adopt(proxy_scope: za_config::ProxyScope) -> Self {
+        Self {
+            action: ToolAction::Install,
+            adoption: AdoptionMode::Require,
+            prune_after_activation: false,
+            proxy_scope,
+        }
+    }
+
+    fn with_prune(mut self, prune_after_activation: bool) -> Self {
+        self.prune_after_activation = prune_after_activation;
+        self
+    }
+}
+
 #[derive(Debug)]
 struct PullSource {
     kind: &'static str,
@@ -509,22 +652,38 @@ struct ToolSpec {
 }
 
 impl ToolSpec {
+    fn from_args(name: &str, version: Option<&str>) -> Result<Self> {
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            bail!("tool name must not be empty");
+        }
+        validate_name(trimmed_name)?;
+        let version = version
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(normalize_version);
+        Ok(Self {
+            name: trimmed_name.to_string(),
+            version,
+        })
+    }
+
     fn parse(input: &str) -> Result<Self> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
             bail!("tool spec must not be empty");
         }
-        let (name, version) = if let Some((n, v)) = trimmed.split_once(':') {
-            (n, Some(v))
-        } else {
-            (trimmed, None)
-        };
-        validate_name(name)?;
-        let version = version.map(str::trim).filter(|v| !v.is_empty());
-        Ok(Self {
-            name: name.to_string(),
-            version: version.map(ToOwned::to_owned),
-        })
+        if trimmed.contains('@') && trimmed.contains(':') {
+            bail!("invalid tool spec `{input}`: use either `name:version` or `name@version`");
+        }
+        let (name, version) = trimmed
+            .split_once('@')
+            .or_else(|| trimmed.split_once(':'))
+            .map_or((trimmed, None), |(name, version)| (name, Some(version)));
+        if version.is_some_and(|version| version.trim().is_empty()) {
+            bail!("invalid tool spec `{input}`: version must not be empty");
+        }
+        Self::from_args(name, version)
     }
 
     fn resolve(self, resolved_version: String) -> ToolRef {
@@ -536,17 +695,24 @@ impl ToolSpec {
 }
 
 impl ToolRef {
+    #[cfg(test)]
     fn parse(input: &str) -> Result<Self> {
-        let (name, version) = input
-            .split_once(':')
-            .ok_or_else(|| anyhow!("invalid tool ref `{input}`: expected `name:version`"))?;
-        validate_name(name)?;
-        if version.trim().is_empty() {
-            bail!("invalid tool ref `{input}`: version must not be empty");
+        if input.contains('@') && input.contains(':') {
+            bail!("invalid tool ref `{input}`: use either `name:version` or `name@version`");
         }
+        let (name, version) = input
+            .split_once('@')
+            .or_else(|| input.split_once(':'))
+            .ok_or_else(|| {
+                anyhow!("invalid tool ref `{input}`: expected `name:version` or `name@version`")
+            })?;
+        let spec = ToolSpec::from_args(name, Some(version))?;
+        let Some(version) = spec.version else {
+            bail!("invalid tool ref `{input}`: version must not be empty");
+        };
         Ok(Self {
-            name: name.to_string(),
-            version: version.to_string(),
+            name: spec.name,
+            version,
         })
     }
 
@@ -571,7 +737,7 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ToolHome {
     scope: ToolScope,
     store_dir: PathBuf,
@@ -650,6 +816,10 @@ impl ToolHome {
     fn lock_file(&self) -> PathBuf {
         self.current_dir.join(LOCK_FILE)
     }
+
+    fn self_update_backup_dir(&self) -> PathBuf {
+        self.current_dir.join(SELF_UPDATE_BACKUP_DIR)
+    }
 }
 
 impl ToolLock {
@@ -677,21 +847,14 @@ impl Drop for ToolLock {
     }
 }
 
-fn install(
-    home: &ToolHome,
-    spec: &str,
-    action: ToolAction,
-    prune_after_update_activation: bool,
-    proxy_scope: za_config::ProxyScope,
-) -> Result<ToolRef> {
+fn install(home: &ToolHome, mut requested: ToolSpec, options: InstallOptions) -> Result<ToolRef> {
     ensure_not_interrupted()?;
 
-    let mut requested = ToolSpec::parse(spec)?;
     requested.name = canonical_tool_name(&requested.name);
-    let adoption = if action == ToolAction::Update {
-        None
-    } else {
+    let adoption = if options.adoption == AdoptionMode::Require {
         detect_adoption_candidate(home, &requested)?
+    } else {
+        None
     };
     let version = if let Some(v) = requested.version.as_deref() {
         let v = normalize_version(v);
@@ -701,15 +864,20 @@ fn install(
         v
     } else if let Some(adopted) = adoption.as_ref() {
         adopted.version.clone()
-    } else if action == ToolAction::Update {
+    } else {
         print_tool_stage(
             "resolve",
             format!("latest version for `{}`", requested.name),
         );
-        resolve_requested_version(&requested.name, None, proxy_scope)?
-    } else {
-        resolve_requested_version(&requested.name, None, proxy_scope)?
+        resolve_requested_version(&requested.name, None, options.proxy_scope)?
     };
+    if options.adoption == AdoptionMode::Require && adoption.is_none() {
+        bail!(
+            "no unmanaged `{}` binary found in {} scope to adopt",
+            requested.name,
+            home.scope.label()
+        );
+    }
     let tool = requested.resolve(version);
     ensure_not_interrupted()?;
 
@@ -717,7 +885,7 @@ fn install(
     let dst = home.install_path(&tool);
     let already_installed = dst.exists();
 
-    if action == ToolAction::Update {
+    if options.action == ToolAction::Update {
         match previous_active.as_deref() {
             Some(current)
                 if normalize_version(current) == normalize_version(&tool.version)
@@ -757,7 +925,7 @@ fn install(
                 "source",
                 format!("fetching `{}` {}", tool.name, tool.version),
             );
-            let src = match resolve_install_source(&tool, proxy_scope) {
+            let src = match resolve_install_source(&tool, options.proxy_scope) {
                 Ok(src) => src,
                 Err(err) => {
                     return Err(match install_source_failure_guidance(&err) {
@@ -783,38 +951,93 @@ fn install(
         print_tool_stage("install", format!("already installed {}", tool.image()));
     }
 
-    let should_activate = action == ToolAction::Update || previous_active.is_none();
-    if should_activate {
-        activate_tool(home, &tool)?;
-        print_tool_stage(
-            "activate",
-            format!(
-                "{} (bin: {})",
-                tool.image(),
-                home.bin_path(&tool.name).display()
-            ),
-        );
-        if action == ToolAction::Update && prune_after_update_activation {
-            let removed = prune_non_active_versions(home, &tool)?;
-            if !removed.is_empty() {
-                print_tool_stage(
-                    "prune",
-                    format!(
-                        "removed old `{}` versions: {}",
-                        tool.name,
-                        removed.join(", ")
-                    ),
-                );
-            }
+    activate_tool(home, &tool)?;
+    print_tool_stage(
+        "activate",
+        format!(
+            "{} (bin: {})",
+            tool.image(),
+            home.bin_path(&tool.name).display()
+        ),
+    );
+    if options.prune_after_activation {
+        let removed = prune_non_active_versions(home, &tool)?;
+        if !removed.is_empty() {
+            print_tool_stage(
+                "prune",
+                format!(
+                    "removed old `{}` versions: {}",
+                    tool.name,
+                    removed.join(", ")
+                ),
+            );
         }
-    } else if !already_installed {
-        print_tool_stage(
-            "next",
-            format!("run `za tool use {}` to activate it", tool.image()),
-        );
     }
 
     Ok(tool)
+}
+
+fn install_tools(
+    home: &ToolHome,
+    tools: &[String],
+    version: Option<&str>,
+    adopt: bool,
+) -> Result<()> {
+    if adopt && version.is_some() {
+        bail!("`za tool install --adopt` does not accept `--version`");
+    }
+    if adopt && tools.len() != 1 {
+        bail!("`za tool install --adopt` requires exactly one tool name");
+    }
+    if version.is_some() && tools.len() != 1 {
+        bail!("`za tool update --version` requires exactly one tool name");
+    }
+
+    let requested_names = if tools.is_empty() {
+        if adopt {
+            bail!("`za tool install --adopt` requires a tool name");
+        }
+        collect_managed_tool_names(home)?
+    } else {
+        normalize_requested_tool_names(tools)?
+    };
+
+    if requested_names.is_empty() {
+        println!(
+            "No managed tools installed in {} scope.",
+            home.scope.label()
+        );
+        return Ok(());
+    }
+
+    let total = requested_names.len();
+    for (idx, name) in requested_names.iter().enumerate() {
+        if total > 1 {
+            println!("➡️  [{}/{}] {}", idx + 1, total, name);
+        }
+        if adopt {
+            adopt_tool(home, name)?;
+        } else {
+            let _ = install(
+                home,
+                ToolSpec::from_args(name, version)?,
+                InstallOptions::update(za_config::ProxyScope::Tool),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn normalize_requested_tool_names(names: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for name in names {
+        let canonical = canonical_tool_name(&ToolSpec::from_args(name, None)?.name);
+        if seen.insert(canonical.clone()) {
+            out.push(canonical);
+        }
+    }
+    Ok(out)
 }
 
 fn sync_manifest(home: &ToolHome, file: &Path) -> Result<()> {
@@ -827,10 +1050,8 @@ fn sync_manifest(home: &ToolHome, file: &Path) -> Result<()> {
         println!("➡️  [{}/{}] {}", idx + 1, specs.len(), spec);
         if let Err(err) = install(
             home,
-            spec,
-            ToolAction::Update,
-            true,
-            za_config::ProxyScope::Tool,
+            ToolSpec::parse(spec)?,
+            InstallOptions::update(za_config::ProxyScope::Tool),
         ) {
             failures.push(format!("{spec}: {err:#}"));
         }
@@ -905,12 +1126,6 @@ fn detect_adoption_candidate(
     requested: &ToolSpec,
 ) -> Result<Option<AdoptionCandidate>> {
     if requested.version.is_some() {
-        return Ok(None);
-    }
-
-    if let Some(policy) = find_tool_policy(&requested.name)
-        && is_policy_managed(home, policy)?
-    {
         return Ok(None);
     }
 
@@ -1081,25 +1296,28 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn use_tool(home: &ToolHome, image: &str) -> Result<()> {
-    let mut tool = ToolRef::parse(image)?;
-    tool.name = canonical_tool_name(&tool.name);
-    let target = home.install_path(&tool);
-    if !target.exists() {
-        bail!("tool version not installed: {}", tool.image());
+fn adopt_tool(home: &ToolHome, tool: &str) -> Result<()> {
+    let mut requested = ToolSpec::from_args(tool, None)?;
+    requested.name = canonical_tool_name(&requested.name);
+    if is_name_managed(home, &requested.name)? {
+        bail!(
+            "`{}` is already managed in {} scope; use `za tool update {}` to refresh it",
+            requested.name,
+            home.scope.label(),
+            requested.name
+        );
     }
 
-    activate_tool(home, &tool)?;
-    println!(
-        "✅ Using {} (bin: {})",
-        tool.image(),
-        home.bin_path(&tool.name).display()
-    );
+    let installed = install(
+        home,
+        requested,
+        InstallOptions::adopt(za_config::ProxyScope::Tool),
+    )?;
+    println!("✅ Adopted {}", installed.image());
     Ok(())
 }
 
-fn uninstall(home: &ToolHome, spec: &str) -> Result<()> {
-    let mut requested = ToolSpec::parse(spec)?;
+fn uninstall(home: &ToolHome, mut requested: ToolSpec) -> Result<()> {
     requested.name = canonical_tool_name(&requested.name);
     match requested.version {
         Some(version) => uninstall_version(
@@ -1278,6 +1496,28 @@ fn read_current_version(home: &ToolHome, name: &str) -> Result<Option<String>> {
     Ok(Some(version))
 }
 
+fn print_active_managed_path(home: &ToolHome, tool: &str) -> Result<()> {
+    let name = canonical_tool_name(&ToolSpec::from_args(tool, None)?.name);
+    let Some(_version) = read_current_version(home, &name)? else {
+        bail!(
+            "`{}` has no active managed version in {} scope",
+            name,
+            home.scope.label()
+        );
+    };
+    let bin = home.bin_path(&name);
+    if !bin.exists() {
+        bail!(
+            "active managed binary for `{}` is missing at {}; repair with `za tool update {}`",
+            name,
+            bin.display(),
+            name
+        );
+    }
+    println!("{}", bin.display());
+    Ok(())
+}
+
 fn activate_tool(home: &ToolHome, tool: &ToolRef) -> Result<()> {
     let previous_active = read_current_version(home, &tool.name)?;
     sync_bin_entry(home, tool)?;
@@ -1397,6 +1637,107 @@ fn collect_dir_names(root: &Path) -> Result<Vec<String>> {
         }
     }
     Ok(out)
+}
+
+fn collect_current_state_names(root: &Path) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    if !root.exists() {
+        return Ok(out);
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if is_current_state_file_name(&name) {
+            out.push(name);
+        }
+    }
+    Ok(out)
+}
+
+fn collect_managed_tool_names(home: &ToolHome) -> Result<Vec<String>> {
+    let mut names: HashSet<String> = collect_dir_names(&home.store_dir)?.into_iter().collect();
+    for file in collect_current_state_names(&home.current_dir)? {
+        names.insert(file);
+    }
+    let mut out = names.into_iter().collect::<Vec<_>>();
+    out.sort();
+    Ok(out)
+}
+
+fn is_current_state_file_name(name: &str) -> bool {
+    name != LOCK_FILE
+        && !name.starts_with(SELF_UPDATE_BACKUP_PREFIX)
+        && !name.contains(CURRENT_TMP_FILE_MARKER)
+}
+
+fn cleanup_legacy_current_dir_artifacts(home: &ToolHome) -> Result<()> {
+    let mut removed = 0usize;
+
+    removed += cleanup_legacy_files_in_dir(&home.current_dir)?;
+    removed += cleanup_legacy_files_in_dir(&home.self_update_backup_dir())?;
+
+    if removed > 0 {
+        eprintln!("🧹 Cleaned {removed} legacy tool state artifact(s)");
+    }
+    Ok(())
+}
+
+fn cleanup_legacy_files_in_dir(root: &Path) -> Result<usize> {
+    if !root.exists() {
+        return Ok(0);
+    }
+
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return Ok(0),
+        Err(err) => return Err(err).with_context(|| format!("read {}", root.display())),
+    };
+
+    let mut removed = 0usize;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !is_legacy_current_artifact_name(&name) {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "remove legacy tool state artifact {}",
+                        entry.path().display()
+                    )
+                });
+            }
+        }
+    }
+
+    if root.file_name().and_then(|name| name.to_str()) == Some(SELF_UPDATE_BACKUP_DIR) {
+        match fs::remove_dir(root) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("remove legacy backup directory {}", root.display()));
+            }
+        }
+    }
+
+    Ok(removed)
+}
+
+fn is_legacy_current_artifact_name(name: &str) -> bool {
+    name.starts_with(SELF_UPDATE_BACKUP_PREFIX) || name.contains(CURRENT_TMP_FILE_MARKER)
 }
 
 fn create_dir_all_with_context(path: &Path, label: &str) -> Result<()> {

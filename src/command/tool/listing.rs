@@ -27,18 +27,109 @@ pub(super) struct UnmanagedBinary {
     pub(super) path: String,
 }
 
-#[derive(Debug, Clone)]
-struct ToolListRow {
+#[derive(Debug)]
+struct InstalledToolRow {
+    name: String,
+    active_version: Option<String>,
+    active_missing_from_store: bool,
+    installed_versions: Vec<String>,
+    source: Option<String>,
+    bin_path: Option<String>,
+}
+
+#[derive(Debug)]
+struct InstalledToolReport {
+    rows: Vec<InstalledToolRow>,
+    unmanaged: Vec<UnmanagedBinary>,
+    scope: String,
+    bin_path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InstalledToolReportJson {
+    scope: String,
+    tool_binaries_path: String,
+    rows: Vec<InstalledToolRowJson>,
+    unmanaged: Vec<UnmanagedBinary>,
+}
+
+#[derive(Debug, Serialize)]
+struct InstalledToolRowJson {
+    name: String,
+    active_version: Option<String>,
+    active_missing_from_store: bool,
+    installed_versions: Vec<String>,
+    installed_count: usize,
+    source: Option<String>,
+    bin_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupportedToolView {
+    tool: String,
+    aliases: Vec<String>,
+    sources: String,
+}
+
+#[derive(Debug)]
+struct ToolVersionDetail {
+    version: String,
+    active: bool,
+    source: String,
+    executable_path: String,
+    manifest_path: String,
+}
+
+#[derive(Debug)]
+struct ToolDetailReport {
+    name: String,
+    aliases: Vec<String>,
+    scope: String,
+    managed: bool,
+    active_version: Option<String>,
+    active_missing_from_store: bool,
+    active_bin_path: Option<String>,
+    supported_source: Option<String>,
+    installed: Vec<ToolVersionDetail>,
+    unmanaged: Option<UnmanagedBinary>,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolVersionDetailJson {
+    version: String,
+    active: bool,
+    source: String,
+    executable_path: String,
+    manifest_path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ToolDetailReportJson {
+    name: String,
+    aliases: Vec<String>,
+    scope: String,
+    managed: bool,
+    active_version: Option<String>,
+    active_missing_from_store: bool,
+    active_bin_path: Option<String>,
+    supported_source: Option<String>,
+    installed: Vec<ToolVersionDetailJson>,
+    unmanaged: Option<UnmanagedBinary>,
+}
+
+#[derive(Debug)]
+struct OutdatedRow {
     name: String,
     version: String,
     active: bool,
     source: String,
-    update: Option<String>,
+    update: String,
+    latest: Option<String>,
 }
 
 #[derive(Debug)]
-struct ToolListReport {
-    rows: Vec<ToolListRow>,
+struct OutdatedReport {
+    rows: Vec<OutdatedRow>,
     unmanaged: Vec<UnmanagedBinary>,
     check_failures: Vec<(String, String)>,
     scope: String,
@@ -47,10 +138,10 @@ struct ToolListReport {
 }
 
 #[derive(Debug, Serialize)]
-struct ToolListJsonReport {
+struct OutdatedReportJson {
     scope: String,
     tool_binaries_path: String,
-    rows: Vec<ToolListRowJson>,
+    rows: Vec<OutdatedRowJson>,
     unmanaged: Vec<UnmanagedBinary>,
     update_check_warnings: Vec<String>,
     has_updates: bool,
@@ -58,19 +149,13 @@ struct ToolListJsonReport {
 }
 
 #[derive(Debug, Serialize)]
-struct ToolListRowJson {
+struct OutdatedRowJson {
     name: String,
     version: String,
     active: bool,
     source: String,
-    update: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct SupportedToolView {
-    tool: String,
-    aliases: Vec<String>,
-    sources: String,
+    update: String,
+    latest: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -194,112 +279,244 @@ struct LatestLookup {
     latest_by_name: HashMap<String, LatestCheck>,
 }
 
-pub(super) fn list(
+pub(super) fn list_installed(home: &ToolHome, json: bool) -> Result<i32> {
+    let report = build_installed_report(home)?;
+    if json {
+        print_installed_json(&report)?;
+    } else {
+        print_installed_text(&report);
+    }
+    Ok(0)
+}
+
+pub(super) fn show_tool(home: &ToolHome, tool: &str, json: bool) -> Result<i32> {
+    let report = build_tool_detail_report(home, tool)?;
+    if json {
+        print_tool_detail_json(&report)?;
+    } else {
+        print_tool_detail_text(&report);
+    }
+    Ok(0)
+}
+
+pub(super) fn show_catalog(json: bool) -> Result<i32> {
+    let rows = supported_tools_view();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rows).context("serialize supported tools JSON")?
+        );
+    } else {
+        print_supported_tools(&rows);
+    }
+    Ok(0)
+}
+
+pub(super) fn list_outdated(
     home: &ToolHome,
-    supported_only: bool,
-    check_updates: bool,
+    tools: &[String],
     json: bool,
     fail_on_updates: bool,
     fail_on_check_errors: bool,
 ) -> Result<i32> {
-    if supported_only && check_updates {
-        bail!("`--supported` cannot be combined with `--updates`");
-    }
-    if supported_only && (fail_on_updates || fail_on_check_errors) {
-        bail!("`--fail-on-updates`/`--fail-on-check-errors` require `--updates`");
-    }
-    if !check_updates && (fail_on_updates || fail_on_check_errors) {
-        bail!("`--fail-on-updates`/`--fail-on-check-errors` require `--updates`");
-    }
+    let names = if tools.is_empty() {
+        collect_managed_tool_names(home)?
+    } else {
+        normalize_requested_tool_names(tools)?
+    };
 
-    if supported_only {
-        let rows = supported_tools_view();
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&rows).context("serialize supported tools JSON")?
-            );
-        } else {
-            print_supported_tools(&rows);
-        }
+    if names.is_empty() {
+        println!(
+            "No managed tools installed in {} scope.",
+            home.scope.label()
+        );
         return Ok(0);
     }
 
-    let report = build_tool_list_report(home, check_updates)?;
+    for name in &names {
+        if !has_managed_state(home, name)? {
+            bail!("`{}` is not managed in {} scope", name, home.scope.label());
+        }
+    }
+
+    let report = build_outdated_report(home, &names)?;
     if json {
-        print_tool_list_json(&report)?;
+        print_outdated_json(&report)?;
     } else {
-        print_tool_list_text(&report, check_updates);
+        print_outdated_text(&report);
     }
 
     if fail_on_check_errors && !report.check_failures.is_empty() {
         eprintln!(
-            "tool list policy failure: {} update checks failed",
+            "tool outdated policy failure: {} update checks failed",
             report.check_failures.len()
         );
         return Ok(TOOL_EXIT_UPDATE_CHECK_FAILED);
     }
     if fail_on_updates && report.has_updates {
-        eprintln!("tool list policy failure: updates available");
+        eprintln!("tool outdated policy failure: updates available");
         return Ok(TOOL_EXIT_UPDATES_AVAILABLE);
     }
     Ok(0)
 }
 
-fn build_tool_list_report(home: &ToolHome, check_updates: bool) -> Result<ToolListReport> {
+fn build_installed_report(home: &ToolHome) -> Result<InstalledToolReport> {
     let mut rows = Vec::new();
-    let mut name_entries = collect_dir_names(&home.store_dir)?;
-    name_entries.sort();
-    let latest_lookup = if check_updates {
-        resolve_latest_checks_for_names(&name_entries)?
-    } else {
-        LatestLookup {
-            latest_by_name: HashMap::new(),
-        }
-    };
-    let unmanaged = collect_unmanaged_binaries(home)?;
-    let mut check_failures: Vec<(String, String)> = Vec::new();
-    let mut has_updates = false;
-
-    for name in name_entries {
-        let current = read_current_version(home, &name)?;
-        let mut versions = collect_dir_names(&home.name_dir(&name))?;
-        versions.sort();
-        let latest = latest_lookup.latest_by_name.get(&name).cloned();
-        if let Some(LatestCheck::Error(err)) = latest.as_ref() {
-            check_failures.push((name.clone(), source::truncate_for_log(err, 120)));
+    for name in collect_managed_tool_names(home)? {
+        let active_version = read_current_version(home, &name)?;
+        let mut installed_versions = collect_dir_names(&home.name_dir(&name))?;
+        installed_versions.sort();
+        if active_version.is_none() && installed_versions.is_empty() {
+            continue;
         }
 
-        for version in versions {
+        let active_missing_from_store = active_version
+            .as_ref()
+            .is_some_and(|active| !installed_versions.iter().any(|version| version == active));
+        let source = active_version
+            .as_ref()
+            .map(|version| {
+                manifest_source_label(
+                    home,
+                    &ToolRef {
+                        name: name.clone(),
+                        version: version.clone(),
+                    },
+                )
+            })
+            .transpose()?;
+
+        rows.push(InstalledToolRow {
+            name: name.clone(),
+            active_version: active_version.clone(),
+            active_missing_from_store,
+            installed_versions,
+            source,
+            bin_path: active_version.map(|_| home.bin_path(&name).display().to_string()),
+        });
+    }
+
+    Ok(InstalledToolReport {
+        rows,
+        unmanaged: collect_unmanaged_binaries(home)?,
+        scope: home.scope.label().to_string(),
+        bin_path: home.bin_dir.display().to_string(),
+    })
+}
+
+fn build_tool_detail_report(home: &ToolHome, tool: &str) -> Result<ToolDetailReport> {
+    let name = canonical_tool_name(&ToolSpec::from_args(tool, None)?.name);
+    let policy = find_tool_policy(&name);
+    let active_version = read_current_version(home, &name)?;
+    let mut installed_versions = collect_dir_names(&home.name_dir(&name))?;
+    installed_versions.sort();
+
+    let active_missing_from_store = active_version
+        .as_ref()
+        .is_some_and(|active| !installed_versions.iter().any(|version| version == active));
+    let managed = active_version.is_some() || !installed_versions.is_empty();
+    let unmanaged = collect_unmanaged_binary_for_name(home, &name)?;
+
+    if !managed && unmanaged.is_none() && policy.is_none() {
+        bail!(
+            "unknown tool `{}`; supported built-ins: {}",
+            name,
+            supported_tool_names_csv()
+        );
+    }
+
+    let installed = installed_versions
+        .iter()
+        .map(|version| {
             let tool = ToolRef {
                 name: name.clone(),
                 version: version.clone(),
             };
-            let is_current = current.as_deref() == Some(version.as_str());
-            let source = manifest_source_label(home, &tool)?;
-            let (update, update_available) = if let Some(latest) = latest.as_ref() {
-                let status = list_update_status(&version, latest);
-                let available = matches!(latest, LatestCheck::Latest(remote) if normalize_version(&version) != normalize_version(remote));
-                (Some(status), available)
-            } else {
-                (None, false)
-            };
-            if update_available {
-                has_updates = true;
-            }
-            rows.push(ToolListRow {
-                name: name.clone(),
-                version,
-                active: is_current,
-                source,
-                update,
-            });
+            Ok(ToolVersionDetail {
+                version: version.clone(),
+                active: active_version.as_deref() == Some(version.as_str()),
+                source: manifest_source_label(home, &tool)?,
+                executable_path: home.install_path(&tool).display().to_string(),
+                manifest_path: home.manifest_path(&tool).display().to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let active_bin_path = active_version
+        .as_ref()
+        .map(|_| home.bin_path(&name).display().to_string());
+
+    Ok(ToolDetailReport {
+        name,
+        aliases: policy
+            .map(|policy| {
+                policy
+                    .aliases
+                    .iter()
+                    .map(|alias| (*alias).to_string())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        scope: home.scope.label().to_string(),
+        managed,
+        active_version: active_version.clone(),
+        active_missing_from_store,
+        active_bin_path,
+        supported_source: policy.map(|policy| policy.source_label.to_string()),
+        installed,
+        unmanaged,
+    })
+}
+
+fn build_outdated_report(home: &ToolHome, names: &[String]) -> Result<OutdatedReport> {
+    let latest_lookup = resolve_latest_checks_for_names(names)?;
+    let mut rows = Vec::new();
+    let mut check_failures = Vec::new();
+    let mut has_updates = false;
+
+    for name in names {
+        let Some((version, active)) = select_primary_version(home, name)? else {
+            continue;
+        };
+        let latest = latest_lookup
+            .latest_by_name
+            .get(name)
+            .cloned()
+            .unwrap_or(LatestCheck::Unsupported);
+        if let LatestCheck::Error(err) = &latest {
+            check_failures.push((name.clone(), source::truncate_for_log(err, 120)));
         }
+
+        let update = list_update_status(&version, &latest);
+        let latest_version = match &latest {
+            LatestCheck::Latest(remote) => Some(remote.clone()),
+            LatestCheck::Unsupported | LatestCheck::Error(_) => None,
+        };
+        let update_available = matches!(
+            latest,
+            LatestCheck::Latest(ref remote)
+                if normalize_version(&version) != normalize_version(remote)
+        );
+        has_updates |= update_available;
+
+        rows.push(OutdatedRow {
+            name: name.clone(),
+            version: version.clone(),
+            active,
+            source: manifest_source_label(
+                home,
+                &ToolRef {
+                    name: name.clone(),
+                    version,
+                },
+            )?,
+            update,
+            latest: latest_version,
+        });
     }
 
-    Ok(ToolListReport {
+    Ok(OutdatedReport {
         rows,
-        unmanaged,
+        unmanaged: collect_unmanaged_binaries(home)?,
         check_failures,
         scope: home.scope.label().to_string(),
         bin_path: home.bin_dir.display().to_string(),
@@ -307,36 +524,196 @@ fn build_tool_list_report(home: &ToolHome, check_updates: bool) -> Result<ToolLi
     })
 }
 
-fn print_tool_list_text(report: &ToolListReport, check_updates: bool) {
+fn select_primary_version(home: &ToolHome, name: &str) -> Result<Option<(String, bool)>> {
+    if let Some(active) = read_current_version(home, name)? {
+        return Ok(Some((active, true)));
+    }
+
+    let mut installed = collect_dir_names(&home.name_dir(name))?;
+    installed.sort();
+    Ok(installed.pop().map(|version| (version, false)))
+}
+
+fn has_managed_state(home: &ToolHome, name: &str) -> Result<bool> {
+    Ok(read_current_version(home, name)?.is_some() || is_name_managed(home, name)?)
+}
+
+fn collect_unmanaged_binary_for_name(
+    home: &ToolHome,
+    name: &str,
+) -> Result<Option<UnmanagedBinary>> {
+    Ok(collect_unmanaged_binaries(home)?
+        .into_iter()
+        .find(|item| item.name == name))
+}
+
+fn print_installed_text(report: &InstalledToolReport) {
     if report.rows.is_empty() {
-        println!("No tools installed.");
-    } else if check_updates {
-        println!(
-            "{:<24} {:<20} {:<6} {:<18} SOURCE",
-            "NAME", "VERSION", "ACTIVE", "UPDATE"
-        );
-        for row in &report.rows {
-            let marker = if row.active { "*" } else { "" };
-            let update = row.update.clone().unwrap_or_else(|| "n/a".to_string());
-            println!(
-                "{:<24} {:<20} {:<6} {:<18} {}",
-                row.name, row.version, marker, update, row.source
-            );
-        }
+        println!("No managed tools installed.");
     } else {
-        println!("{:<24} {:<20} {:<6} SOURCE", "NAME", "VERSION", "ACTIVE");
+        println!("{:<24} {:<20} {:<8} SOURCE", "NAME", "ACTIVE", "VERSIONS");
         for row in &report.rows {
-            let marker = if row.active { "*" } else { "" };
+            let active = row
+                .active_version
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| "-".to_string());
+            let active = if row.active_missing_from_store {
+                format!("{active} !")
+            } else {
+                active
+            };
             println!(
-                "{:<24} {:<20} {:<6} {}",
-                row.name, row.version, marker, row.source
+                "{:<24} {:<20} {:<8} {}",
+                row.name,
+                active,
+                row.installed_versions.len(),
+                row.source.as_deref().unwrap_or("-"),
             );
         }
     }
 
     println!("\nScope: {}", report.scope);
     println!("Tool binaries path: {}", report.bin_path);
-    if check_updates && !report.check_failures.is_empty() {
+    print_unmanaged_binaries_text(&report.unmanaged);
+}
+
+fn print_installed_json(report: &InstalledToolReport) -> Result<()> {
+    let json = InstalledToolReportJson {
+        scope: report.scope.clone(),
+        tool_binaries_path: report.bin_path.clone(),
+        rows: report
+            .rows
+            .iter()
+            .map(|row| InstalledToolRowJson {
+                name: row.name.clone(),
+                active_version: row.active_version.clone(),
+                active_missing_from_store: row.active_missing_from_store,
+                installed_versions: row.installed_versions.clone(),
+                installed_count: row.installed_versions.len(),
+                source: row.source.clone(),
+                bin_path: row.bin_path.clone(),
+            })
+            .collect(),
+        unmanaged: report.unmanaged.clone(),
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json).context("serialize tool list JSON")?
+    );
+    Ok(())
+}
+
+fn print_tool_detail_text(report: &ToolDetailReport) {
+    println!("Tool: {}", report.name);
+    println!("Scope: {}", report.scope);
+    println!("Managed: {}", if report.managed { "yes" } else { "no" });
+
+    let active = report
+        .active_version
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_else(|| "-".to_string());
+    if report.active_missing_from_store {
+        println!("Active version: {active} (missing from store)");
+    } else {
+        println!("Active version: {active}");
+    }
+    println!(
+        "Active binary: {}",
+        report.active_bin_path.as_deref().unwrap_or("-")
+    );
+    println!(
+        "Supported source: {}",
+        report
+            .supported_source
+            .as_deref()
+            .unwrap_or("custom / unmanaged")
+    );
+    println!(
+        "Aliases: {}",
+        if report.aliases.is_empty() {
+            "-".to_string()
+        } else {
+            report.aliases.join(", ")
+        }
+    );
+
+    if report.installed.is_empty() {
+        println!("Installed versions: none");
+    } else {
+        println!("Installed versions:");
+        for item in &report.installed {
+            let active_marker = if item.active { " [active]" } else { "" };
+            println!(
+                "- {}{}  source={}  path={}",
+                item.version, active_marker, item.source, item.executable_path
+            );
+        }
+    }
+
+    if let Some(unmanaged) = &report.unmanaged {
+        println!(
+            "Unmanaged binary: {} {} ({})",
+            unmanaged.name, unmanaged.version, unmanaged.path
+        );
+        println!(
+            "Tip: run `za tool install {} --adopt` to manage it in this scope.",
+            unmanaged.name
+        );
+    }
+}
+
+fn print_tool_detail_json(report: &ToolDetailReport) -> Result<()> {
+    let json = ToolDetailReportJson {
+        name: report.name.clone(),
+        aliases: report.aliases.clone(),
+        scope: report.scope.clone(),
+        managed: report.managed,
+        active_version: report.active_version.clone(),
+        active_missing_from_store: report.active_missing_from_store,
+        active_bin_path: report.active_bin_path.clone(),
+        supported_source: report.supported_source.clone(),
+        installed: report
+            .installed
+            .iter()
+            .map(|item| ToolVersionDetailJson {
+                version: item.version.clone(),
+                active: item.active,
+                source: item.source.clone(),
+                executable_path: item.executable_path.clone(),
+                manifest_path: item.manifest_path.clone(),
+            })
+            .collect(),
+        unmanaged: report.unmanaged.clone(),
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json).context("serialize tool detail JSON")?
+    );
+    Ok(())
+}
+
+fn print_outdated_text(report: &OutdatedReport) {
+    if report.rows.is_empty() {
+        println!("No managed tools installed.");
+    } else {
+        println!(
+            "{:<24} {:<20} {:<6} {:<18} SOURCE",
+            "NAME", "VERSION", "ACTIVE", "UPDATE"
+        );
+        for row in &report.rows {
+            let marker = if row.active { "*" } else { "" };
+            println!(
+                "{:<24} {:<20} {:<6} {:<18} {}",
+                row.name, row.version, marker, row.update, row.source
+            );
+        }
+    }
+
+    println!("\nScope: {}", report.scope);
+    println!("Tool binaries path: {}", report.bin_path);
+    if !report.check_failures.is_empty() {
         println!("\nUpdate check warnings:");
         for (name, err) in &report.check_failures {
             println!("- {name}: {err}");
@@ -345,19 +722,20 @@ fn print_tool_list_text(report: &ToolListReport, check_updates: bool) {
     print_unmanaged_binaries_text(&report.unmanaged);
 }
 
-fn print_tool_list_json(report: &ToolListReport) -> Result<()> {
-    let json = ToolListJsonReport {
+fn print_outdated_json(report: &OutdatedReport) -> Result<()> {
+    let json = OutdatedReportJson {
         scope: report.scope.clone(),
         tool_binaries_path: report.bin_path.clone(),
         rows: report
             .rows
             .iter()
-            .map(|row| ToolListRowJson {
+            .map(|row| OutdatedRowJson {
                 name: row.name.clone(),
                 version: row.version.clone(),
                 active: row.active,
                 source: row.source.clone(),
                 update: row.update.clone(),
+                latest: row.latest.clone(),
             })
             .collect(),
         unmanaged: report.unmanaged.clone(),
@@ -371,7 +749,7 @@ fn print_tool_list_json(report: &ToolListReport) -> Result<()> {
     };
     println!(
         "{}",
-        serde_json::to_string_pretty(&json).context("serialize tool list JSON")?
+        serde_json::to_string_pretty(&json).context("serialize tool outdated JSON")?
     );
     Ok(())
 }
@@ -413,7 +791,7 @@ fn print_unmanaged_binaries_text(unmanaged: &[UnmanagedBinary]) {
             item.name, item.version, item.path
         );
         println!(
-            "Run `za tool install {}` to adopt it into managed store.",
+            "Run `za tool install {} --adopt` to move it into the managed store.",
             item.name
         );
     }
@@ -487,11 +865,17 @@ fn fetch_latest_checks_parallel(policies: Vec<ToolPolicy>) -> HashMap<&'static s
     let worker_count = normalize_tool_update_jobs(default_tool_update_jobs(), policies.len());
     let queue = Arc::new(Mutex::new(VecDeque::from(policies)));
     let out: Arc<Mutex<HashMap<&'static str, LatestCheck>>> = Arc::new(Mutex::new(HashMap::new()));
+    let progress = new_tool_progress_bar(
+        "update",
+        queue.lock().map(|guard| guard.len()).unwrap_or(0),
+        "checking upstream releases",
+    );
 
     thread::scope(|scope| {
         for _ in 0..worker_count {
             let queue = Arc::clone(&queue);
             let out = Arc::clone(&out);
+            let progress = progress.clone();
             scope.spawn(move || {
                 loop {
                     let task = match queue.lock() {
@@ -502,6 +886,10 @@ fn fetch_latest_checks_parallel(policies: Vec<ToolPolicy>) -> HashMap<&'static s
                         break;
                     };
                     let latest = resolve_latest_for_policy(policy);
+                    if let Some(progress) = progress.as_ref() {
+                        progress.set_message(latest_check_progress_message(policy, &latest));
+                        progress.inc(1);
+                    }
                     if let Ok(mut guard) = out.lock() {
                         guard.insert(policy.canonical_name, latest);
                     } else {
@@ -511,6 +899,10 @@ fn fetch_latest_checks_parallel(policies: Vec<ToolPolicy>) -> HashMap<&'static s
             });
         }
     });
+
+    if let Some(progress) = progress {
+        progress.finish_and_clear();
+    }
 
     out.lock()
         .map(|guard| guard.clone())
@@ -548,4 +940,12 @@ fn tool_update_cache_path() -> Option<PathBuf> {
             .join("za")
             .join(TOOL_UPDATE_CACHE_FILE_NAME)
     })
+}
+
+pub(super) fn latest_check_progress_message(policy: ToolPolicy, latest: &LatestCheck) -> String {
+    match latest {
+        LatestCheck::Latest(version) => format!("{} {}", policy.canonical_name, version),
+        LatestCheck::Unsupported => format!("{} n/a", policy.canonical_name),
+        LatestCheck::Error(_) => format!("{} failed", policy.canonical_name),
+    }
 }

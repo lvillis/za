@@ -1,7 +1,9 @@
 use super::{
-    LatestCheck, ToolHome, ToolRef, ToolScope, ToolSpec, canonical_tool_name, command_candidates,
-    extract_version_from_text, find_tool_policy, list_update_status, load_sync_specs_from_manifest,
-    normalize_version, prune_non_active_versions, source, supported_tool_names_csv,
+    LatestCheck, ToolHome, ToolRef, ToolScope, ToolSpec, canonical_tool_name,
+    cleanup_legacy_current_dir_artifacts, collect_managed_tool_names, command_candidates,
+    extract_version_from_text, find_tool_policy, latest_check_progress_message, list_update_status,
+    load_sync_specs_from_manifest, normalize_version, prune_non_active_versions, source,
+    supported_tool_names_csv,
 };
 use std::{fs, time::Duration};
 
@@ -10,6 +12,10 @@ fn parse_tool_ref_ok() {
     let tool = ToolRef::parse("codex-cli:0.20.0").expect("valid ref");
     assert_eq!(tool.name, "codex-cli");
     assert_eq!(tool.version, "0.20.0");
+
+    let tool = ToolRef::parse("codex-cli@0.21.0").expect("valid ref");
+    assert_eq!(tool.name, "codex-cli");
+    assert_eq!(tool.version, "0.21.0");
 }
 
 #[test]
@@ -62,6 +68,13 @@ fn parse_tool_spec_supports_optional_version() {
     let s2 = ToolSpec::parse("codex:0.104.0").expect("valid spec");
     assert_eq!(s2.name, "codex");
     assert_eq!(s2.version.as_deref(), Some("0.104.0"));
+
+    let s3 = ToolSpec::parse("codex@0.105.0").expect("valid spec");
+    assert_eq!(s3.name, "codex");
+    assert_eq!(s3.version.as_deref(), Some("0.105.0"));
+
+    assert!(ToolSpec::parse("codex:").is_err());
+    assert!(ToolSpec::parse("codex@").is_err());
 }
 
 #[test]
@@ -84,7 +97,7 @@ tools = [
   "codex",
   "ripgrep",
   "rg",
-  "docker-compose:v5.1.0",
+  "docker-compose@v5.1.0",
 ]
 "#,
     )
@@ -172,6 +185,23 @@ fn list_update_status_marks_latest_and_outdated() {
     assert_eq!(
         list_update_status("0.104.0", &LatestCheck::Error("boom".to_string())),
         "check-failed"
+    );
+}
+
+#[test]
+fn latest_check_progress_message_summarizes_result() {
+    let policy = find_tool_policy("codex").expect("policy");
+    assert_eq!(
+        latest_check_progress_message(policy, &LatestCheck::Latest("0.114.0".to_string())),
+        "codex 0.114.0"
+    );
+    assert_eq!(
+        latest_check_progress_message(policy, &LatestCheck::Unsupported),
+        "codex n/a"
+    );
+    assert_eq!(
+        latest_check_progress_message(policy, &LatestCheck::Error("boom".to_string())),
+        "codex failed"
     );
 }
 
@@ -298,6 +328,73 @@ fn prune_non_active_versions_keeps_only_target_version() {
     assert_eq!(removed, vec!["0.104.0".to_string()]);
     assert!(!home.version_dir(&old).exists());
     assert!(home.version_dir(&active).exists());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn collect_managed_tool_names_ignores_legacy_current_artifacts() {
+    let root = std::env::temp_dir().join(format!(
+        "za-test-current-artifacts-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let home = ToolHome {
+        scope: ToolScope::User,
+        store_dir: root.join("store"),
+        current_dir: root.join("current"),
+        bin_dir: root.join("bin"),
+    };
+
+    fs::create_dir_all(&home.current_dir).expect("create current dir");
+    fs::create_dir_all(home.name_dir("codex")).expect("create store dir");
+    fs::write(home.current_file("rg"), "14.1.0\n").expect("write current version");
+    fs::write(home.current_dir.join("za-self-backup-123"), [0_u8, 159]).expect("write backup");
+    fs::write(home.current_dir.join("codex.tmp-current-123"), "0.1.0\n").expect("write temp");
+
+    let names = collect_managed_tool_names(&home).expect("collect names");
+    assert_eq!(names, vec!["codex".to_string(), "rg".to_string()]);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cleanup_legacy_current_dir_artifacts_removes_backup_and_temp_files() {
+    let root = std::env::temp_dir().join(format!(
+        "za-test-cleanup-current-artifacts-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let home = ToolHome {
+        scope: ToolScope::User,
+        store_dir: root.join("store"),
+        current_dir: root.join("current"),
+        bin_dir: root.join("bin"),
+    };
+
+    fs::create_dir_all(&home.current_dir).expect("create current dir");
+    fs::create_dir_all(home.self_update_backup_dir()).expect("create backup dir");
+    fs::write(home.current_dir.join("za-self-backup-123"), [0_u8, 159]).expect("write backup");
+    fs::write(home.current_dir.join("codex.tmp-current-123"), "0.1.0\n").expect("write temp");
+    fs::write(home.current_file("rg"), "14.1.0\n").expect("write current version");
+    fs::write(
+        home.self_update_backup_dir().join("za-self-backup-999"),
+        [1_u8, 2_u8],
+    )
+    .expect("write nested backup");
+
+    cleanup_legacy_current_dir_artifacts(&home).expect("cleanup artifacts");
+
+    assert!(home.current_file("rg").exists());
+    assert!(!home.current_dir.join("za-self-backup-123").exists());
+    assert!(!home.current_dir.join("codex.tmp-current-123").exists());
+    assert!(!home.self_update_backup_dir().exists());
 
     let _ = fs::remove_dir_all(&root);
 }
