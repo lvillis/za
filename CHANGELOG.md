@@ -1,8 +1,17 @@
+## [0.1.32] - 2026-03-13
+
+### 🚀 Features
+
+- *(tool)* Refine tool management ergonomics and reliability
 ## [0.1.31] - 2026-03-11
 
 ### 🚜 Refactor
 
 - Polish diff, codex top, completion, and tool output
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.31
 ## [0.1.30] - 2026-03-11
 
 ### 🐛 Bug Fixes
