@@ -30,13 +30,25 @@
 
 ## Install
 
-### Prebuilt binary (Linux x86_64)
+### GitHub Release
 
 ```bash
-curl -fsSL https://github.com/lvillis/za/releases/latest/download/za-x86_64-unknown-linux-musl \
-  -o /usr/local/bin/za
-chmod +x /usr/local/bin/za
+curl -fsSL https://github.com/lvillis/za/releases/latest/download/za-linux-amd64 -o /usr/local/bin/za && chmod +x /usr/local/bin/za
 ```
+
+Stable alias assets are published alongside the versioned release archives, so the install command can stay short.
+
+Other common aliases:
+
+```bash
+za-linux-arm64
+za-linux-armhf
+za-linux-armv7
+za-darwin-arm64
+za-windows-amd64.exe
+```
+
+If `/usr/local/bin` is not writable, change the output path to somewhere already on `PATH`, such as `~/.local/bin/za`.
 
 ### Cargo
 

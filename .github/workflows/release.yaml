@@ -119,12 +119,32 @@ jobs:
             tar czf "$staging.tar.gz" "$staging"
             echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
           fi
+          alias=""
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl) alias="${{ env.PROJECT }}-linux-amd64" ;;
+            aarch64-unknown-linux-musl) alias="${{ env.PROJECT }}-linux-arm64" ;;
+            arm-unknown-linux-gnueabihf) alias="${{ env.PROJECT }}-linux-armhf" ;;
+            armv7-unknown-linux-gnueabihf) alias="${{ env.PROJECT }}-linux-armv7" ;;
+            aarch64-apple-darwin) alias="${{ env.PROJECT }}-darwin-arm64" ;;
+            x86_64-pc-windows-msvc) alias="${{ env.PROJECT }}-windows-amd64.exe" ;;
+          esac
+          if [ -n "$alias" ]; then
+            cp "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" "$alias"
+          fi
+          {
+            echo "UPLOAD_PATHS<<EOF"
+            echo "${ASSET}"
+            if [ -n "$alias" ]; then
+              echo "$alias"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_ENV"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: ${{ env.ASSET }}
+          path: ${{ env.UPLOAD_PATHS }}
 
   release:
     needs: build
