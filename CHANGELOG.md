@@ -1,8 +1,18 @@
+## [0.1.33] - 2026-03-16
+
+### 🚀 Features
+
+- Add oha
+- Add cross
 ## [0.1.32] - 2026-03-13
 
 ### 🚀 Features
 
 - *(tool)* Refine tool management ergonomics and reliability
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.32
 ## [0.1.31] - 2026-03-11
 
 ### 🚜 Refactor
