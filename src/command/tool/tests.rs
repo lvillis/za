@@ -266,6 +266,8 @@ fn tool_policy_matches_alias_and_canonical() {
     assert_eq!(tcping.canonical_name, "tcping");
     let dust = find_tool_policy("dust").expect("canonical policy");
     assert_eq!(dust.canonical_name, "dust");
+    let oha = find_tool_policy("oha").expect("canonical policy");
+    assert_eq!(oha.canonical_name, "oha");
     assert!(find_tool_policy("unknown-tool").is_none());
 }
 
@@ -276,6 +278,7 @@ fn canonical_tool_name_resolves_aliases() {
     assert_eq!(canonical_tool_name("fdfind"), "fd");
     assert_eq!(canonical_tool_name("tcping-rs"), "tcping");
     assert_eq!(canonical_tool_name("docker-compose"), "docker-compose");
+    assert_eq!(canonical_tool_name("oha"), "oha");
 }
 
 #[test]
@@ -293,6 +296,7 @@ fn supported_tool_names_csv_contains_all_aliases() {
     assert!(csv.contains("tcping-rs"));
     assert!(csv.contains("dust"));
     assert!(csv.contains("just"));
+    assert!(csv.contains("oha"));
 }
 
 #[test]

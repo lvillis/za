@@ -63,6 +63,7 @@ za tool install fd
 za tool install tcping
 za tool install dust
 za tool install just
+za tool install oha
 
 za tool ls
 za tool ls --outdated
@@ -221,6 +222,7 @@ Current built-in tool policies:
 | `tcping` | `tcping-rs` | GitHub Release (SHA-256 verify) |
 | `dust` | - | GitHub Release (SHA-256 verify) |
 | `just` | - | GitHub Release (SHA-256 verify) |
+| `oha` | - | GitHub Release (SHA-256 verify) |
 
 ### Common workflows
 

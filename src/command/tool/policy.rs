@@ -25,6 +25,9 @@ const DUST_GITHUB_TAG_PREFIX: &str = "v";
 const JUST_GITHUB_OWNER: &str = "casey";
 const JUST_GITHUB_REPO: &str = "just";
 const JUST_GITHUB_TAG_PREFIX: &str = "";
+const OHA_GITHUB_OWNER: &str = "hatoo";
+const OHA_GITHUB_REPO: &str = "oha";
+const OHA_GITHUB_TAG_PREFIX: &str = "v";
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct GithubReleasePolicy {
@@ -56,7 +59,7 @@ impl ToolPolicy {
     }
 }
 
-const TOOL_POLICIES: [ToolPolicy; 8] = [
+const TOOL_POLICIES: [ToolPolicy; 9] = [
     ToolPolicy {
         canonical_name: "za",
         aliases: &[],
@@ -161,6 +164,19 @@ const TOOL_POLICIES: [ToolPolicy; 8] = [
         }),
         cargo_fallback_package: None,
     },
+    ToolPolicy {
+        canonical_name: "oha",
+        aliases: &[],
+        source_label: "GitHub Release (SHA-256 verified)",
+        github_release: Some(GithubReleasePolicy {
+            project_label: "oha",
+            owner: OHA_GITHUB_OWNER,
+            repo: OHA_GITHUB_REPO,
+            tag_prefix: OHA_GITHUB_TAG_PREFIX,
+            expected_asset_name: oha_expected_asset_name,
+        }),
+        cargo_fallback_package: None,
+    },
 ];
 
 pub(super) fn tool_policies() -> &'static [ToolPolicy] {
@@ -224,6 +240,10 @@ fn dust_expected_asset_name(version: &str) -> Result<String> {
 
 fn just_expected_asset_name(version: &str) -> Result<String> {
     Ok(format!("just-{version}-{}.tar.gz", just_target_triple()?))
+}
+
+fn oha_expected_asset_name(_version: &str) -> Result<String> {
+    Ok(format!("oha-{}", oha_target()?))
 }
 
 fn codex_target_triple() -> Result<&'static str> {
@@ -331,6 +351,20 @@ fn just_target_triple() -> Result<&'static str> {
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
         _ => bail!(
             "unsupported platform for just release asset: {}-{}",
+            env::consts::ARCH,
+            env::consts::OS
+        ),
+    }
+}
+
+fn oha_target() -> Result<&'static str> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("linux-amd64"),
+        ("linux", "aarch64") => Ok("linux-arm64"),
+        ("macos", "x86_64") => Ok("macos-amd64"),
+        ("macos", "aarch64") => Ok("macos-arm64"),
+        _ => bail!(
+            "unsupported platform for oha release asset: {}-{}",
             env::consts::ARCH,
             env::consts::OS
         ),
