@@ -1,8 +1,17 @@
+## [0.1.35] - 2026-03-16
+
+### 🐛 Bug Fixes
+
+- Ci
 ## [0.1.34] - 2026-03-16
 
 ### 🚀 Features
 
 - *(release)* Publish stable install aliases for GitHub binaries
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.34
 ## [0.1.33] - 2026-03-16
 
 ### 🚀 Features
