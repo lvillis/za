@@ -64,6 +64,7 @@ za tool install tcping
 za tool install dust
 za tool install just
 za tool install oha
+za tool install cross
 
 za tool ls
 za tool ls --outdated
@@ -223,6 +224,7 @@ Current built-in tool policies:
 | `dust` | - | GitHub Release (SHA-256 verify) |
 | `just` | - | GitHub Release (SHA-256 verify) |
 | `oha` | - | GitHub Release (SHA-256 verify) |
+| `cross` | - | GitHub Release (SHA-256 unavailable; unverified) |
 
 ### Common workflows
 

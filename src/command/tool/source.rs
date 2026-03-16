@@ -1,3 +1,4 @@
+use super::policy::GithubReleaseVerification;
 use super::*;
 use std::{
     sync::{
@@ -226,16 +227,23 @@ fn download_from_github_release(
         .ok_or_else(|| {
             anyhow!("release `{tag}` does not contain expected asset `{expected_asset_name}`")
         })?;
-    let expected_sha256 = asset
-        .digest
-        .as_deref()
-        .and_then(parse_github_sha256_digest)
-        .ok_or_else(|| anyhow!("release asset `{}` missing valid sha256 digest", asset.name))?;
+    let expected_sha256 = match policy.verification {
+        GithubReleaseVerification::RequiredSha256Digest => Some(
+            asset
+                .digest
+                .as_deref()
+                .and_then(parse_github_sha256_digest)
+                .ok_or_else(|| {
+                    anyhow!("release asset `{}` missing valid sha256 digest", asset.name)
+                })?,
+        ),
+        GithubReleaseVerification::NoSha256Digest => None,
+    };
 
     download_from_url(
         tool,
         &asset.browser_download_url,
-        Some(&expected_sha256),
+        expected_sha256.as_deref(),
         proxy_scope,
     )
 }

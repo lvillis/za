@@ -28,6 +28,9 @@ const JUST_GITHUB_TAG_PREFIX: &str = "";
 const OHA_GITHUB_OWNER: &str = "hatoo";
 const OHA_GITHUB_REPO: &str = "oha";
 const OHA_GITHUB_TAG_PREFIX: &str = "v";
+const CROSS_GITHUB_OWNER: &str = "cross-rs";
+const CROSS_GITHUB_REPO: &str = "cross";
+const CROSS_GITHUB_TAG_PREFIX: &str = "v";
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct GithubReleasePolicy {
@@ -36,6 +39,13 @@ pub(super) struct GithubReleasePolicy {
     pub(super) repo: &'static str,
     pub(super) tag_prefix: &'static str,
     pub(super) expected_asset_name: fn(&str) -> Result<String>,
+    pub(super) verification: GithubReleaseVerification,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GithubReleaseVerification {
+    RequiredSha256Digest,
+    NoSha256Digest,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -59,7 +69,7 @@ impl ToolPolicy {
     }
 }
 
-const TOOL_POLICIES: [ToolPolicy; 9] = [
+const TOOL_POLICIES: [ToolPolicy; 10] = [
     ToolPolicy {
         canonical_name: "za",
         aliases: &[],
@@ -70,6 +80,7 @@ const TOOL_POLICIES: [ToolPolicy; 9] = [
             repo: ZA_GITHUB_REPO,
             tag_prefix: ZA_GITHUB_TAG_PREFIX,
             expected_asset_name: za_expected_asset_name,
+            verification: GithubReleaseVerification::RequiredSha256Digest,
         }),
         cargo_fallback_package: None,
     },
@@ -83,6 +94,7 @@ const TOOL_POLICIES: [ToolPolicy; 9] = [
             repo: CODEX_GITHUB_REPO,
             tag_prefix: CODEX_GITHUB_TAG_PREFIX,
             expected_asset_name: codex_expected_asset_name,
+            verification: GithubReleaseVerification::RequiredSha256Digest,
         }),
         cargo_fallback_package: Some("codex-cli"),
     },
@@ -96,6 +108,7 @@ const TOOL_POLICIES: [ToolPolicy; 9] = [
             repo: DOCKER_COMPOSE_GITHUB_REPO,
             tag_prefix: DOCKER_COMPOSE_GITHUB_TAG_PREFIX,
             expected_asset_name: docker_compose_expected_asset_name,
+            verification: GithubReleaseVerification::RequiredSha256Digest,
         }),
         cargo_fallback_package: None,
     },
@@ -109,6 +122,7 @@ const TOOL_POLICIES: [ToolPolicy; 9] = [
             repo: RIPGREP_GITHUB_REPO,
             tag_prefix: RIPGREP_GITHUB_TAG_PREFIX,
             expected_asset_name: ripgrep_expected_asset_name,
+            verification: GithubReleaseVerification::RequiredSha256Digest,
         }),
         cargo_fallback_package: None,
     },
@@ -122,6 +136,7 @@ const TOOL_POLICIES: [ToolPolicy; 9] = [
             repo: FD_GITHUB_REPO,
             tag_prefix: FD_GITHUB_TAG_PREFIX,
             expected_asset_name: fd_expected_asset_name,
+            verification: GithubReleaseVerification::RequiredSha256Digest,
         }),
         cargo_fallback_package: None,
     },
@@ -135,6 +150,7 @@ const TOOL_POLICIES: [ToolPolicy; 9] = [
             repo: TCPING_GITHUB_REPO,
             tag_prefix: TCPING_GITHUB_TAG_PREFIX,
             expected_asset_name: tcping_expected_asset_name,
+            verification: GithubReleaseVerification::RequiredSha256Digest,
         }),
         cargo_fallback_package: None,
     },
@@ -148,6 +164,7 @@ const TOOL_POLICIES: [ToolPolicy; 9] = [
             repo: DUST_GITHUB_REPO,
             tag_prefix: DUST_GITHUB_TAG_PREFIX,
             expected_asset_name: dust_expected_asset_name,
+            verification: GithubReleaseVerification::RequiredSha256Digest,
         }),
         cargo_fallback_package: None,
     },
@@ -161,6 +178,7 @@ const TOOL_POLICIES: [ToolPolicy; 9] = [
             repo: JUST_GITHUB_REPO,
             tag_prefix: JUST_GITHUB_TAG_PREFIX,
             expected_asset_name: just_expected_asset_name,
+            verification: GithubReleaseVerification::RequiredSha256Digest,
         }),
         cargo_fallback_package: None,
     },
@@ -174,6 +192,21 @@ const TOOL_POLICIES: [ToolPolicy; 9] = [
             repo: OHA_GITHUB_REPO,
             tag_prefix: OHA_GITHUB_TAG_PREFIX,
             expected_asset_name: oha_expected_asset_name,
+            verification: GithubReleaseVerification::RequiredSha256Digest,
+        }),
+        cargo_fallback_package: None,
+    },
+    ToolPolicy {
+        canonical_name: "cross",
+        aliases: &[],
+        source_label: "GitHub Release (SHA-256 unavailable; unverified)",
+        github_release: Some(GithubReleasePolicy {
+            project_label: "cross",
+            owner: CROSS_GITHUB_OWNER,
+            repo: CROSS_GITHUB_REPO,
+            tag_prefix: CROSS_GITHUB_TAG_PREFIX,
+            expected_asset_name: cross_expected_asset_name,
+            verification: GithubReleaseVerification::NoSha256Digest,
         }),
         cargo_fallback_package: None,
     },
@@ -244,6 +277,10 @@ fn just_expected_asset_name(version: &str) -> Result<String> {
 
 fn oha_expected_asset_name(_version: &str) -> Result<String> {
     Ok(format!("oha-{}", oha_target()?))
+}
+
+fn cross_expected_asset_name(_version: &str) -> Result<String> {
+    Ok(format!("cross-{}.tar.gz", cross_target_triple()?))
 }
 
 fn codex_target_triple() -> Result<&'static str> {
@@ -365,6 +402,19 @@ fn oha_target() -> Result<&'static str> {
         ("macos", "aarch64") => Ok("macos-arm64"),
         _ => bail!(
             "unsupported platform for oha release asset: {}-{}",
+            env::consts::ARCH,
+            env::consts::OS
+        ),
+    }
+}
+
+fn cross_target_triple() -> Result<&'static str> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
+        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
+        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
+        _ => bail!(
+            "unsupported platform for cross release asset: {}-{}",
             env::consts::ARCH,
             env::consts::OS
         ),

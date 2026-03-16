@@ -1,3 +1,4 @@
+use super::policy::GithubReleaseVerification;
 use super::{
     LatestCheck, ToolHome, ToolRef, ToolScope, ToolSpec, canonical_tool_name,
     cleanup_legacy_current_dir_artifacts, collect_managed_tool_names, command_candidates,
@@ -268,6 +269,17 @@ fn tool_policy_matches_alias_and_canonical() {
     assert_eq!(dust.canonical_name, "dust");
     let oha = find_tool_policy("oha").expect("canonical policy");
     assert_eq!(oha.canonical_name, "oha");
+    let cross = find_tool_policy("cross").expect("canonical policy");
+    assert_eq!(cross.canonical_name, "cross");
+    assert_eq!(cross.cargo_fallback_package, None);
+    assert_eq!(
+        cross.source_label,
+        "GitHub Release (SHA-256 unavailable; unverified)"
+    );
+    assert_eq!(
+        cross.github_release.expect("github policy").verification,
+        GithubReleaseVerification::NoSha256Digest
+    );
     assert!(find_tool_policy("unknown-tool").is_none());
 }
 
@@ -279,6 +291,7 @@ fn canonical_tool_name_resolves_aliases() {
     assert_eq!(canonical_tool_name("tcping-rs"), "tcping");
     assert_eq!(canonical_tool_name("docker-compose"), "docker-compose");
     assert_eq!(canonical_tool_name("oha"), "oha");
+    assert_eq!(canonical_tool_name("cross"), "cross");
 }
 
 #[test]
@@ -297,6 +310,7 @@ fn supported_tool_names_csv_contains_all_aliases() {
     assert!(csv.contains("dust"));
     assert!(csv.contains("just"));
     assert!(csv.contains("oha"));
+    assert!(csv.contains("cross"));
 }
 
 #[test]
