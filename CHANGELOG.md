@@ -1,9 +1,18 @@
+## [0.1.34] - 2026-03-16
+
+### 🚀 Features
+
+- *(release)* Publish stable install aliases for GitHub binaries
 ## [0.1.33] - 2026-03-16
 
 ### 🚀 Features
 
 - Add oha
 - Add cross
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.33
 ## [0.1.32] - 2026-03-13
 
 ### 🚀 Features
