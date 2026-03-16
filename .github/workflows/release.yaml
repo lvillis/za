@@ -108,34 +108,35 @@ jobs:
         shell: bash
         run: |
           staging="${{ env.PROJECT }}-${{ env.PROJECT_VERSION }}-${{ matrix.target }}"
+          asset=""
+          alias_asset=""
           mkdir "$staging"
           cp README.md LICENSE "$staging/"
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" "$staging/"
-            7z a "$staging.zip" "$staging" >/dev/null
-            echo "ASSET=$staging.zip" >> "$GITHUB_ENV"
+            asset="$staging.zip"
+            7z a "$asset" "$staging" >/dev/null
           else
             cp "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" "$staging/"
-            tar czf "$staging.tar.gz" "$staging"
-            echo "ASSET=$staging.tar.gz" >> "$GITHUB_ENV"
+            asset="$staging.tar.gz"
+            tar czf "$asset" "$staging"
           fi
-          alias=""
           case "${{ matrix.target }}" in
-            x86_64-unknown-linux-musl) alias="${{ env.PROJECT }}-linux-amd64" ;;
-            aarch64-unknown-linux-musl) alias="${{ env.PROJECT }}-linux-arm64" ;;
-            arm-unknown-linux-gnueabihf) alias="${{ env.PROJECT }}-linux-armhf" ;;
-            armv7-unknown-linux-gnueabihf) alias="${{ env.PROJECT }}-linux-armv7" ;;
-            aarch64-apple-darwin) alias="${{ env.PROJECT }}-darwin-arm64" ;;
-            x86_64-pc-windows-msvc) alias="${{ env.PROJECT }}-windows-amd64.exe" ;;
+            x86_64-unknown-linux-musl) alias_asset="${{ env.PROJECT }}-linux-amd64" ;;
+            aarch64-unknown-linux-musl) alias_asset="${{ env.PROJECT }}-linux-arm64" ;;
+            arm-unknown-linux-gnueabihf) alias_asset="${{ env.PROJECT }}-linux-armhf" ;;
+            armv7-unknown-linux-gnueabihf) alias_asset="${{ env.PROJECT }}-linux-armv7" ;;
+            aarch64-apple-darwin) alias_asset="${{ env.PROJECT }}-darwin-arm64" ;;
+            x86_64-pc-windows-msvc) alias_asset="${{ env.PROJECT }}-windows-amd64.exe" ;;
           esac
-          if [ -n "$alias" ]; then
-            cp "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" "$alias"
+          if [ -n "$alias_asset" ]; then
+            cp "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" "$alias_asset"
           fi
           {
             echo "UPLOAD_PATHS<<EOF"
-            echo "${ASSET}"
-            if [ -n "$alias" ]; then
-              echo "$alias"
+            echo "$asset"
+            if [ -n "$alias_asset" ]; then
+              echo "$alias_asset"
             fi
             echo "EOF"
           } >> "$GITHUB_ENV"
