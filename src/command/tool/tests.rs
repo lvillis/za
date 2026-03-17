@@ -1,10 +1,11 @@
 use super::policy::GithubReleaseVerification;
 use super::{
-    LatestCheck, ToolHome, ToolRef, ToolScope, ToolSpec, canonical_tool_name,
+    LatestCheck, ManagedFileChange, STARSHIP_BASH_INIT_END_MARKER, STARSHIP_BASH_INIT_START_MARKER,
+    ToolHome, ToolRef, ToolScope, ToolSpec, canonical_tool_name,
     cleanup_legacy_current_dir_artifacts, collect_managed_tool_names, command_candidates,
     extract_version_from_text, find_tool_policy, latest_check_progress_message, list_update_status,
     load_sync_specs_from_manifest, normalize_version, prune_non_active_versions, source,
-    supported_tool_names_csv,
+    starship_bash_init_block, supported_tool_names_csv, upsert_managed_block,
 };
 use std::{fs, time::Duration};
 
@@ -269,6 +270,14 @@ fn tool_policy_matches_alias_and_canonical() {
     assert_eq!(dust.canonical_name, "dust");
     let oha = find_tool_policy("oha").expect("canonical policy");
     assert_eq!(oha.canonical_name, "oha");
+    let starship = find_tool_policy("starship").expect("canonical policy");
+    assert_eq!(starship.canonical_name, "starship");
+    assert_eq!(starship.cargo_fallback_package, None);
+    assert_eq!(starship.source_label, "GitHub Release (SHA-256 verified)");
+    assert_eq!(
+        starship.github_release.expect("github policy").verification,
+        GithubReleaseVerification::RequiredSha256Digest
+    );
     let git_cliff = find_tool_policy("git-cliff").expect("canonical policy");
     assert_eq!(git_cliff.canonical_name, "git-cliff");
     assert_eq!(git_cliff.cargo_fallback_package, None);
@@ -316,6 +325,7 @@ fn canonical_tool_name_resolves_aliases() {
     assert_eq!(canonical_tool_name("tcping-rs"), "tcping");
     assert_eq!(canonical_tool_name("docker-compose"), "docker-compose");
     assert_eq!(canonical_tool_name("oha"), "oha");
+    assert_eq!(canonical_tool_name("starship"), "starship");
     assert_eq!(canonical_tool_name("git-cliff"), "git-cliff");
     assert_eq!(canonical_tool_name("cargo-release"), "cargo-release");
     assert_eq!(canonical_tool_name("cross"), "cross");
@@ -337,9 +347,73 @@ fn supported_tool_names_csv_contains_all_aliases() {
     assert!(csv.contains("dust"));
     assert!(csv.contains("just"));
     assert!(csv.contains("oha"));
+    assert!(csv.contains("starship"));
     assert!(csv.contains("git-cliff"));
     assert!(csv.contains("cargo-release"));
     assert!(csv.contains("cross"));
+}
+
+#[test]
+fn starship_bash_init_block_uses_jeditem_guard() {
+    let block = starship_bash_init_block();
+    assert!(block.contains(r#"if [ "${TERMINAL_EMULATOR-}" = "JetBrains-JediTerm" ]; then"#));
+    assert!(block.contains(r#"eval "$(starship init bash)""#));
+}
+
+#[test]
+fn starship_bash_init_managed_block_is_idempotent() {
+    let root = std::env::temp_dir().join(format!(
+        "za-test-starship-bashrc-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("create temp root");
+    let rc_path = root.join(".bashrc");
+    fs::write(&rc_path, "export PATH=/tmp\n").expect("write rc");
+
+    let first = upsert_managed_block(
+        &rc_path,
+        STARSHIP_BASH_INIT_START_MARKER,
+        STARSHIP_BASH_INIT_END_MARKER,
+        starship_bash_init_block(),
+    )
+    .expect("insert block");
+    let second = upsert_managed_block(
+        &rc_path,
+        STARSHIP_BASH_INIT_START_MARKER,
+        STARSHIP_BASH_INIT_END_MARKER,
+        starship_bash_init_block(),
+    )
+    .expect("update block");
+
+    let content = fs::read_to_string(&rc_path).expect("read rc");
+    assert_eq!(first, ManagedFileChange::Created);
+    assert_eq!(second, ManagedFileChange::Unchanged);
+    assert!(content.contains("export PATH=/tmp"));
+    assert!(content.contains("JetBrains-JediTerm"));
+    assert_eq!(content.matches(STARSHIP_BASH_INIT_START_MARKER).count(), 1);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn starship_policy_expected_asset_name_matches_supported_tarball() {
+    let policy = find_tool_policy("starship")
+        .expect("policy")
+        .github_release
+        .expect("github policy");
+    let asset_name = (policy.expected_asset_name)("1.24.2").expect("asset name");
+    let expected_target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+        ("linux", "aarch64") => "aarch64-unknown-linux-musl",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        other => panic!("unsupported local test platform: {other:?}"),
+    };
+    assert_eq!(asset_name, format!("starship-{expected_target}.tar.gz"));
 }
 
 #[test]

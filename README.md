@@ -76,6 +76,7 @@ za tool install tcping
 za tool install dust
 za tool install just
 za tool install oha
+za tool install starship
 za tool install git-cliff
 za tool install cargo-release
 za tool install cross
@@ -238,6 +239,7 @@ Current built-in tool policies:
 | `dust` | - | GitHub Release (SHA-256 verify) |
 | `just` | - | GitHub Release (SHA-256 verify) |
 | `oha` | - | GitHub Release (SHA-256 verify) |
+| `starship` | - | GitHub Release (SHA-256 verify) |
 | `git-cliff` | - | GitHub Release (SHA-256 verify) |
 | `cargo-release` | - | GitHub Release (SHA-256 verify) |
 | `cross` | - | GitHub Release (SHA-256 unavailable; unverified) |
@@ -247,7 +249,7 @@ Current built-in tool policies:
 ```bash
 # install the latest release and make it active
 za tool install codex
-za tool install just git-cliff cargo-release cross
+za tool install just starship git-cliff cargo-release cross
 
 # install a specific version and make it active
 za tool install codex --version 0.105.0
@@ -278,6 +280,8 @@ za tool install codex --adopt
 za tool uninstall codex --version 0.104.0
 za tool uninstall codex
 ```
+
+`za tool install starship` also upserts a managed `~/.bashrc` block that initializes the prompt only when `TERMINAL_EMULATOR=JetBrains-JediTerm`. Installation does not patch the current shell process; open a new JetBrains bash shell or `source ~/.bashrc` after install.
 
 `za tool install` and `za tool update` are interruption-safe: pressing `Ctrl+C` aborts cleanly and temporary download directories are removed automatically (stale leftovers are cleaned on next run). Output is stage-oriented (`resolve`, `source`, `install`, `activate`, `prune`) so it is obvious where a run is spending time.
 For large GitHub release assets, `za` will use parallel HTTP range downloads when the upstream supports it, emit explicit `download` / `verify` / `extract` stages, and automatically fall back to a single stream otherwise.

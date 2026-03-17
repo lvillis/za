@@ -28,6 +28,9 @@ const JUST_GITHUB_TAG_PREFIX: &str = "";
 const OHA_GITHUB_OWNER: &str = "hatoo";
 const OHA_GITHUB_REPO: &str = "oha";
 const OHA_GITHUB_TAG_PREFIX: &str = "v";
+const STARSHIP_GITHUB_OWNER: &str = "starship";
+const STARSHIP_GITHUB_REPO: &str = "starship";
+const STARSHIP_GITHUB_TAG_PREFIX: &str = "v";
 const GIT_CLIFF_GITHUB_OWNER: &str = "orhun";
 const GIT_CLIFF_GITHUB_REPO: &str = "git-cliff";
 const GIT_CLIFF_GITHUB_TAG_PREFIX: &str = "v";
@@ -75,7 +78,7 @@ impl ToolPolicy {
     }
 }
 
-const TOOL_POLICIES: [ToolPolicy; 12] = [
+const TOOL_POLICIES: [ToolPolicy; 13] = [
     ToolPolicy {
         canonical_name: "za",
         aliases: &[],
@@ -203,6 +206,20 @@ const TOOL_POLICIES: [ToolPolicy; 12] = [
         cargo_fallback_package: None,
     },
     ToolPolicy {
+        canonical_name: "starship",
+        aliases: &[],
+        source_label: "GitHub Release (SHA-256 verified)",
+        github_release: Some(GithubReleasePolicy {
+            project_label: "starship",
+            owner: STARSHIP_GITHUB_OWNER,
+            repo: STARSHIP_GITHUB_REPO,
+            tag_prefix: STARSHIP_GITHUB_TAG_PREFIX,
+            expected_asset_name: starship_expected_asset_name,
+            verification: GithubReleaseVerification::RequiredSha256Digest,
+        }),
+        cargo_fallback_package: None,
+    },
+    ToolPolicy {
         canonical_name: "git-cliff",
         aliases: &[],
         source_label: "GitHub Release (SHA-256 verified)",
@@ -311,6 +328,10 @@ fn just_expected_asset_name(version: &str) -> Result<String> {
 
 fn oha_expected_asset_name(_version: &str) -> Result<String> {
     Ok(format!("oha-{}", oha_target()?))
+}
+
+fn starship_expected_asset_name(_version: &str) -> Result<String> {
+    Ok(format!("starship-{}.tar.gz", starship_target_triple()?))
 }
 
 fn git_cliff_expected_asset_name(version: &str) -> Result<String> {
@@ -450,6 +471,20 @@ fn oha_target() -> Result<&'static str> {
         ("macos", "aarch64") => Ok("macos-arm64"),
         _ => bail!(
             "unsupported platform for oha release asset: {}-{}",
+            env::consts::ARCH,
+            env::consts::OS
+        ),
+    }
+}
+
+fn starship_target_triple() -> Result<&'static str> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
+        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
+        _ => bail!(
+            "unsupported platform for starship release asset: {}-{}",
             env::consts::ARCH,
             env::consts::OS
         ),

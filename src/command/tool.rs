@@ -59,6 +59,8 @@ const SOURCE_KIND_DOWNLOAD: &str = "download";
 const SOURCE_KIND_CARGO_INSTALL: &str = "cargo-install";
 const SOURCE_KIND_ADOPTED: &str = "adopted";
 const SOURCE_KIND_SYNTHESIZED: &str = "synthesized";
+const STARSHIP_BASH_INIT_START_MARKER: &str = "# >>> za starship (bash) >>>";
+const STARSHIP_BASH_INIT_END_MARKER: &str = "# <<< za starship (bash) <<<";
 const PROXY_HINT: &str =
     "if your network requires a proxy, set HTTPS_PROXY/HTTP_PROXY (and optional NO_PROXY)";
 const TOOL_UPDATE_CACHE_SCHEMA_VERSION: u32 = 1;
@@ -552,6 +554,23 @@ enum ToolAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedFileChange {
+    Created,
+    Updated,
+    Unchanged,
+}
+
+impl ManagedFileChange {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Updated => "updated",
+            Self::Unchanged => "already present",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdoptionMode {
     Disallow,
     Require,
@@ -982,6 +1001,7 @@ fn install(home: &ToolHome, mut requested: ToolSpec, options: InstallOptions) ->
             home.bin_path(&tool.name).display()
         ),
     );
+    ensure_post_activation_integrations(&tool)?;
     if options.prune_after_activation {
         let removed = prune_non_active_versions(home, &tool)?;
         if !removed.is_empty() {
@@ -997,6 +1017,97 @@ fn install(home: &ToolHome, mut requested: ToolSpec, options: InstallOptions) ->
     }
 
     Ok(tool)
+}
+
+fn ensure_post_activation_integrations(tool: &ToolRef) -> Result<()> {
+    if tool.name != "starship" {
+        return Ok(());
+    }
+    ensure_starship_bash_init()
+}
+
+fn ensure_starship_bash_init() -> Result<()> {
+    let rc_path = resolve_home_dir()?.join(".bashrc");
+    let change = upsert_managed_block(
+        &rc_path,
+        STARSHIP_BASH_INIT_START_MARKER,
+        STARSHIP_BASH_INIT_END_MARKER,
+        starship_bash_init_block(),
+    )
+    .with_context(|| format!("configure starship bash init in `{}`", rc_path.display()))?;
+    print_tool_stage(
+        "next",
+        format!(
+            "starship bash init {} in {}; open a new JetBrains bash shell or `source {}`",
+            change.label(),
+            rc_path.display(),
+            rc_path.display()
+        ),
+    );
+    Ok(())
+}
+
+fn resolve_home_dir() -> Result<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("cannot resolve home directory: set `HOME`"))
+}
+
+fn starship_bash_init_block() -> &'static str {
+    r#"if [ "${TERMINAL_EMULATOR-}" = "JetBrains-JediTerm" ]; then
+  command -v starship >/dev/null 2>&1 && eval "$(starship init bash)"
+fi"#
+}
+
+fn upsert_managed_block(
+    target_path: &Path,
+    start_marker: &str,
+    end_marker: &str,
+    body: &str,
+) -> Result<ManagedFileChange> {
+    let existing = match fs::read_to_string(target_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err).with_context(|| format!("read `{}`", target_path.display())),
+    };
+    let block = format!("{start_marker}\n{body}\n{end_marker}");
+    let (updated, change) = if let Some(start) = existing.find(start_marker) {
+        let end = existing[start..]
+            .find(end_marker)
+            .map(|offset| start + offset + end_marker.len())
+            .ok_or_else(|| {
+                anyhow!(
+                    "found `{start_marker}` in `{}` without matching `{end_marker}`",
+                    target_path.display()
+                )
+            })?;
+        let prefix = existing[..start].trim_end_matches('\n');
+        let suffix = existing[end..].trim_start_matches('\n');
+        let updated = match (prefix.is_empty(), suffix.is_empty()) {
+            (true, true) => format!("{block}\n"),
+            (true, false) => format!("{block}\n\n{suffix}"),
+            (false, true) => format!("{prefix}\n\n{block}\n"),
+            (false, false) => format!("{prefix}\n\n{block}\n\n{suffix}"),
+        };
+        let change = if updated == existing {
+            ManagedFileChange::Unchanged
+        } else {
+            ManagedFileChange::Updated
+        };
+        (updated, change)
+    } else if existing.trim().is_empty() {
+        (format!("{block}\n"), ManagedFileChange::Created)
+    } else {
+        (
+            format!("{}\n\n{block}\n", existing.trim_end()),
+            ManagedFileChange::Created,
+        )
+    };
+    if !matches!(change, ManagedFileChange::Unchanged) {
+        fs::write(target_path, updated)
+            .with_context(|| format!("write `{}`", target_path.display()))?;
+    }
+    Ok(change)
 }
 
 fn install_tools(
