@@ -40,6 +40,31 @@ const CARGO_RELEASE_GITHUB_TAG_PREFIX: &str = "v";
 const CROSS_GITHUB_OWNER: &str = "cross-rs";
 const CROSS_GITHUB_REPO: &str = "cross";
 const CROSS_GITHUB_TAG_PREFIX: &str = "v";
+const BLESH_GITHUB_OWNER: &str = "akinomyoga";
+const BLESH_GITHUB_REPO: &str = "ble.sh";
+const BLESH_NIGHTLY_TAG: &str = "nightly";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ToolLayout {
+    Binary,
+    Package,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PackagePolicy {
+    pub(super) entry_relpath: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GithubReleaseTrack {
+    VersionedTags,
+    RollingTagAssets {
+        tag: &'static str,
+        asset_prefix: &'static str,
+        asset_suffix: &'static str,
+        version_prefix: &'static str,
+    },
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct GithubReleasePolicy {
@@ -47,8 +72,9 @@ pub(super) struct GithubReleasePolicy {
     pub(super) owner: &'static str,
     pub(super) repo: &'static str,
     pub(super) tag_prefix: &'static str,
-    pub(super) expected_asset_name: fn(&str) -> Result<String>,
+    pub(super) expected_asset_name: Option<fn(&str) -> Result<String>>,
     pub(super) verification: GithubReleaseVerification,
+    pub(super) track: GithubReleaseTrack,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +88,8 @@ pub(super) struct ToolPolicy {
     pub(super) canonical_name: &'static str,
     pub(super) aliases: &'static [&'static str],
     pub(super) source_label: &'static str,
+    pub(super) layout: ToolLayout,
+    pub(super) package: Option<PackagePolicy>,
     pub(super) github_release: Option<GithubReleasePolicy>,
     pub(super) cargo_fallback_package: Option<&'static str>,
 }
@@ -78,18 +106,21 @@ impl ToolPolicy {
     }
 }
 
-const TOOL_POLICIES: [ToolPolicy; 13] = [
+const TOOL_POLICIES: [ToolPolicy; 14] = [
     ToolPolicy {
         canonical_name: "za",
         aliases: &[],
         source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
         github_release: Some(GithubReleasePolicy {
             project_label: "za",
             owner: ZA_GITHUB_OWNER,
             repo: ZA_GITHUB_REPO,
             tag_prefix: ZA_GITHUB_TAG_PREFIX,
-            expected_asset_name: za_expected_asset_name,
+            expected_asset_name: Some(za_expected_asset_name),
             verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
         }),
         cargo_fallback_package: None,
     },
@@ -97,13 +128,16 @@ const TOOL_POLICIES: [ToolPolicy; 13] = [
         canonical_name: "codex",
         aliases: &["codex-cli"],
         source_label: "GitHub Release (SHA-256 verified), cargo install fallback",
+        layout: ToolLayout::Binary,
+        package: None,
         github_release: Some(GithubReleasePolicy {
             project_label: "codex",
             owner: CODEX_GITHUB_OWNER,
             repo: CODEX_GITHUB_REPO,
             tag_prefix: CODEX_GITHUB_TAG_PREFIX,
-            expected_asset_name: codex_expected_asset_name,
+            expected_asset_name: Some(codex_expected_asset_name),
             verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
         }),
         cargo_fallback_package: Some("codex-cli"),
     },
@@ -111,13 +145,16 @@ const TOOL_POLICIES: [ToolPolicy; 13] = [
         canonical_name: "docker-compose",
         aliases: &[],
         source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
         github_release: Some(GithubReleasePolicy {
             project_label: "docker-compose",
             owner: DOCKER_COMPOSE_GITHUB_OWNER,
             repo: DOCKER_COMPOSE_GITHUB_REPO,
             tag_prefix: DOCKER_COMPOSE_GITHUB_TAG_PREFIX,
-            expected_asset_name: docker_compose_expected_asset_name,
+            expected_asset_name: Some(docker_compose_expected_asset_name),
             verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
         }),
         cargo_fallback_package: None,
     },
@@ -125,13 +162,16 @@ const TOOL_POLICIES: [ToolPolicy; 13] = [
         canonical_name: "rg",
         aliases: &["ripgrep"],
         source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
         github_release: Some(GithubReleasePolicy {
             project_label: "ripgrep",
             owner: RIPGREP_GITHUB_OWNER,
             repo: RIPGREP_GITHUB_REPO,
             tag_prefix: RIPGREP_GITHUB_TAG_PREFIX,
-            expected_asset_name: ripgrep_expected_asset_name,
+            expected_asset_name: Some(ripgrep_expected_asset_name),
             verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
         }),
         cargo_fallback_package: None,
     },
@@ -139,13 +179,16 @@ const TOOL_POLICIES: [ToolPolicy; 13] = [
         canonical_name: "fd",
         aliases: &["fdfind"],
         source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
         github_release: Some(GithubReleasePolicy {
             project_label: "fd",
             owner: FD_GITHUB_OWNER,
             repo: FD_GITHUB_REPO,
             tag_prefix: FD_GITHUB_TAG_PREFIX,
-            expected_asset_name: fd_expected_asset_name,
+            expected_asset_name: Some(fd_expected_asset_name),
             verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
         }),
         cargo_fallback_package: None,
     },
@@ -153,13 +196,16 @@ const TOOL_POLICIES: [ToolPolicy; 13] = [
         canonical_name: "tcping",
         aliases: &["tcping-rs"],
         source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
         github_release: Some(GithubReleasePolicy {
             project_label: "tcping-rs",
             owner: TCPING_GITHUB_OWNER,
             repo: TCPING_GITHUB_REPO,
             tag_prefix: TCPING_GITHUB_TAG_PREFIX,
-            expected_asset_name: tcping_expected_asset_name,
+            expected_asset_name: Some(tcping_expected_asset_name),
             verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
         }),
         cargo_fallback_package: None,
     },
@@ -167,13 +213,16 @@ const TOOL_POLICIES: [ToolPolicy; 13] = [
         canonical_name: "dust",
         aliases: &[],
         source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
         github_release: Some(GithubReleasePolicy {
             project_label: "dust",
             owner: DUST_GITHUB_OWNER,
             repo: DUST_GITHUB_REPO,
             tag_prefix: DUST_GITHUB_TAG_PREFIX,
-            expected_asset_name: dust_expected_asset_name,
+            expected_asset_name: Some(dust_expected_asset_name),
             verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
         }),
         cargo_fallback_package: None,
     },
@@ -181,13 +230,16 @@ const TOOL_POLICIES: [ToolPolicy; 13] = [
         canonical_name: "just",
         aliases: &[],
         source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
         github_release: Some(GithubReleasePolicy {
             project_label: "just",
             owner: JUST_GITHUB_OWNER,
             repo: JUST_GITHUB_REPO,
             tag_prefix: JUST_GITHUB_TAG_PREFIX,
-            expected_asset_name: just_expected_asset_name,
+            expected_asset_name: Some(just_expected_asset_name),
             verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
         }),
         cargo_fallback_package: None,
     },
@@ -195,13 +247,16 @@ const TOOL_POLICIES: [ToolPolicy; 13] = [
         canonical_name: "oha",
         aliases: &[],
         source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
         github_release: Some(GithubReleasePolicy {
             project_label: "oha",
             owner: OHA_GITHUB_OWNER,
             repo: OHA_GITHUB_REPO,
             tag_prefix: OHA_GITHUB_TAG_PREFIX,
-            expected_asset_name: oha_expected_asset_name,
+            expected_asset_name: Some(oha_expected_asset_name),
             verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
         }),
         cargo_fallback_package: None,
     },
@@ -209,13 +264,16 @@ const TOOL_POLICIES: [ToolPolicy; 13] = [
         canonical_name: "starship",
         aliases: &[],
         source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
         github_release: Some(GithubReleasePolicy {
             project_label: "starship",
             owner: STARSHIP_GITHUB_OWNER,
             repo: STARSHIP_GITHUB_REPO,
             tag_prefix: STARSHIP_GITHUB_TAG_PREFIX,
-            expected_asset_name: starship_expected_asset_name,
+            expected_asset_name: Some(starship_expected_asset_name),
             verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
         }),
         cargo_fallback_package: None,
     },
@@ -223,13 +281,16 @@ const TOOL_POLICIES: [ToolPolicy; 13] = [
         canonical_name: "git-cliff",
         aliases: &[],
         source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
         github_release: Some(GithubReleasePolicy {
             project_label: "git-cliff",
             owner: GIT_CLIFF_GITHUB_OWNER,
             repo: GIT_CLIFF_GITHUB_REPO,
             tag_prefix: GIT_CLIFF_GITHUB_TAG_PREFIX,
-            expected_asset_name: git_cliff_expected_asset_name,
+            expected_asset_name: Some(git_cliff_expected_asset_name),
             verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
         }),
         cargo_fallback_package: None,
     },
@@ -237,13 +298,16 @@ const TOOL_POLICIES: [ToolPolicy; 13] = [
         canonical_name: "cargo-release",
         aliases: &[],
         source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
         github_release: Some(GithubReleasePolicy {
             project_label: "cargo-release",
             owner: CARGO_RELEASE_GITHUB_OWNER,
             repo: CARGO_RELEASE_GITHUB_REPO,
             tag_prefix: CARGO_RELEASE_GITHUB_TAG_PREFIX,
-            expected_asset_name: cargo_release_expected_asset_name,
+            expected_asset_name: Some(cargo_release_expected_asset_name),
             verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
         }),
         cargo_fallback_package: None,
     },
@@ -251,13 +315,40 @@ const TOOL_POLICIES: [ToolPolicy; 13] = [
         canonical_name: "cross",
         aliases: &[],
         source_label: "GitHub Release (SHA-256 unavailable; unverified)",
+        layout: ToolLayout::Binary,
+        package: None,
         github_release: Some(GithubReleasePolicy {
             project_label: "cross",
             owner: CROSS_GITHUB_OWNER,
             repo: CROSS_GITHUB_REPO,
             tag_prefix: CROSS_GITHUB_TAG_PREFIX,
-            expected_asset_name: cross_expected_asset_name,
+            expected_asset_name: Some(cross_expected_asset_name),
             verification: GithubReleaseVerification::NoSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
+        }),
+        cargo_fallback_package: None,
+    },
+    ToolPolicy {
+        canonical_name: "ble.sh",
+        aliases: &["blesh"],
+        source_label: "GitHub nightly rolling release (commit-tracked; SHA-256 unavailable)",
+        layout: ToolLayout::Package,
+        package: Some(PackagePolicy {
+            entry_relpath: "ble.sh",
+        }),
+        github_release: Some(GithubReleasePolicy {
+            project_label: "ble.sh",
+            owner: BLESH_GITHUB_OWNER,
+            repo: BLESH_GITHUB_REPO,
+            tag_prefix: "",
+            expected_asset_name: None,
+            verification: GithubReleaseVerification::NoSha256Digest,
+            track: GithubReleaseTrack::RollingTagAssets {
+                tag: BLESH_NIGHTLY_TAG,
+                asset_prefix: "ble-nightly-",
+                asset_suffix: ".tar.xz",
+                version_prefix: "nightly-",
+            },
         }),
         cargo_fallback_package: None,
     },

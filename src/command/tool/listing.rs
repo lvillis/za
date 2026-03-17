@@ -392,7 +392,7 @@ fn build_installed_report(home: &ToolHome) -> Result<InstalledToolReport> {
             active_missing_from_store,
             installed_versions,
             source,
-            bin_path: active_version.map(|_| home.bin_path(&name).display().to_string()),
+            bin_path: active_version.map(|_| home.active_path(&name).display().to_string()),
         });
     }
 
@@ -443,7 +443,7 @@ fn build_tool_detail_report(home: &ToolHome, tool: &str) -> Result<ToolDetailRep
         .collect::<Result<Vec<_>>>()?;
     let active_bin_path = active_version
         .as_ref()
-        .map(|_| home.bin_path(&name).display().to_string());
+        .map(|_| home.active_path(&name).display().to_string());
 
     Ok(ToolDetailReport {
         name,
@@ -620,7 +620,7 @@ fn print_tool_detail_text(report: &ToolDetailReport) {
         println!("Active version: {active}");
     }
     println!(
-        "Active binary: {}",
+        "Active path: {}",
         report.active_bin_path.as_deref().unwrap_or("-")
     );
     println!(
@@ -913,7 +913,11 @@ fn resolve_latest_for_policy(policy: ToolPolicy) -> LatestCheck {
     let Some(release) = policy.github_release else {
         return LatestCheck::Unsupported;
     };
-    match source::fetch_latest_version_from_github_release(release, za_config::ProxyScope::Tool) {
+    match source::fetch_latest_version_from_github_release(
+        policy,
+        release,
+        za_config::ProxyScope::Tool,
+    ) {
         Ok(version) => LatestCheck::Latest(version),
         Err(err) => LatestCheck::Error(format!("{err:#}")),
     }

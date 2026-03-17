@@ -1,5 +1,6 @@
-use super::policy::GithubReleaseVerification;
+use super::policy::{GithubReleaseTrack, GithubReleaseVerification, ToolLayout};
 use super::*;
+use flate2::read::GzDecoder;
 use std::{
     sync::{
         Arc,
@@ -7,6 +8,8 @@ use std::{
     },
     thread,
 };
+use tar::Archive;
+use xz2::read::XzDecoder;
 
 const TEMP_DIR_PREFIX_DOWNLOAD: &str = "za-tool-download";
 const TEMP_DIR_PREFIX_CARGO_INSTALL: &str = "za-tool-cargo-install";
@@ -41,6 +44,11 @@ struct DownloadProbe {
 enum ParallelDownloadError {
     Unsupported(anyhow::Error),
     Failed(anyhow::Error),
+}
+
+enum DownloadExtractionMode<'a> {
+    KeepArchive,
+    PrimaryEntry(&'a ToolRef),
 }
 
 pub(super) fn unregister_temp_dir(path: &Path) {
@@ -142,7 +150,7 @@ pub(super) fn resolve_requested_version(
     let Some(release) = policy.github_release else {
         bail!("latest version resolution is not defined for `{name}`");
     };
-    fetch_latest_version_from_github_release(release, proxy_scope)
+    fetch_latest_version_from_github_release(policy, release, proxy_scope)
 }
 
 pub(super) fn resolve_install_source(
@@ -162,7 +170,7 @@ pub(super) fn resolve_install_source(
     let mut errors = Vec::new();
 
     if let Some(release) = policy.github_release {
-        match download_from_github_release(tool, release, proxy_scope) {
+        match download_from_github_release(tool, policy.layout, release, proxy_scope) {
             Ok(src) => return Ok(src),
             Err(err) => errors.push(format!("github release: {err:#}")),
         }
@@ -181,6 +189,42 @@ pub(super) fn resolve_install_source(
     )
 }
 
+pub(super) fn preview_install_source(
+    tool: &ToolRef,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<InstallSource> {
+    ensure_not_interrupted()?;
+
+    let Some(policy) = find_tool_policy(&tool.name) else {
+        bail!(
+            "unsupported tool `{}`: no built-in source policy. currently supported: {}",
+            tool.name,
+            supported_tool_names_csv()
+        );
+    };
+
+    let mut errors = Vec::new();
+
+    if let Some(release) = policy.github_release {
+        match preview_github_release_source(tool, release, proxy_scope) {
+            Ok(source) => return Ok(source),
+            Err(err) => errors.push(format!("github release: {err:#}")),
+        }
+    }
+    if let Some(package) = policy.cargo_fallback_package {
+        return Ok(InstallSource {
+            kind: SOURCE_KIND_CARGO_INSTALL,
+            detail: format!("cargo install {package}"),
+        });
+    }
+
+    bail!(
+        "failed to resolve source for `{}` via automatic policies:\n- {}",
+        tool.name,
+        errors.join("\n- ")
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
@@ -188,46 +232,145 @@ struct GithubRelease {
     assets: Vec<GithubReleaseAsset>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct GithubReleaseAsset {
     name: String,
     browser_download_url: String,
     digest: Option<String>,
+    #[serde(default)]
+    updated_at: String,
 }
 
 pub(super) fn fetch_latest_version_from_github_release(
-    policy: GithubReleasePolicy,
+    tool_policy: ToolPolicy,
+    release_policy: GithubReleasePolicy,
     proxy_scope: za_config::ProxyScope,
 ) -> Result<String> {
-    let release = fetch_github_release(
-        policy.project_label,
-        &format!("/repos/{}/{}/releases/latest", policy.owner, policy.repo),
-        proxy_scope,
-    )?;
-    parse_release_version(&release.tag_name, policy.tag_prefix)
+    match release_policy.track {
+        GithubReleaseTrack::VersionedTags => {
+            let release = fetch_github_release(
+                release_policy.project_label,
+                &format!(
+                    "/repos/{}/{}/releases/latest",
+                    release_policy.owner, release_policy.repo
+                ),
+                proxy_scope,
+            )?;
+            parse_release_version(&release.tag_name, release_policy.tag_prefix)
+        }
+        GithubReleaseTrack::RollingTagAssets {
+            tag,
+            asset_prefix,
+            asset_suffix,
+            version_prefix,
+        } => {
+            let release = fetch_github_release(
+                release_policy.project_label,
+                &format!(
+                    "/repos/{}/{}/releases/tags/{tag}",
+                    release_policy.owner, release_policy.repo
+                ),
+                proxy_scope,
+            )?;
+            latest_rolling_asset_version(
+                &release,
+                tool_policy,
+                asset_prefix,
+                asset_suffix,
+                version_prefix,
+            )
+        }
+    }
 }
 
 fn download_from_github_release(
     tool: &ToolRef,
-    policy: GithubReleasePolicy,
+    layout: ToolLayout,
+    release_policy: GithubReleasePolicy,
     proxy_scope: za_config::ProxyScope,
 ) -> Result<PullSource> {
+    let (asset, expected_sha256) = resolve_github_release_asset(tool, release_policy, proxy_scope)?;
+
+    let extraction = match layout {
+        ToolLayout::Binary => DownloadExtractionMode::PrimaryEntry(tool),
+        ToolLayout::Package => DownloadExtractionMode::KeepArchive,
+    };
+    download_from_url(
+        &asset.browser_download_url,
+        expected_sha256.as_deref(),
+        proxy_scope,
+        extraction,
+    )
+}
+
+fn preview_github_release_source(
+    tool: &ToolRef,
+    release_policy: GithubReleasePolicy,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<InstallSource> {
+    let (asset, expected_sha256) = resolve_github_release_asset(tool, release_policy, proxy_scope)?;
+    Ok(InstallSource {
+        kind: SOURCE_KIND_DOWNLOAD,
+        detail: match expected_sha256 {
+            Some(expected) => format!("URL {} (sha256={expected})", asset.browser_download_url),
+            None => format!("URL {}", asset.browser_download_url),
+        },
+    })
+}
+
+fn resolve_github_release_asset(
+    tool: &ToolRef,
+    release_policy: GithubReleasePolicy,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<(GithubReleaseAsset, Option<String>)> {
     let version = normalize_version(&tool.version);
-    let expected_asset_name = (policy.expected_asset_name)(&version)?;
-    let tag = format!("{}{}", policy.tag_prefix, version);
-    let path = format!(
-        "/repos/{}/{}/releases/tags/{tag}",
-        policy.owner, policy.repo
-    );
-    let release = fetch_github_release(policy.project_label, &path, proxy_scope)?;
-    let asset = release
-        .assets
-        .iter()
-        .find(|asset| asset.name == expected_asset_name)
-        .ok_or_else(|| {
-            anyhow!("release `{tag}` does not contain expected asset `{expected_asset_name}`")
-        })?;
-    let expected_sha256 = match policy.verification {
+    let asset = match release_policy.track {
+        GithubReleaseTrack::VersionedTags => {
+            let expected_asset_name = (release_policy.expected_asset_name.ok_or_else(|| {
+                anyhow!(
+                    "release policy for `{}` has no expected asset resolver",
+                    tool.name
+                )
+            })?)(&version)?;
+            let tag = format!("{}{}", release_policy.tag_prefix, version);
+            let path = format!(
+                "/repos/{}/{}/releases/tags/{tag}",
+                release_policy.owner, release_policy.repo
+            );
+            let release = fetch_github_release(release_policy.project_label, &path, proxy_scope)?;
+            release
+                .assets
+                .into_iter()
+                .find(|asset| asset.name == expected_asset_name)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "release `{tag}` does not contain expected asset `{expected_asset_name}`"
+                    )
+                })?
+        }
+        GithubReleaseTrack::RollingTagAssets {
+            tag,
+            asset_prefix,
+            asset_suffix,
+            version_prefix,
+        } => {
+            let path = format!(
+                "/repos/{}/{}/releases/tags/{tag}",
+                release_policy.owner, release_policy.repo
+            );
+            let release = fetch_github_release(release_policy.project_label, &path, proxy_scope)?;
+            find_rolling_asset_for_version(
+                &release,
+                &version,
+                asset_prefix,
+                asset_suffix,
+                version_prefix,
+            )?
+            .clone()
+        }
+    };
+
+    let expected_sha256 = match release_policy.verification {
         GithubReleaseVerification::RequiredSha256Digest => Some(
             asset
                 .digest
@@ -240,12 +383,72 @@ fn download_from_github_release(
         GithubReleaseVerification::NoSha256Digest => None,
     };
 
-    download_from_url(
-        tool,
-        &asset.browser_download_url,
-        expected_sha256.as_deref(),
-        proxy_scope,
-    )
+    Ok((asset, expected_sha256))
+}
+
+fn latest_rolling_asset_version(
+    release: &GithubRelease,
+    tool_policy: ToolPolicy,
+    asset_prefix: &str,
+    asset_suffix: &str,
+    version_prefix: &str,
+) -> Result<String> {
+    release
+        .assets
+        .iter()
+        .filter_map(|asset| {
+            parse_rolling_asset_version(&asset.name, asset_prefix, asset_suffix, version_prefix)
+                .map(|version| (asset, version))
+        })
+        .max_by(|(left_asset, left_version), (right_asset, right_version)| {
+            left_asset
+                .updated_at
+                .cmp(&right_asset.updated_at)
+                .then_with(|| left_version.cmp(right_version))
+        })
+        .map(|(_, version)| version)
+        .ok_or_else(|| {
+            anyhow!(
+                "release metadata for `{}` had no versioned rolling assets",
+                tool_policy.canonical_name
+            )
+        })
+}
+
+fn find_rolling_asset_for_version<'a>(
+    release: &'a GithubRelease,
+    requested_version: &str,
+    asset_prefix: &str,
+    asset_suffix: &str,
+    version_prefix: &str,
+) -> Result<&'a GithubReleaseAsset> {
+    release
+        .assets
+        .iter()
+        .find(|asset| {
+            parse_rolling_asset_version(&asset.name, asset_prefix, asset_suffix, version_prefix)
+                .is_some_and(|version| {
+                    normalize_version(&version) == normalize_version(requested_version)
+                })
+        })
+        .ok_or_else(|| {
+            anyhow!("rolling release does not contain asset for version `{requested_version}`")
+        })
+}
+
+pub(super) fn parse_rolling_asset_version(
+    asset_name: &str,
+    asset_prefix: &str,
+    asset_suffix: &str,
+    version_prefix: &str,
+) -> Option<String> {
+    let middle = asset_name
+        .strip_prefix(asset_prefix)?
+        .strip_suffix(asset_suffix)?;
+    if middle.trim().is_empty() {
+        return None;
+    }
+    Some(format!("{version_prefix}{middle}"))
 }
 
 fn install_from_cargo_package(tool: &ToolRef, package: &str) -> Result<PullSource> {
@@ -283,6 +486,7 @@ fn install_from_cargo_package(tool: &ToolRef, package: &str) -> Result<PullSourc
             if is_executable_file(&p) {
                 return Ok(PullSource::temp(
                     SOURCE_KIND_CARGO_INSTALL,
+                    PullArtifactKind::File,
                     p,
                     format!("cargo install {package}"),
                     install_root.clone(),
@@ -295,6 +499,7 @@ fn install_from_cargo_package(tool: &ToolRef, package: &str) -> Result<PullSourc
         if files.len() == 1 {
             return Ok(PullSource::temp(
                 SOURCE_KIND_CARGO_INSTALL,
+                PullArtifactKind::File,
                 files.remove(0),
                 format!("cargo install {package}"),
                 install_root.clone(),
@@ -514,10 +719,10 @@ pub(super) fn parse_github_sha256_digest(digest: &str) -> Option<String> {
 }
 
 fn download_from_url(
-    tool: &ToolRef,
     url: &str,
     expected_sha256: Option<&str>,
     proxy_scope: za_config::ProxyScope,
+    extraction: DownloadExtractionMode<'_>,
 ) -> Result<PullSource> {
     ensure_not_interrupted()?;
     let download_root = unique_temp_dir(TEMP_DIR_PREFIX_DOWNLOAD)?;
@@ -592,16 +797,28 @@ fn download_from_url(
             print_download_stage(interactive, "verify", "sha256 ok");
         }
 
-        let executable_path = if is_tar_gz_asset(&asset_name) {
-            print_download_stage(interactive, "extract", &asset_name);
-            extract_tar_gz_executable(tool, &asset_path, &download_root)?
-        } else {
-            asset_path
+        let (artifact, resolved_path) = match extraction {
+            DownloadExtractionMode::KeepArchive => {
+                if detect_archive_kind(&asset_name).is_none() {
+                    bail!("downloaded asset `{asset_name}` is not a supported archive");
+                }
+                (PullArtifactKind::Archive, asset_path)
+            }
+            DownloadExtractionMode::PrimaryEntry(tool) => {
+                let resolved_path = if detect_archive_kind(&asset_name).is_some() {
+                    print_download_stage(interactive, "extract", &asset_name);
+                    extract_archive_primary_entry(tool, &asset_path, &download_root)?
+                } else {
+                    asset_path
+                };
+                (PullArtifactKind::File, resolved_path)
+            }
         };
 
         Ok(PullSource::temp(
             SOURCE_KIND_DOWNLOAD,
-            executable_path,
+            artifact,
+            resolved_path,
             match expected_sha256 {
                 Some(expected) => format!("URL {url} (sha256={expected})"),
                 None => format!("URL {url}"),
@@ -1197,23 +1414,74 @@ pub(super) fn truncate_for_log(input: &str, max_chars: usize) -> String {
     out
 }
 
-pub(super) fn is_tar_gz_asset(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with(".tar.gz") || lower.ends_with(".tgz")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveKind {
+    TarGz,
+    TarXz,
 }
 
-fn extract_tar_gz_executable(tool: &ToolRef, archive_path: &Path, root: &Path) -> Result<PathBuf> {
-    let unpack_dir = root.join("unpack");
-    fs::create_dir_all(&unpack_dir)?;
+fn detect_archive_kind(name: &str) -> Option<ArchiveKind> {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+        Some(ArchiveKind::TarGz)
+    } else if lower.ends_with(".tar.xz") || lower.ends_with(".txz") {
+        Some(ArchiveKind::TarXz)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+pub(super) fn is_tar_gz_asset(name: &str) -> bool {
+    detect_archive_kind(name) == Some(ArchiveKind::TarGz)
+}
+
+#[cfg(test)]
+pub(super) fn is_tar_xz_asset(name: &str) -> bool {
+    detect_archive_kind(name) == Some(ArchiveKind::TarXz)
+}
+
+pub(super) fn extract_archive_into_dir(archive_path: &Path, dst: &Path) -> Result<()> {
+    remove_path_if_exists(dst)?;
+    fs::create_dir_all(dst).with_context(|| format!("create {}", dst.display()))?;
+
+    let archive_kind = detect_archive_kind(
+        archive_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default(),
+    )
+    .ok_or_else(|| anyhow!("unsupported archive format `{}`", archive_path.display()))?;
 
     let file = File::open(archive_path)
         .with_context(|| format!("open archive {}", archive_path.display()))?;
-    let gz = GzDecoder::new(file);
-    let mut archive = Archive::new(gz);
-    archive
-        .unpack(&unpack_dir)
-        .with_context(|| format!("extract archive {}", archive_path.display()))?;
+    match archive_kind {
+        ArchiveKind::TarGz => {
+            let gz = GzDecoder::new(file);
+            let mut archive = Archive::new(gz);
+            archive
+                .unpack(dst)
+                .with_context(|| format!("extract archive {}", archive_path.display()))?;
+        }
+        ArchiveKind::TarXz => {
+            let xz = XzDecoder::new(file);
+            let mut archive = Archive::new(xz);
+            archive
+                .unpack(dst)
+                .with_context(|| format!("extract archive {}", archive_path.display()))?;
+        }
+    }
 
+    Ok(())
+}
+
+fn extract_archive_primary_entry(
+    tool: &ToolRef,
+    archive_path: &Path,
+    root: &Path,
+) -> Result<PathBuf> {
+    let unpack_dir = root.join("unpack");
+    extract_archive_into_dir(archive_path, &unpack_dir)?;
     select_executable_from_dir(tool, &unpack_dir)
 }
 

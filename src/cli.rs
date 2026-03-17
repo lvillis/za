@@ -155,6 +155,9 @@ pub enum ToolCommands {
         /// Adopt an existing unmanaged binary already present in this scope. Requires exactly one tool.
         #[arg(long)]
         adopt: bool,
+        /// Preview the resolved install plan without downloading or changing any files.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List managed tools and availability in this scope
     #[command(name = "ls", alias = "list")]
@@ -184,6 +187,9 @@ pub enum ToolCommands {
         /// Pin the update target to a specific version. Requires exactly one tool.
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
+        /// Preview the resolved update plan without downloading or changing any files.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show detailed managed state for one tool
     #[command(alias = "inspect")]
@@ -601,6 +607,7 @@ mod tests {
                         tools,
                         version: Some(version),
                         adopt: false,
+                        dry_run: false,
                     } if tools == vec!["codex"] && version == "0.105.0"
                 ));
             }
@@ -621,6 +628,7 @@ mod tests {
                         tools,
                         version: None,
                         adopt: false,
+                        dry_run: false,
                     } if tools == vec!["just", "cross"]
                 ));
             }
@@ -637,7 +645,11 @@ mod tests {
                 assert!(user);
                 assert!(matches!(
                     cmd,
-                    ToolCommands::Update { tools, version: None } if tools == vec!["codex", "rg"]
+                    ToolCommands::Update {
+                        tools,
+                        version: None,
+                        dry_run: false,
+                    } if tools == vec!["codex", "rg"]
                 ));
             }
             _ => panic!("unexpected command"),
@@ -705,6 +717,46 @@ mod tests {
                         tools,
                         version: None,
                         adopt: true,
+                        dry_run: false,
+                    } if tools == vec!["codex"]
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn tool_install_parses_dry_run_flag() {
+        let cli = Cli::try_parse_from(["za", "tool", "install", "ble.sh", "--dry-run"])
+            .expect("must parse");
+        match cli.cmd {
+            Commands::Tool { cmd, .. } => {
+                assert!(matches!(
+                    cmd,
+                    ToolCommands::Install {
+                        tools,
+                        version: None,
+                        adopt: false,
+                        dry_run: true,
+                    } if tools == vec!["ble.sh"]
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn tool_update_parses_dry_run_flag() {
+        let cli = Cli::try_parse_from(["za", "tool", "update", "codex", "--dry-run"])
+            .expect("must parse");
+        match cli.cmd {
+            Commands::Tool { cmd, .. } => {
+                assert!(matches!(
+                    cmd,
+                    ToolCommands::Update {
+                        tools,
+                        version: None,
+                        dry_run: true,
                     } if tools == vec!["codex"]
                 ));
             }

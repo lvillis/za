@@ -1,7 +1,7 @@
 use super::policy::GithubReleaseVerification;
 use super::{
-    LatestCheck, ManagedFileChange, STARSHIP_BASH_INIT_END_MARKER, STARSHIP_BASH_INIT_START_MARKER,
-    ToolHome, ToolRef, ToolScope, ToolSpec, canonical_tool_name,
+    LatestCheck, ManagedBlockPosition, ManagedFileChange, STARSHIP_BASH_INIT_END_MARKER,
+    STARSHIP_BASH_INIT_START_MARKER, ToolHome, ToolRef, ToolScope, ToolSpec, canonical_tool_name,
     cleanup_legacy_current_dir_artifacts, collect_managed_tool_names, command_candidates,
     extract_version_from_text, find_tool_policy, latest_check_progress_message, list_update_status,
     load_sync_specs_from_manifest, normalize_version, prune_non_active_versions, source,
@@ -45,8 +45,34 @@ fn download_filename_reads_url_basename() {
 fn tar_asset_detection_works() {
     assert!(source::is_tar_gz_asset("a.tar.gz"));
     assert!(source::is_tar_gz_asset("A.TGZ"));
+    assert!(source::is_tar_xz_asset("a.tar.xz"));
+    assert!(source::is_tar_xz_asset("A.TXZ"));
     assert!(!source::is_tar_gz_asset("a.zip"));
     assert!(!source::is_tar_gz_asset("codex"));
+    assert!(!source::is_tar_xz_asset("a.zip"));
+    assert!(!source::is_tar_xz_asset("codex"));
+}
+
+#[test]
+fn parse_rolling_asset_version_extracts_blesh_nightly_version() {
+    assert_eq!(
+        source::parse_rolling_asset_version(
+            "ble-nightly-20260310+8f3c1ab.tar.xz",
+            "ble-nightly-",
+            ".tar.xz",
+            "nightly-"
+        ),
+        Some("nightly-20260310+8f3c1ab".to_string())
+    );
+    assert_eq!(
+        source::parse_rolling_asset_version(
+            "ble-nightly.tar.xz",
+            "ble-nightly-",
+            ".tar.xz",
+            "nightly-"
+        ),
+        None
+    );
 }
 
 #[test]
@@ -314,6 +340,19 @@ fn tool_policy_matches_alias_and_canonical() {
         cross.github_release.expect("github policy").verification,
         GithubReleaseVerification::NoSha256Digest
     );
+    let blesh_alias = find_tool_policy("blesh").expect("alias policy");
+    let blesh = find_tool_policy("ble.sh").expect("canonical policy");
+    assert_eq!(blesh_alias.canonical_name, "ble.sh");
+    assert_eq!(blesh.canonical_name, "ble.sh");
+    assert_eq!(blesh.cargo_fallback_package, None);
+    assert_eq!(
+        blesh.source_label,
+        "GitHub nightly rolling release (commit-tracked; SHA-256 unavailable)"
+    );
+    assert_eq!(
+        blesh.github_release.expect("github policy").verification,
+        GithubReleaseVerification::NoSha256Digest
+    );
     assert!(find_tool_policy("unknown-tool").is_none());
 }
 
@@ -329,6 +368,7 @@ fn canonical_tool_name_resolves_aliases() {
     assert_eq!(canonical_tool_name("git-cliff"), "git-cliff");
     assert_eq!(canonical_tool_name("cargo-release"), "cargo-release");
     assert_eq!(canonical_tool_name("cross"), "cross");
+    assert_eq!(canonical_tool_name("blesh"), "ble.sh");
 }
 
 #[test]
@@ -351,6 +391,8 @@ fn supported_tool_names_csv_contains_all_aliases() {
     assert!(csv.contains("git-cliff"));
     assert!(csv.contains("cargo-release"));
     assert!(csv.contains("cross"));
+    assert!(csv.contains("ble.sh"));
+    assert!(csv.contains("blesh"));
 }
 
 #[test]
@@ -378,6 +420,7 @@ fn starship_bash_init_managed_block_is_idempotent() {
         &rc_path,
         STARSHIP_BASH_INIT_START_MARKER,
         STARSHIP_BASH_INIT_END_MARKER,
+        ManagedBlockPosition::Bottom,
         starship_bash_init_block(),
     )
     .expect("insert block");
@@ -385,6 +428,7 @@ fn starship_bash_init_managed_block_is_idempotent() {
         &rc_path,
         STARSHIP_BASH_INIT_START_MARKER,
         STARSHIP_BASH_INIT_END_MARKER,
+        ManagedBlockPosition::Bottom,
         starship_bash_init_block(),
     )
     .expect("update block");
@@ -405,7 +449,8 @@ fn starship_policy_expected_asset_name_matches_supported_tarball() {
         .expect("policy")
         .github_release
         .expect("github policy");
-    let asset_name = (policy.expected_asset_name)("1.24.2").expect("asset name");
+    let asset_name =
+        (policy.expected_asset_name.expect("asset resolver"))("1.24.2").expect("asset name");
     let expected_target = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => "x86_64-unknown-linux-musl",
         ("linux", "aarch64") => "aarch64-unknown-linux-musl",
@@ -422,7 +467,8 @@ fn git_cliff_policy_expected_asset_name_matches_supported_tarball() {
         .expect("policy")
         .github_release
         .expect("github policy");
-    let asset_name = (policy.expected_asset_name)("2.12.0").expect("asset name");
+    let asset_name =
+        (policy.expected_asset_name.expect("asset resolver"))("2.12.0").expect("asset name");
     let expected_target = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => "x86_64-unknown-linux-musl",
         ("linux", "aarch64") => "aarch64-unknown-linux-musl",
@@ -442,7 +488,8 @@ fn cargo_release_policy_expected_asset_name_matches_supported_tarball() {
         .expect("policy")
         .github_release
         .expect("github policy");
-    let asset_name = (policy.expected_asset_name)("1.1.1").expect("asset name");
+    let asset_name =
+        (policy.expected_asset_name.expect("asset resolver"))("1.1.1").expect("asset name");
     let expected_target = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => "x86_64-unknown-linux-musl",
         ("linux", "aarch64") => "aarch64-unknown-linux-musl",

@@ -77,6 +77,7 @@ za tool install dust
 za tool install just
 za tool install oha
 za tool install starship
+za tool install ble.sh
 za tool install git-cliff
 za tool install cargo-release
 za tool install cross
@@ -240,6 +241,7 @@ Current built-in tool policies:
 | `just` | - | GitHub Release (SHA-256 verify) |
 | `oha` | - | GitHub Release (SHA-256 verify) |
 | `starship` | - | GitHub Release (SHA-256 verify) |
+| `ble.sh` | `blesh` | GitHub nightly rolling release (commit-tracked; SHA-256 unavailable) |
 | `git-cliff` | - | GitHub Release (SHA-256 verify) |
 | `cargo-release` | - | GitHub Release (SHA-256 verify) |
 | `cross` | - | GitHub Release (SHA-256 unavailable; unverified) |
@@ -249,10 +251,14 @@ Current built-in tool policies:
 ```bash
 # install the latest release and make it active
 za tool install codex
-za tool install just starship git-cliff cargo-release cross
+za tool install just starship ble.sh git-cliff cargo-release cross
 
 # install a specific version and make it active
 za tool install codex --version 0.105.0
+
+# preview the resolved install/update plan without changing anything
+za tool install ble.sh --dry-run
+za tool update codex --dry-run
 
 # inspect the current managed state
 za tool ls
@@ -282,6 +288,10 @@ za tool uninstall codex
 ```
 
 `za tool install starship` also upserts a managed `~/.bashrc` block that initializes the prompt only when `TERMINAL_EMULATOR=JetBrains-JediTerm`. Installation does not patch the current shell process; open a new JetBrains bash shell or `source ~/.bashrc` after install.
+
+`za tool install ble.sh` tracks the upstream rolling `nightly` release instead of the stale stable release. It installs `ble.sh` as a managed package payload, keeps a stable active path under the tool state directory, and upserts JetBrains-only top/bottom `~/.bashrc` blocks so `source -- .../ble.sh --attach=none` and `ble-attach` stay in sync across updates.
+
+`za tool install --dry-run` and `za tool update --dry-run` resolve the target version and source policy, preview activation/shell-init changes, and make no filesystem changes.
 
 `za tool install` and `za tool update` are interruption-safe: pressing `Ctrl+C` aborts cleanly and temporary download directories are removed automatically (stale leftovers are cleaned on next run). Output is stage-oriented (`resolve`, `source`, `install`, `activate`, `prune`) so it is obvious where a run is spending time.
 For large GitHub release assets, `za` will use parallel HTTP range downloads when the upstream supports it, emit explicit `download` / `verify` / `extract` stages, and automatically fall back to a single stream otherwise.

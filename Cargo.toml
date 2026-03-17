@@ -47,6 +47,7 @@ rustls = { version = "0.23.36", default-features = false, features = ["ring"] }
 # Archive extraction for downloaded binaries.
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 tar = { version = "0.4.44", default-features = false }
+xz2 = { version = "0.1.7", default-features = false }
 
 [features]
 default = []

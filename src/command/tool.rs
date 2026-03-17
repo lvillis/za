@@ -5,7 +5,6 @@ mod policy;
 mod source;
 
 use anyhow::{Context, Result, anyhow, bail};
-use flate2::read::GzDecoder;
 use fs4::fs_std::FileExt;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use regex::Regex;
@@ -17,6 +16,8 @@ use reqx::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use signal_hook::{consts::signal::SIGINT, flag as signal_flag};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
@@ -31,17 +32,14 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tar::Archive;
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 #[cfg(test)]
 use self::listing::{LatestCheck, latest_check_progress_message, list_update_status};
 use self::listing::{UnmanagedBinary, list_installed, list_outdated, show_catalog, show_tool};
 use self::policy::{
-    GithubReleasePolicy, ToolPolicy, canonical_tool_name as canonical_tool_name_impl,
-    find_tool_policy, supported_tool_names_csv, tool_policies,
+    GithubReleasePolicy, PackagePolicy, ToolLayout, ToolPolicy,
+    canonical_tool_name as canonical_tool_name_impl, find_tool_policy, supported_tool_names_csv,
+    tool_policies,
 };
 use self::source::{resolve_install_source, resolve_requested_version};
 use crate::{cli::ToolCommands, command::za_config};
@@ -61,6 +59,10 @@ const SOURCE_KIND_ADOPTED: &str = "adopted";
 const SOURCE_KIND_SYNTHESIZED: &str = "synthesized";
 const STARSHIP_BASH_INIT_START_MARKER: &str = "# >>> za starship (bash) >>>";
 const STARSHIP_BASH_INIT_END_MARKER: &str = "# <<< za starship (bash) <<<";
+const BLESH_BASH_INIT_TOP_START_MARKER: &str = "# >>> za ble.sh (bash top) >>>";
+const BLESH_BASH_INIT_TOP_END_MARKER: &str = "# <<< za ble.sh (bash top) <<<";
+const BLESH_BASH_INIT_BOTTOM_START_MARKER: &str = "# >>> za ble.sh (bash bottom) >>>";
+const BLESH_BASH_INIT_BOTTOM_END_MARKER: &str = "# <<< za ble.sh (bash bottom) <<<";
 const PROXY_HINT: &str =
     "if your network requires a proxy, set HTTPS_PROXY/HTTP_PROXY (and optional NO_PROXY)";
 const TOOL_UPDATE_CACHE_SCHEMA_VERSION: u32 = 1;
@@ -301,29 +303,60 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
             tools,
             version,
             adopt,
+            dry_run,
         } => {
-            let home_for_action = home.clone();
-            run_mutating_tool_command(&home, scope, move || {
+            if dry_run {
                 install_tools(
-                    &home_for_action,
+                    &home,
                     &tools,
                     version.as_deref(),
                     adopt,
                     ToolAction::Install,
-                )
-            })
+                    true,
+                )?;
+                Ok(0)
+            } else {
+                let home_for_action = home.clone();
+                run_mutating_tool_command(&home, scope, move || {
+                    install_tools(
+                        &home_for_action,
+                        &tools,
+                        version.as_deref(),
+                        adopt,
+                        ToolAction::Install,
+                        false,
+                    )
+                })
+            }
         }
-        ToolCommands::Update { tools, version } => {
-            let home_for_action = home.clone();
-            run_mutating_tool_command(&home, scope, move || {
+        ToolCommands::Update {
+            tools,
+            version,
+            dry_run,
+        } => {
+            if dry_run {
                 install_tools(
-                    &home_for_action,
+                    &home,
                     &tools,
                     version.as_deref(),
                     false,
                     ToolAction::Update,
-                )
-            })
+                    true,
+                )?;
+                Ok(0)
+            } else {
+                let home_for_action = home.clone();
+                run_mutating_tool_command(&home, scope, move || {
+                    install_tools(
+                        &home_for_action,
+                        &tools,
+                        version.as_deref(),
+                        false,
+                        ToolAction::Update,
+                        false,
+                    )
+                })
+            }
         }
         ToolCommands::Sync { file } => {
             let home_for_action = home.clone();
@@ -358,6 +391,7 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
                     None,
                     true,
                     ToolAction::Install,
+                    false,
                 )
             })
         }
@@ -571,6 +605,12 @@ impl ManagedFileChange {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedBlockPosition {
+    Top,
+    Bottom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdoptionMode {
     Disallow,
     Require,
@@ -582,6 +622,7 @@ struct InstallOptions {
     adoption: AdoptionMode,
     prune_after_activation: bool,
     proxy_scope: za_config::ProxyScope,
+    dry_run: bool,
 }
 
 impl InstallOptions {
@@ -591,6 +632,7 @@ impl InstallOptions {
             adoption: AdoptionMode::Disallow,
             prune_after_activation: true,
             proxy_scope,
+            dry_run: false,
         }
     }
 
@@ -600,6 +642,7 @@ impl InstallOptions {
             adoption: AdoptionMode::Disallow,
             prune_after_activation: true,
             proxy_scope,
+            dry_run: false,
         }
     }
 
@@ -609,6 +652,7 @@ impl InstallOptions {
             adoption: AdoptionMode::Require,
             prune_after_activation: false,
             proxy_scope,
+            dry_run: false,
         }
     }
 
@@ -616,20 +660,39 @@ impl InstallOptions {
         self.prune_after_activation = prune_after_activation;
         self
     }
+
+    fn dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+}
+
+#[derive(Debug)]
+enum PullArtifactKind {
+    File,
+    Archive,
 }
 
 #[derive(Debug)]
 struct PullSource {
     kind: &'static str,
+    artifact: PullArtifactKind,
     path: PathBuf,
     resolved_by: String,
     cleanup_root: Option<PathBuf>,
 }
 
 impl PullSource {
-    fn temp(kind: &'static str, path: PathBuf, resolved_by: String, cleanup_root: PathBuf) -> Self {
+    fn temp(
+        kind: &'static str,
+        artifact: PullArtifactKind,
+        path: PathBuf,
+        resolved_by: String,
+        cleanup_root: PathBuf,
+    ) -> Self {
         Self {
             kind,
+            artifact,
             path,
             resolved_by,
             cleanup_root: Some(cleanup_root),
@@ -828,14 +891,22 @@ impl ToolHome {
     }
 
     fn install_path(&self, tool: &ToolRef) -> PathBuf {
-        self.store_dir
-            .join(&tool.name)
-            .join(&tool.version)
-            .join(&tool.name)
+        match package_policy_for_name(&tool.name) {
+            Some(package) => self.package_payload_dir(tool).join(package.entry_relpath),
+            None => self
+                .store_dir
+                .join(&tool.name)
+                .join(&tool.version)
+                .join(&tool.name),
+        }
     }
 
     fn version_dir(&self, tool: &ToolRef) -> PathBuf {
         self.store_dir.join(&tool.name).join(&tool.version)
+    }
+
+    fn package_payload_dir(&self, tool: &ToolRef) -> PathBuf {
+        self.version_dir(tool).join("payload")
     }
 
     fn manifest_path(&self, tool: &ToolRef) -> PathBuf {
@@ -850,8 +921,19 @@ impl ToolHome {
         self.current_dir.join(name)
     }
 
+    fn current_package_path(&self, name: &str) -> PathBuf {
+        self.current_dir.join(format!("{name}.payload"))
+    }
+
     fn bin_path(&self, name: &str) -> PathBuf {
         self.bin_dir.join(name)
+    }
+
+    fn active_path(&self, name: &str) -> PathBuf {
+        match package_policy_for_name(name) {
+            Some(package) => self.current_package_path(name).join(package.entry_relpath),
+            None => self.bin_path(name),
+        }
     }
 
     fn lock_file(&self) -> PathBuf {
@@ -885,6 +967,95 @@ impl ToolLock {
 impl Drop for ToolLock {
     fn drop(&mut self) {
         let _ = self._file.unlock();
+    }
+}
+
+fn materialize_pulled_tool(home: &ToolHome, tool: &ToolRef, source: &PullSource) -> Result<()> {
+    match tool_layout_for_name(&tool.name) {
+        ToolLayout::Binary => {
+            if !matches!(source.artifact, PullArtifactKind::File) {
+                bail!(
+                    "resolved install source for `{}` was not a direct executable payload",
+                    tool.name
+                );
+            }
+            copy_executable(&source.path, &home.install_path(tool))
+        }
+        ToolLayout::Package => stage_package_payload(home, tool, source),
+    }
+}
+
+fn stage_package_payload(home: &ToolHome, tool: &ToolRef, source: &PullSource) -> Result<()> {
+    if !matches!(source.artifact, PullArtifactKind::Archive) {
+        bail!(
+            "resolved install source for `{}` was not an archive payload",
+            tool.name
+        );
+    }
+
+    let version_dir = home.version_dir(tool);
+    let unpack_dir = version_dir.join(".unpack");
+    let payload_dir = home.package_payload_dir(tool);
+    let run = (|| -> Result<()> {
+        remove_path_if_exists(&unpack_dir)?;
+        fs::create_dir_all(&version_dir)?;
+        source::extract_archive_into_dir(&source.path, &unpack_dir)?;
+        let staged_root = select_extracted_payload_root(&unpack_dir)?;
+        remove_path_if_exists(&payload_dir)?;
+        if staged_root == unpack_dir {
+            fs::rename(&unpack_dir, &payload_dir).with_context(|| {
+                format!(
+                    "stage package payload {} -> {}",
+                    unpack_dir.display(),
+                    payload_dir.display()
+                )
+            })?;
+        } else {
+            fs::rename(&staged_root, &payload_dir).with_context(|| {
+                format!(
+                    "stage package payload {} -> {}",
+                    staged_root.display(),
+                    payload_dir.display()
+                )
+            })?;
+            remove_path_if_exists(&unpack_dir)?;
+        }
+        let entry_path = home.install_path(tool);
+        if !entry_path.exists() {
+            bail!(
+                "package payload for `{}` missing expected entry {}",
+                tool.name,
+                entry_path.display()
+            );
+        }
+        Ok(())
+    })();
+
+    if run.is_err() {
+        let _ = remove_path_if_exists(&version_dir);
+    }
+    run
+}
+
+fn select_extracted_payload_root(unpack_dir: &Path) -> Result<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut other_entries = Vec::new();
+    for entry in
+        fs::read_dir(unpack_dir).with_context(|| format!("read {}", unpack_dir.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            dirs.push(entry.path());
+        } else {
+            other_entries.push(entry.path());
+        }
+    }
+
+    if dirs.len() == 1 && other_entries.is_empty() {
+        Ok(dirs.remove(0))
+    } else {
+        Ok(unpack_dir.to_path_buf())
     }
 }
 
@@ -945,6 +1116,11 @@ fn install(home: &ToolHome, mut requested: ToolSpec, options: InstallOptions) ->
         }
     }
 
+    if options.dry_run {
+        preview_install(home, &tool, adoption.as_ref(), already_installed, options)?;
+        return Ok(tool);
+    }
+
     if !already_installed {
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
@@ -976,7 +1152,7 @@ fn install(home: &ToolHome, mut requested: ToolSpec, options: InstallOptions) ->
                 }
             };
             ensure_not_interrupted()?;
-            copy_executable(&src.path, &dst)?;
+            materialize_pulled_tool(home, &tool, &src)?;
             InstallSource {
                 kind: src.kind,
                 detail: src.resolved_by.clone(),
@@ -996,12 +1172,12 @@ fn install(home: &ToolHome, mut requested: ToolSpec, options: InstallOptions) ->
     print_tool_stage(
         "activate",
         format!(
-            "{} (bin: {})",
+            "{} (path: {})",
             tool.image(),
-            home.bin_path(&tool.name).display()
+            home.active_path(&tool.name).display()
         ),
     );
-    ensure_post_activation_integrations(&tool)?;
+    ensure_post_activation_integrations(home, &tool)?;
     if options.prune_after_activation {
         let removed = prune_non_active_versions(home, &tool)?;
         if !removed.is_empty() {
@@ -1019,11 +1195,82 @@ fn install(home: &ToolHome, mut requested: ToolSpec, options: InstallOptions) ->
     Ok(tool)
 }
 
-fn ensure_post_activation_integrations(tool: &ToolRef) -> Result<()> {
-    if tool.name != "starship" {
-        return Ok(());
+fn preview_install(
+    home: &ToolHome,
+    tool: &ToolRef,
+    adoption: Option<&AdoptionCandidate>,
+    already_installed: bool,
+    options: InstallOptions,
+) -> Result<()> {
+    if !already_installed {
+        if let Some(adopted) = adoption.filter(|a| a.version == tool.version) {
+            print_tool_stage(
+                "source",
+                format!("would adopt existing binary {}", adopted.path.display()),
+            );
+        } else {
+            let source = match source::preview_install_source(tool, options.proxy_scope) {
+                Ok(source) => source,
+                Err(err) => {
+                    return Err(match install_source_failure_guidance(&err) {
+                        Some(guidance) => err.context(guidance),
+                        None => err,
+                    });
+                }
+            };
+            print_tool_stage(
+                "source",
+                format!(
+                    "would fetch `{}` {} from {}",
+                    tool.name, tool.version, source.detail
+                ),
+            );
+        }
+        print_tool_stage("install", format!("would install {}", tool.image()));
+    } else {
+        print_tool_stage("install", format!("already installed {}", tool.image()));
     }
-    ensure_starship_bash_init()
+
+    print_tool_stage(
+        "activate",
+        format!(
+            "would activate {} (path: {})",
+            tool.image(),
+            home.active_path(&tool.name).display()
+        ),
+    );
+    preview_post_activation_integrations(home, tool)?;
+    if options.prune_after_activation {
+        let removed = stale_versions_to_prune(home, tool)?;
+        if !removed.is_empty() {
+            print_tool_stage(
+                "prune",
+                format!(
+                    "would remove old `{}` versions: {}",
+                    tool.name,
+                    removed.join(", ")
+                ),
+            );
+        }
+    }
+    print_tool_stage("next", "dry-run only; no changes were made");
+    Ok(())
+}
+
+fn ensure_post_activation_integrations(home: &ToolHome, tool: &ToolRef) -> Result<()> {
+    match tool.name.as_str() {
+        "starship" => ensure_starship_bash_init(),
+        "ble.sh" => ensure_blesh_bash_init(home, tool),
+        _ => Ok(()),
+    }
+}
+
+fn preview_post_activation_integrations(home: &ToolHome, tool: &ToolRef) -> Result<()> {
+    match tool.name.as_str() {
+        "starship" => preview_starship_bash_init(),
+        "ble.sh" => preview_blesh_bash_init(home, tool),
+        _ => Ok(()),
+    }
 }
 
 fn ensure_starship_bash_init() -> Result<()> {
@@ -1032,6 +1279,7 @@ fn ensure_starship_bash_init() -> Result<()> {
         &rc_path,
         STARSHIP_BASH_INIT_START_MARKER,
         STARSHIP_BASH_INIT_END_MARKER,
+        ManagedBlockPosition::Bottom,
         starship_bash_init_block(),
     )
     .with_context(|| format!("configure starship bash init in `{}`", rc_path.display()))?;
@@ -1047,10 +1295,135 @@ fn ensure_starship_bash_init() -> Result<()> {
     Ok(())
 }
 
+fn preview_starship_bash_init() -> Result<()> {
+    let rc_path = resolve_home_dir()?.join(".bashrc");
+    let change = preview_managed_block(
+        &rc_path,
+        STARSHIP_BASH_INIT_START_MARKER,
+        STARSHIP_BASH_INIT_END_MARKER,
+        ManagedBlockPosition::Bottom,
+        starship_bash_init_block(),
+    )?;
+    print_tool_stage(
+        "next",
+        format!(
+            "starship bash init would be {} in {}",
+            change.label(),
+            rc_path.display()
+        ),
+    );
+    Ok(())
+}
+
 fn resolve_home_dir() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("cannot resolve home directory: set `HOME`"))
+}
+
+fn ensure_blesh_bash_init(home: &ToolHome, tool: &ToolRef) -> Result<()> {
+    if home.scope != ToolScope::User {
+        print_tool_stage(
+            "next",
+            "ble.sh bash init is only auto-managed for `za tool --user`; source the managed path manually in other scopes",
+        );
+        return Ok(());
+    }
+
+    let rc_path = resolve_home_dir()?.join(".bashrc");
+    let active_path = home.active_path(&tool.name);
+    let top_change = upsert_managed_block(
+        &rc_path,
+        BLESH_BASH_INIT_TOP_START_MARKER,
+        BLESH_BASH_INIT_TOP_END_MARKER,
+        ManagedBlockPosition::Top,
+        &blesh_bash_init_top_block(&active_path),
+    )
+    .with_context(|| format!("configure ble.sh bash prelude in `{}`", rc_path.display()))?;
+    let bottom_change = upsert_managed_block(
+        &rc_path,
+        BLESH_BASH_INIT_BOTTOM_START_MARKER,
+        BLESH_BASH_INIT_BOTTOM_END_MARKER,
+        ManagedBlockPosition::Bottom,
+        blesh_bash_init_bottom_block(),
+    )
+    .with_context(|| {
+        format!(
+            "configure ble.sh bash attach hook in `{}`",
+            rc_path.display()
+        )
+    })?;
+    print_tool_stage(
+        "next",
+        format!(
+            "ble.sh bash init top={} bottom={} in {}; open a new JetBrains bash shell or `source {}`",
+            top_change.label(),
+            bottom_change.label(),
+            rc_path.display(),
+            rc_path.display()
+        ),
+    );
+    Ok(())
+}
+
+fn preview_blesh_bash_init(home: &ToolHome, tool: &ToolRef) -> Result<()> {
+    if home.scope != ToolScope::User {
+        print_tool_stage(
+            "next",
+            "ble.sh bash init would not be auto-managed outside `za tool --user`",
+        );
+        return Ok(());
+    }
+
+    let rc_path = resolve_home_dir()?.join(".bashrc");
+    let active_path = home.active_path(&tool.name);
+    let top_change = preview_managed_block(
+        &rc_path,
+        BLESH_BASH_INIT_TOP_START_MARKER,
+        BLESH_BASH_INIT_TOP_END_MARKER,
+        ManagedBlockPosition::Top,
+        &blesh_bash_init_top_block(&active_path),
+    )?;
+    let bottom_change = preview_managed_block(
+        &rc_path,
+        BLESH_BASH_INIT_BOTTOM_START_MARKER,
+        BLESH_BASH_INIT_BOTTOM_END_MARKER,
+        ManagedBlockPosition::Bottom,
+        blesh_bash_init_bottom_block(),
+    )?;
+    print_tool_stage(
+        "next",
+        format!(
+            "ble.sh bash init would set top={} bottom={} in {}",
+            top_change.label(),
+            bottom_change.label(),
+            rc_path.display()
+        ),
+    );
+    Ok(())
+}
+
+fn cleanup_post_uninstall_integrations(home: &ToolHome, name: &str) -> Result<()> {
+    if name != "ble.sh" || home.scope != ToolScope::User {
+        return Ok(());
+    }
+
+    let rc_path = resolve_home_dir()?.join(".bashrc");
+    remove_managed_block(
+        &rc_path,
+        BLESH_BASH_INIT_TOP_START_MARKER,
+        BLESH_BASH_INIT_TOP_END_MARKER,
+    )?;
+    remove_managed_block(
+        &rc_path,
+        BLESH_BASH_INIT_BOTTOM_START_MARKER,
+        BLESH_BASH_INIT_BOTTOM_END_MARKER,
+    )?;
+    print_tool_stage(
+        "next",
+        format!("removed ble.sh bash init from {}", rc_path.display()),
+    );
+    Ok(())
 }
 
 fn starship_bash_init_block() -> &'static str {
@@ -1059,55 +1432,129 @@ fn starship_bash_init_block() -> &'static str {
 fi"#
 }
 
+fn blesh_bash_init_top_block(active_path: &Path) -> String {
+    format!(
+        r#"if [ "${{TERMINAL_EMULATOR-}}" = "JetBrains-JediTerm" ] && [[ $- == *i* ]]; then
+  source -- "{}" --attach=none
+fi"#,
+        active_path.display()
+    )
+}
+
+fn blesh_bash_init_bottom_block() -> &'static str {
+    r#"if [ "${TERMINAL_EMULATOR-}" = "JetBrains-JediTerm" ] && [[ ${BLE_VERSION-} ]]; then
+  ble-attach
+fi"#
+}
+
 fn upsert_managed_block(
     target_path: &Path,
     start_marker: &str,
     end_marker: &str,
+    position: ManagedBlockPosition,
     body: &str,
 ) -> Result<ManagedFileChange> {
+    let (updated, change) =
+        compute_upsert_managed_block(target_path, start_marker, end_marker, position, body)?;
+    if !matches!(change, ManagedFileChange::Unchanged) {
+        fs::write(target_path, updated)
+            .with_context(|| format!("write `{}`", target_path.display()))?;
+    }
+    Ok(change)
+}
+
+fn preview_managed_block(
+    target_path: &Path,
+    start_marker: &str,
+    end_marker: &str,
+    position: ManagedBlockPosition,
+    body: &str,
+) -> Result<ManagedFileChange> {
+    let (_, change) =
+        compute_upsert_managed_block(target_path, start_marker, end_marker, position, body)?;
+    Ok(change)
+}
+
+fn compute_upsert_managed_block(
+    target_path: &Path,
+    start_marker: &str,
+    end_marker: &str,
+    position: ManagedBlockPosition,
+    body: &str,
+) -> Result<(String, ManagedFileChange)> {
     let existing = match fs::read_to_string(target_path) {
         Ok(content) => content,
         Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(err).with_context(|| format!("read `{}`", target_path.display())),
     };
     let block = format!("{start_marker}\n{body}\n{end_marker}");
-    let (updated, change) = if let Some(start) = existing.find(start_marker) {
-        let end = existing[start..]
-            .find(end_marker)
-            .map(|offset| start + offset + end_marker.len())
-            .ok_or_else(|| {
-                anyhow!(
-                    "found `{start_marker}` in `{}` without matching `{end_marker}`",
-                    target_path.display()
-                )
-            })?;
-        let prefix = existing[..start].trim_end_matches('\n');
-        let suffix = existing[end..].trim_start_matches('\n');
-        let updated = match (prefix.is_empty(), suffix.is_empty()) {
-            (true, true) => format!("{block}\n"),
-            (true, false) => format!("{block}\n\n{suffix}"),
-            (false, true) => format!("{prefix}\n\n{block}\n"),
-            (false, false) => format!("{prefix}\n\n{block}\n\n{suffix}"),
-        };
-        let change = if updated == existing {
-            ManagedFileChange::Unchanged
-        } else {
-            ManagedFileChange::Updated
-        };
-        (updated, change)
-    } else if existing.trim().is_empty() {
-        (format!("{block}\n"), ManagedFileChange::Created)
+    let (remaining, existed) =
+        remove_managed_block_from_content(&existing, target_path, start_marker, end_marker)?;
+    let updated = insert_managed_block(&remaining, &block, position);
+    let change = if updated == existing {
+        ManagedFileChange::Unchanged
+    } else if existed {
+        ManagedFileChange::Updated
     } else {
-        (
-            format!("{}\n\n{block}\n", existing.trim_end()),
-            ManagedFileChange::Created,
-        )
+        ManagedFileChange::Created
     };
-    if !matches!(change, ManagedFileChange::Unchanged) {
+    Ok((updated, change))
+}
+
+fn remove_managed_block(target_path: &Path, start_marker: &str, end_marker: &str) -> Result<bool> {
+    let existing = match fs::read_to_string(target_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("read `{}`", target_path.display())),
+    };
+    let (updated, removed) =
+        remove_managed_block_from_content(&existing, target_path, start_marker, end_marker)?;
+    if removed {
         fs::write(target_path, updated)
             .with_context(|| format!("write `{}`", target_path.display()))?;
     }
-    Ok(change)
+    Ok(removed)
+}
+
+fn remove_managed_block_from_content(
+    existing: &str,
+    target_path: &Path,
+    start_marker: &str,
+    end_marker: &str,
+) -> Result<(String, bool)> {
+    let Some(start) = existing.find(start_marker) else {
+        return Ok((existing.to_string(), false));
+    };
+    let end = existing[start..]
+        .find(end_marker)
+        .map(|offset| start + offset + end_marker.len())
+        .ok_or_else(|| {
+            anyhow!(
+                "found `{start_marker}` in `{}` without matching `{end_marker}`",
+                target_path.display()
+            )
+        })?;
+    let prefix = existing[..start].trim_end_matches('\n');
+    let suffix = existing[end..].trim_start_matches('\n');
+    let updated = match (prefix.is_empty(), suffix.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!("{suffix}\n"),
+        (false, true) => format!("{prefix}\n"),
+        (false, false) => format!("{prefix}\n\n{suffix}\n"),
+    };
+    Ok((updated, true))
+}
+
+fn insert_managed_block(content: &str, block: &str, position: ManagedBlockPosition) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return format!("{block}\n");
+    }
+
+    match position {
+        ManagedBlockPosition::Top => format!("{block}\n\n{}\n", content.trim()),
+        ManagedBlockPosition::Bottom => format!("{}\n\n{block}\n", content.trim_end()),
+    }
 }
 
 fn install_tools(
@@ -1116,6 +1563,7 @@ fn install_tools(
     version: Option<&str>,
     adopt: bool,
     action: ToolAction,
+    dry_run: bool,
 ) -> Result<()> {
     if adopt && version.is_some() {
         bail!("`za tool install --adopt` does not accept `--version`");
@@ -1154,14 +1602,18 @@ fn install_tools(
             println!("➡️  [{}/{}] {}", idx + 1, total, name);
         }
         if adopt {
-            adopt_tool(home, name)?;
+            adopt_tool(home, name, dry_run)?;
         } else {
             let _ = install(
                 home,
                 ToolSpec::from_args(name, version)?,
                 match action {
-                    ToolAction::Install => InstallOptions::install(za_config::ProxyScope::Tool),
-                    ToolAction::Update => InstallOptions::update(za_config::ProxyScope::Tool),
+                    ToolAction::Install => {
+                        InstallOptions::install(za_config::ProxyScope::Tool).dry_run(dry_run)
+                    }
+                    ToolAction::Update => {
+                        InstallOptions::update(za_config::ProxyScope::Tool).dry_run(dry_run)
+                    }
                 },
             )?;
         }
@@ -1262,10 +1714,26 @@ pub(crate) fn canonical_tool_name(name: &str) -> String {
     canonical_tool_name_impl(name)
 }
 
+fn tool_layout_for_name(name: &str) -> ToolLayout {
+    find_tool_policy(name)
+        .map(|policy| policy.layout)
+        .unwrap_or(ToolLayout::Binary)
+}
+
+fn package_policy_for_name(name: &str) -> Option<PackagePolicy> {
+    find_tool_policy(name).and_then(|policy| policy.package)
+}
+
 fn detect_adoption_candidate(
     home: &ToolHome,
     requested: &ToolSpec,
 ) -> Result<Option<AdoptionCandidate>> {
+    if tool_layout_for_name(&requested.name) == ToolLayout::Package {
+        bail!(
+            "`{}` uses a package-style install and cannot be adopted from an unmanaged binary",
+            requested.name
+        );
+    }
     if requested.version.is_some() {
         return Ok(None);
     }
@@ -1321,6 +1789,9 @@ fn find_existing_executable_for_name(home: &ToolHome, name: &str) -> Option<Path
 fn collect_unmanaged_binaries(home: &ToolHome) -> Result<Vec<UnmanagedBinary>> {
     let mut out = Vec::new();
     for policy in tool_policies() {
+        if policy.layout != ToolLayout::Binary {
+            continue;
+        }
         if is_policy_managed(home, *policy)? {
             continue;
         }
@@ -1437,7 +1908,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn adopt_tool(home: &ToolHome, tool: &str) -> Result<()> {
+fn adopt_tool(home: &ToolHome, tool: &str, dry_run: bool) -> Result<()> {
     let mut requested = ToolSpec::from_args(tool, None)?;
     requested.name = canonical_tool_name(&requested.name);
     if is_name_managed(home, &requested.name)? {
@@ -1452,9 +1923,11 @@ fn adopt_tool(home: &ToolHome, tool: &str) -> Result<()> {
     let installed = install(
         home,
         requested,
-        InstallOptions::adopt(za_config::ProxyScope::Tool),
+        InstallOptions::adopt(za_config::ProxyScope::Tool).dry_run(dry_run),
     )?;
-    println!("✅ Adopted {}", installed.image());
+    if !dry_run {
+        println!("✅ Adopted {}", installed.image());
+    }
     Ok(())
 }
 
@@ -1491,7 +1964,8 @@ fn uninstall_version(home: &ToolHome, tool: &ToolRef) -> Result<()> {
 
     if was_current {
         remove_file_if_exists(&home.current_file(&tool.name))?;
-        remove_file_if_exists(&home.bin_path(&tool.name))?;
+        remove_active_entry(home, &tool.name)?;
+        cleanup_post_uninstall_integrations(home, &tool.name)?;
         println!("🗑  Removed {} and cleared active version", tool.image());
     } else {
         println!("🗑  Removed {}", tool.image());
@@ -1512,24 +1986,16 @@ fn uninstall_all_versions(home: &ToolHome, name: &str) -> Result<()> {
     let removed_count = versions.len();
     fs::remove_dir_all(&name_dir).with_context(|| format!("remove {}", name_dir.display()))?;
     remove_file_if_exists(&home.current_file(name))?;
-    remove_file_if_exists(&home.bin_path(name))?;
+    remove_active_entry(home, name)?;
+    cleanup_post_uninstall_integrations(home, name)?;
 
     println!("🗑  Removed {name} ({removed_count} version(s)) and cleared active entry");
     Ok(())
 }
 
 fn prune_non_active_versions(home: &ToolHome, active: &ToolRef) -> Result<Vec<String>> {
-    let name_dir = home.name_dir(&active.name);
-    if !name_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let active_version = normalize_version(&active.version);
     let mut removed = Vec::new();
-    for version in collect_dir_names(&name_dir)? {
-        if normalize_version(&version) == active_version {
-            continue;
-        }
+    for version in stale_versions_to_prune(home, active)? {
         let stale = ToolRef {
             name: active.name.clone(),
             version: version.clone(),
@@ -1543,6 +2009,21 @@ fn prune_non_active_versions(home: &ToolHome, active: &ToolRef) -> Result<Vec<St
     }
     removed.sort();
     Ok(removed)
+}
+
+fn stale_versions_to_prune(home: &ToolHome, active: &ToolRef) -> Result<Vec<String>> {
+    let name_dir = home.name_dir(&active.name);
+    if !name_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let active_version = normalize_version(&active.version);
+    let mut stale = collect_dir_names(&name_dir)?
+        .into_iter()
+        .filter(|version| normalize_version(version) != active_version)
+        .collect::<Vec<_>>();
+    stale.sort();
+    Ok(stale)
 }
 
 fn command_candidates(name: &str) -> Vec<String> {
@@ -1646,28 +2127,28 @@ fn print_active_managed_path(home: &ToolHome, tool: &str) -> Result<()> {
             home.scope.label()
         );
     };
-    let bin = home.bin_path(&name);
-    if !bin.exists() {
+    let path = home.active_path(&name);
+    if !path.exists() {
         bail!(
-            "active managed binary for `{}` is missing at {}; repair with `za tool update {}`",
+            "active managed path for `{}` is missing at {}; repair with `za tool update {}`",
             name,
-            bin.display(),
+            path.display(),
             name
         );
     }
-    println!("{}", bin.display());
+    println!("{}", path.display());
     Ok(())
 }
 
 fn activate_tool(home: &ToolHome, tool: &ToolRef) -> Result<()> {
     let previous_active = read_current_version(home, &tool.name)?;
-    sync_bin_entry(home, tool)?;
+    sync_active_entry(home, tool)?;
 
     if let Err(err) = set_current_version(home, tool) {
-        let restore_res = restore_bin_entry(home, &tool.name, previous_active.as_deref());
+        let restore_res = restore_active_entry(home, &tool.name, previous_active.as_deref());
         let err = err.context("persist active tool version");
         if let Err(restore_err) = restore_res {
-            return Err(err.context(format!("rollback bin entry failed: {restore_err}")));
+            return Err(err.context(format!("rollback active entry failed: {restore_err}")));
         }
         return Err(err);
     }
@@ -1675,7 +2156,7 @@ fn activate_tool(home: &ToolHome, tool: &ToolRef) -> Result<()> {
     Ok(())
 }
 
-fn restore_bin_entry(home: &ToolHome, name: &str, previous_version: Option<&str>) -> Result<()> {
+fn restore_active_entry(home: &ToolHome, name: &str, previous_version: Option<&str>) -> Result<()> {
     match previous_version {
         Some(version) => {
             let previous = ToolRef {
@@ -1683,13 +2164,13 @@ fn restore_bin_entry(home: &ToolHome, name: &str, previous_version: Option<&str>
                 version: version.to_string(),
             };
             if home.install_path(&previous).exists() {
-                sync_bin_entry(home, &previous)?;
+                sync_active_entry(home, &previous)?;
             } else {
-                remove_file_if_exists(&home.bin_path(name))?;
+                remove_active_entry(home, name)?;
             }
         }
         None => {
-            remove_file_if_exists(&home.bin_path(name))?;
+            remove_active_entry(home, name)?;
         }
     }
     Ok(())
@@ -1716,20 +2197,42 @@ fn set_current_version(home: &ToolHome, tool: &ToolRef) -> Result<()> {
     Ok(())
 }
 
-fn sync_bin_entry(home: &ToolHome, tool: &ToolRef) -> Result<()> {
+fn sync_active_entry(home: &ToolHome, tool: &ToolRef) -> Result<()> {
     let src = home.install_path(tool);
     if !src.exists() {
         bail!("tool version not installed: {}", tool.image());
     }
-    let dst = home.bin_path(&tool.name);
-    if let Err(err) = link_executable(&src, &dst) {
-        copy_executable(&src, &dst).with_context(|| {
-            format!(
-                "activate {} via copy fallback after link failed: {err}",
-                tool.image()
-            )
-        })?;
+
+    match tool_layout_for_name(&tool.name) {
+        ToolLayout::Binary => {
+            let dst = home.bin_path(&tool.name);
+            if let Err(err) = link_executable(&src, &dst) {
+                copy_executable(&src, &dst).with_context(|| {
+                    format!(
+                        "activate {} via copy fallback after link failed: {err}",
+                        tool.image()
+                    )
+                })?;
+            }
+            Ok(())
+        }
+        ToolLayout::Package => {
+            let src_dir = home.package_payload_dir(tool);
+            let dst_dir = home.current_package_path(&tool.name);
+            link_directory(&src_dir, &dst_dir).with_context(|| {
+                format!(
+                    "activate {} package payload {}",
+                    tool.image(),
+                    src_dir.display()
+                )
+            })
+        }
     }
+}
+
+fn remove_active_entry(home: &ToolHome, name: &str) -> Result<()> {
+    remove_path_if_exists(&home.bin_path(name))?;
+    remove_path_if_exists(&home.current_package_path(name))?;
     Ok(())
 }
 
@@ -1758,12 +2261,98 @@ fn link_executable(_src: &Path, _dst: &Path) -> Result<()> {
     bail!("symlink activation is not supported on this platform")
 }
 
+#[cfg(unix)]
+fn link_directory(src: &Path, dst: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let src = fs::canonicalize(src).unwrap_or_else(|_| src.to_path_buf());
+    let tmp = dst.with_extension(format!("tmp-link-{}", std::process::id()));
+    remove_path_if_exists(&tmp)?;
+    symlink(&src, &tmp)
+        .with_context(|| format!("symlink {} -> {}", tmp.display(), src.display()))?;
+    if let Err(err) = fs::rename(&tmp, dst) {
+        let _ = remove_path_if_exists(&tmp);
+        return Err(err)
+            .with_context(|| format!("activate link {} -> {}", dst.display(), src.display()));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn link_directory(src: &Path, dst: &Path) -> Result<()> {
+    copy_dir_recursive(src, dst)
+}
+
 fn remove_file_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(_) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err.into()),
     }
+}
+
+fn remove_path_if_exists(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+                fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))?;
+            } else {
+                fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("stat {}", path.display())),
+    }
+}
+
+#[cfg(not(unix))]
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    remove_path_if_exists(dst)?;
+    fs::create_dir_all(dst).with_context(|| format!("create {}", dst.display()))?;
+
+    for entry in fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&src_path, &dst_path).with_context(|| {
+                format!("copy {} -> {}", src_path.display(), dst_path.display())
+            })?;
+            #[cfg(unix)]
+            {
+                let mode = fs::metadata(&src_path)?.permissions().mode();
+                fs::set_permissions(&dst_path, fs::Permissions::from_mode(mode))?;
+            }
+        } else if file_type.is_symlink() {
+            #[cfg(unix)]
+            {
+                let target = fs::read_link(&src_path)
+                    .with_context(|| format!("read link {}", src_path.display()))?;
+                std::os::unix::fs::symlink(&target, &dst_path).with_context(|| {
+                    format!("symlink {} -> {}", dst_path.display(), target.display())
+                })?;
+            }
+            #[cfg(not(unix))]
+            {
+                bail!(
+                    "cannot copy symbolic link {} on this platform",
+                    src_path.display()
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn collect_dir_names(root: &Path) -> Result<Vec<String>> {
