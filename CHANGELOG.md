@@ -1,8 +1,17 @@
+## [0.1.42] - 2026-03-17
+
+### 🐛 Bug Fixes
+
+- *(tool)* Align ls columns for long version strings
 ## [0.1.41] - 2026-03-17
 
 ### 🚀 Features
 
 - *(tool)* Add ble.sh
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.41
 ## [0.1.40] - 2026-03-17
 
 ### 🚀 Features
