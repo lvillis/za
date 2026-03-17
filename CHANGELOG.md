@@ -1,8 +1,18 @@
+## [0.1.37] - 2026-03-17
+
+### 🚀 Features
+
+- *(tool)* Add git-cliff
+- *(tool)* Add cargo-release
 ## [0.1.36] - 2026-03-17
 
 ### 🚀 Features
 
 - *(tool)* Support installing multiple tools in one command
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.36
 ## [0.1.35] - 2026-03-16
 
 ### 🐛 Bug Fixes
