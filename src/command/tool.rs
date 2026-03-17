@@ -1322,14 +1322,6 @@ fn resolve_home_dir() -> Result<PathBuf> {
 }
 
 fn ensure_blesh_bash_init(home: &ToolHome, tool: &ToolRef) -> Result<()> {
-    if home.scope != ToolScope::User {
-        print_tool_stage(
-            "next",
-            "ble.sh bash init is only auto-managed for `za tool --user`; source the managed path manually in other scopes",
-        );
-        return Ok(());
-    }
-
     let rc_path = resolve_home_dir()?.join(".bashrc");
     let active_path = home.active_path(&tool.name);
     let top_change = upsert_managed_block(
@@ -1367,14 +1359,6 @@ fn ensure_blesh_bash_init(home: &ToolHome, tool: &ToolRef) -> Result<()> {
 }
 
 fn preview_blesh_bash_init(home: &ToolHome, tool: &ToolRef) -> Result<()> {
-    if home.scope != ToolScope::User {
-        print_tool_stage(
-            "next",
-            "ble.sh bash init would not be auto-managed outside `za tool --user`",
-        );
-        return Ok(());
-    }
-
     let rc_path = resolve_home_dir()?.join(".bashrc");
     let active_path = home.active_path(&tool.name);
     let top_change = preview_managed_block(
@@ -1403,8 +1387,8 @@ fn preview_blesh_bash_init(home: &ToolHome, tool: &ToolRef) -> Result<()> {
     Ok(())
 }
 
-fn cleanup_post_uninstall_integrations(home: &ToolHome, name: &str) -> Result<()> {
-    if name != "ble.sh" || home.scope != ToolScope::User {
+fn cleanup_post_uninstall_integrations(_home: &ToolHome, name: &str) -> Result<()> {
+    if name != "ble.sh" {
         return Ok(());
     }
 

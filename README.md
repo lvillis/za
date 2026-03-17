@@ -289,7 +289,7 @@ za tool uninstall codex
 
 `za tool install starship` also upserts a managed `~/.bashrc` block that initializes the prompt only when `TERMINAL_EMULATOR=JetBrains-JediTerm`. Installation does not patch the current shell process; open a new JetBrains bash shell or `source ~/.bashrc` after install.
 
-`za tool install ble.sh` tracks the upstream rolling `nightly` release instead of the stale stable release. It installs `ble.sh` as a managed package payload, keeps a stable active path under the tool state directory, and upserts JetBrains-only top/bottom `~/.bashrc` blocks so `source -- .../ble.sh --attach=none` and `ble-attach` stay in sync across updates.
+`za tool install ble.sh` tracks the upstream rolling `nightly` release instead of the stale stable release. It installs `ble.sh` as a managed package payload, keeps a stable active path under the tool state directory, and upserts JetBrains-only top/bottom `~/.bashrc` blocks for the current user so `source -- .../ble.sh --attach=none` and `ble-attach` stay in sync across updates, regardless of whether the managed payload lives in system or user scope.
 
 `za tool install --dry-run` and `za tool update --dry-run` resolve the target version and source policy, preview activation/shell-init changes, and make no filesystem changes.
 
