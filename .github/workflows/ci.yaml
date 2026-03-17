@@ -3,12 +3,20 @@ name: CI
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - "Dockerfile"
-      - "CHANGELOG.md"
-      - "README.md"
+    paths:
+      - ".github/workflows/ci.yaml"
+      - ".justfile"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
   pull_request:
     branches: [main]
+    paths:
+      - ".github/workflows/ci.yaml"
+      - ".justfile"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
   workflow_dispatch:
 
 permissions:
@@ -24,7 +32,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
