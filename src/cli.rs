@@ -143,15 +143,16 @@ pub enum Commands {
 /// `za tool` sub-commands
 #[derive(Subcommand)]
 pub enum ToolCommands {
-    /// Install a tool and make it active in this scope
+    /// Install one or more tools and make them active in this scope
     #[command(alias = "pull")]
     Install {
-        /// Tool name, e.g. `codex`
-        tool: String,
-        /// Install a specific version instead of the latest release.
+        /// Tool names, e.g. `codex just`
+        #[arg(required = true, num_args = 1.., value_name = "TOOL")]
+        tools: Vec<String>,
+        /// Install a specific version instead of the latest release. Requires exactly one tool.
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
-        /// Adopt an existing unmanaged binary already present in this scope.
+        /// Adopt an existing unmanaged binary already present in this scope. Requires exactly one tool.
         #[arg(long)]
         adopt: bool,
     },
@@ -597,10 +598,30 @@ mod tests {
                 assert!(matches!(
                     cmd,
                     ToolCommands::Install {
-                        tool,
+                        tools,
                         version: Some(version),
                         adopt: false,
-                    } if tool == "codex" && version == "0.105.0"
+                    } if tools == vec!["codex"] && version == "0.105.0"
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn tool_install_parses_multiple_tools() {
+        let cli =
+            Cli::try_parse_from(["za", "tool", "install", "just", "cross"]).expect("must parse");
+        match cli.cmd {
+            Commands::Tool { user, cmd } => {
+                assert!(!user);
+                assert!(matches!(
+                    cmd,
+                    ToolCommands::Install {
+                        tools,
+                        version: None,
+                        adopt: false,
+                    } if tools == vec!["just", "cross"]
                 ));
             }
             _ => panic!("unexpected command"),
@@ -681,10 +702,10 @@ mod tests {
                 assert!(matches!(
                     cmd,
                     ToolCommands::Install {
-                        tool,
+                        tools,
                         version: None,
                         adopt: true,
-                    } if tool == "codex"
+                    } if tools == vec!["codex"]
                 ));
             }
             _ => panic!("unexpected command"),

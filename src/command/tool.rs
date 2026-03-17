@@ -296,7 +296,7 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
             }
         }
         ToolCommands::Install {
-            tool,
+            tools,
             version,
             adopt,
         } => {
@@ -304,16 +304,23 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
             run_mutating_tool_command(&home, scope, move || {
                 install_tools(
                     &home_for_action,
-                    std::slice::from_ref(&tool),
+                    &tools,
                     version.as_deref(),
                     adopt,
+                    ToolAction::Install,
                 )
             })
         }
         ToolCommands::Update { tools, version } => {
             let home_for_action = home.clone();
             run_mutating_tool_command(&home, scope, move || {
-                install_tools(&home_for_action, &tools, version.as_deref(), false)
+                install_tools(
+                    &home_for_action,
+                    &tools,
+                    version.as_deref(),
+                    false,
+                    ToolAction::Update,
+                )
             })
         }
         ToolCommands::Sync { file } => {
@@ -343,7 +350,13 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
         ToolCommands::Adopt { tool } => {
             let home_for_action = home.clone();
             run_mutating_tool_command(&home, scope, move || {
-                install_tools(&home_for_action, std::slice::from_ref(&tool), None, true)
+                install_tools(
+                    &home_for_action,
+                    std::slice::from_ref(&tool),
+                    None,
+                    true,
+                    ToolAction::Install,
+                )
             })
         }
     }
@@ -553,6 +566,15 @@ struct InstallOptions {
 }
 
 impl InstallOptions {
+    fn install(proxy_scope: za_config::ProxyScope) -> Self {
+        Self {
+            action: ToolAction::Install,
+            adoption: AdoptionMode::Disallow,
+            prune_after_activation: true,
+            proxy_scope,
+        }
+    }
+
     fn update(proxy_scope: za_config::ProxyScope) -> Self {
         Self {
             action: ToolAction::Update,
@@ -982,6 +1004,7 @@ fn install_tools(
     tools: &[String],
     version: Option<&str>,
     adopt: bool,
+    action: ToolAction,
 ) -> Result<()> {
     if adopt && version.is_some() {
         bail!("`za tool install --adopt` does not accept `--version`");
@@ -990,7 +1013,11 @@ fn install_tools(
         bail!("`za tool install --adopt` requires exactly one tool name");
     }
     if version.is_some() && tools.len() != 1 {
-        bail!("`za tool update --version` requires exactly one tool name");
+        let command = match action {
+            ToolAction::Install => "install",
+            ToolAction::Update => "update",
+        };
+        bail!("`za tool {command} --version` requires exactly one tool name");
     }
 
     let requested_names = if tools.is_empty() {
@@ -1021,7 +1048,10 @@ fn install_tools(
             let _ = install(
                 home,
                 ToolSpec::from_args(name, version)?,
-                InstallOptions::update(za_config::ProxyScope::Tool),
+                match action {
+                    ToolAction::Install => InstallOptions::install(za_config::ProxyScope::Tool),
+                    ToolAction::Update => InstallOptions::update(za_config::ProxyScope::Tool),
+                },
             )?;
         }
     }

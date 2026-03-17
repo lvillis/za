@@ -243,6 +243,7 @@ Current built-in tool policies:
 ```bash
 # install the latest release and make it active
 za tool install codex
+za tool install just cross
 
 # install a specific version and make it active
 za tool install codex --version 0.105.0
