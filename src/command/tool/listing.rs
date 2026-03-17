@@ -547,12 +547,41 @@ fn collect_unmanaged_binary_for_name(
         .find(|item| item.name == name))
 }
 
-fn print_installed_text(report: &InstalledToolReport) {
-    if report.rows.is_empty() {
-        println!("No managed tools installed.");
-    } else {
-        println!("{:<24} {:<20} {:<8} SOURCE", "NAME", "ACTIVE", "VERSIONS");
-        for row in &report.rows {
+#[derive(Debug)]
+struct InstalledTextRow {
+    name: String,
+    active: String,
+    versions: String,
+    source: String,
+}
+
+#[derive(Debug)]
+struct OutdatedTextRow {
+    name: String,
+    version: String,
+    active: String,
+    update: String,
+    source: String,
+}
+
+fn text_width(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn column_width<'a, I>(header: &str, min_width: usize, values: I) -> usize
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    values
+        .into_iter()
+        .fold(text_width(header).max(min_width), |width, value| {
+            width.max(text_width(value))
+        })
+}
+
+fn installed_text_rows(rows: &[InstalledToolRow]) -> Vec<InstalledTextRow> {
+    rows.iter()
+        .map(|row| {
             let active = row
                 .active_version
                 .as_deref()
@@ -563,14 +592,107 @@ fn print_installed_text(report: &InstalledToolReport) {
             } else {
                 active
             };
-            println!(
-                "{:<24} {:<20} {:<8} {}",
-                row.name,
+
+            InstalledTextRow {
+                name: row.name.clone(),
                 active,
-                row.installed_versions.len(),
-                row.source.as_deref().unwrap_or("-"),
-            );
-        }
+                versions: row.installed_versions.len().to_string(),
+                source: row.source.as_deref().unwrap_or("-").to_string(),
+            }
+        })
+        .collect()
+}
+
+fn render_installed_table(rows: &[InstalledToolRow]) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+
+    let display_rows = installed_text_rows(rows);
+    let name_width = column_width("NAME", 24, display_rows.iter().map(|row| row.name.as_str()));
+    let active_width = column_width(
+        "ACTIVE",
+        20,
+        display_rows.iter().map(|row| row.active.as_str()),
+    );
+    let versions_width = column_width(
+        "VERSIONS",
+        8,
+        display_rows.iter().map(|row| row.versions.as_str()),
+    );
+
+    let mut lines = Vec::with_capacity(display_rows.len() + 1);
+    lines.push(format!(
+        "{:<name_width$} {:<active_width$} {:<versions_width$} SOURCE",
+        "NAME", "ACTIVE", "VERSIONS",
+    ));
+    for row in display_rows {
+        lines.push(format!(
+            "{:<name_width$} {:<active_width$} {:<versions_width$} {}",
+            row.name, row.active, row.versions, row.source
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
+fn outdated_text_rows(rows: &[OutdatedRow]) -> Vec<OutdatedTextRow> {
+    rows.iter()
+        .map(|row| OutdatedTextRow {
+            name: row.name.clone(),
+            version: row.version.clone(),
+            active: if row.active {
+                "*".to_string()
+            } else {
+                String::new()
+            },
+            update: row.update.clone(),
+            source: row.source.clone(),
+        })
+        .collect()
+}
+
+fn render_outdated_table(rows: &[OutdatedRow]) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+
+    let display_rows = outdated_text_rows(rows);
+    let name_width = column_width("NAME", 24, display_rows.iter().map(|row| row.name.as_str()));
+    let version_width = column_width(
+        "VERSION",
+        20,
+        display_rows.iter().map(|row| row.version.as_str()),
+    );
+    let active_width = column_width(
+        "ACTIVE",
+        6,
+        display_rows.iter().map(|row| row.active.as_str()),
+    );
+    let update_width = column_width(
+        "UPDATE",
+        18,
+        display_rows.iter().map(|row| row.update.as_str()),
+    );
+
+    let mut lines = Vec::with_capacity(display_rows.len() + 1);
+    lines.push(format!(
+        "{:<name_width$} {:<version_width$} {:<active_width$} {:<update_width$} SOURCE",
+        "NAME", "VERSION", "ACTIVE", "UPDATE",
+    ));
+    for row in display_rows {
+        lines.push(format!(
+            "{:<name_width$} {:<version_width$} {:<active_width$} {:<update_width$} {}",
+            row.name, row.version, row.active, row.update, row.source
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
+fn print_installed_text(report: &InstalledToolReport) {
+    if let Some(table) = render_installed_table(&report.rows) {
+        println!("{table}");
+    } else {
+        println!("No managed tools installed.");
     }
 
     println!("\nScope: {}", report.scope);
@@ -695,20 +817,10 @@ fn print_tool_detail_json(report: &ToolDetailReport) -> Result<()> {
 }
 
 fn print_outdated_text(report: &OutdatedReport) {
-    if report.rows.is_empty() {
-        println!("No managed tools installed.");
+    if let Some(table) = render_outdated_table(&report.rows) {
+        println!("{table}");
     } else {
-        println!(
-            "{:<24} {:<20} {:<6} {:<18} SOURCE",
-            "NAME", "VERSION", "ACTIVE", "UPDATE"
-        );
-        for row in &report.rows {
-            let marker = if row.active { "*" } else { "" };
-            println!(
-                "{:<24} {:<20} {:<6} {:<18} {}",
-                row.name, row.version, marker, row.update, row.source
-            );
-        }
+        println!("No managed tools installed.");
     }
 
     println!("\nScope: {}", report.scope);
@@ -951,5 +1063,88 @@ pub(super) fn latest_check_progress_message(policy: ToolPolicy, latest: &LatestC
         LatestCheck::Latest(version) => format!("{} {}", policy.canonical_name, version),
         LatestCheck::Unsupported => format!("{} n/a", policy.canonical_name),
         LatestCheck::Error(_) => format!("{} failed", policy.canonical_name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_installed_table_expands_active_column_for_long_versions() {
+        let rows = vec![
+            InstalledToolRow {
+                name: "ble.sh".to_string(),
+                active_version: Some("nightly-20260310+b99cadb".to_string()),
+                active_missing_from_store: false,
+                installed_versions: vec!["nightly-20260310+b99cadb".to_string()],
+                source: Some("download".to_string()),
+                bin_path: None,
+            },
+            InstalledToolRow {
+                name: "za".to_string(),
+                active_version: Some("0.1.41".to_string()),
+                active_missing_from_store: false,
+                installed_versions: vec!["0.1.41".to_string()],
+                source: Some("download".to_string()),
+                bin_path: None,
+            },
+        ];
+
+        let expected = [
+            format!("{:<24} {:<24} {:<8} SOURCE", "NAME", "ACTIVE", "VERSIONS"),
+            format!(
+                "{:<24} {:<24} {:<8} {}",
+                "ble.sh", "nightly-20260310+b99cadb", "1", "download"
+            ),
+            format!("{:<24} {:<24} {:<8} {}", "za", "0.1.41", "1", "download"),
+        ]
+        .join("\n");
+
+        assert_eq!(render_installed_table(&rows), Some(expected));
+    }
+
+    #[test]
+    fn render_outdated_table_expands_update_column_for_long_versions() {
+        let rows = vec![
+            OutdatedRow {
+                name: "ble.sh".to_string(),
+                version: "nightly-20260310+b99cadb".to_string(),
+                active: true,
+                source: "download".to_string(),
+                update: "update -> nightly-20260317+cafebabe".to_string(),
+                latest: Some("nightly-20260317+cafebabe".to_string()),
+            },
+            OutdatedRow {
+                name: "za".to_string(),
+                version: "0.1.41".to_string(),
+                active: false,
+                source: "download".to_string(),
+                update: "latest".to_string(),
+                latest: Some("0.1.41".to_string()),
+            },
+        ];
+
+        let expected = [
+            format!(
+                "{:<24} {:<24} {:<6} {:<35} SOURCE",
+                "NAME", "VERSION", "ACTIVE", "UPDATE"
+            ),
+            format!(
+                "{:<24} {:<24} {:<6} {:<35} {}",
+                "ble.sh",
+                "nightly-20260310+b99cadb",
+                "*",
+                "update -> nightly-20260317+cafebabe",
+                "download"
+            ),
+            format!(
+                "{:<24} {:<24} {:<6} {:<35} {}",
+                "za", "0.1.41", "", "latest", "download"
+            ),
+        ]
+        .join("\n");
+
+        assert_eq!(render_outdated_table(&rows), Some(expected));
     }
 }
