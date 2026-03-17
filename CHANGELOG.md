@@ -4,6 +4,10 @@
 
 - *(tool)* Add git-cliff
 - *(tool)* Add cargo-release
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.37
 ## [0.1.36] - 2026-03-17
 
 ### 🚀 Features
