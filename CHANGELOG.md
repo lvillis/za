@@ -1,8 +1,17 @@
+## [0.1.41] - 2026-03-17
+
+### 🚀 Features
+
+- *(tool)* Add ble.sh
 ## [0.1.40] - 2026-03-17
 
 ### 🚀 Features
 
 - *(tool)* Add ble.sh
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.40
 ## [0.1.39] - 2026-03-17
 
 ### 🚀 Features
