@@ -1,3 +1,13 @@
+## [0.1.39] - 2026-03-17
+
+### 🚀 Features
+
+- *(tool)* Add starship
+## [0.1.38] - 2026-03-17
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.38
 ## [0.1.37] - 2026-03-17
 
 ### 🚀 Features
