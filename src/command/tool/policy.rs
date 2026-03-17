@@ -31,6 +31,9 @@ const OHA_GITHUB_TAG_PREFIX: &str = "v";
 const GIT_CLIFF_GITHUB_OWNER: &str = "orhun";
 const GIT_CLIFF_GITHUB_REPO: &str = "git-cliff";
 const GIT_CLIFF_GITHUB_TAG_PREFIX: &str = "v";
+const CARGO_RELEASE_GITHUB_OWNER: &str = "crate-ci";
+const CARGO_RELEASE_GITHUB_REPO: &str = "cargo-release";
+const CARGO_RELEASE_GITHUB_TAG_PREFIX: &str = "v";
 const CROSS_GITHUB_OWNER: &str = "cross-rs";
 const CROSS_GITHUB_REPO: &str = "cross";
 const CROSS_GITHUB_TAG_PREFIX: &str = "v";
@@ -72,7 +75,7 @@ impl ToolPolicy {
     }
 }
 
-const TOOL_POLICIES: [ToolPolicy; 11] = [
+const TOOL_POLICIES: [ToolPolicy; 12] = [
     ToolPolicy {
         canonical_name: "za",
         aliases: &[],
@@ -214,6 +217,20 @@ const TOOL_POLICIES: [ToolPolicy; 11] = [
         cargo_fallback_package: None,
     },
     ToolPolicy {
+        canonical_name: "cargo-release",
+        aliases: &[],
+        source_label: "GitHub Release (SHA-256 verified)",
+        github_release: Some(GithubReleasePolicy {
+            project_label: "cargo-release",
+            owner: CARGO_RELEASE_GITHUB_OWNER,
+            repo: CARGO_RELEASE_GITHUB_REPO,
+            tag_prefix: CARGO_RELEASE_GITHUB_TAG_PREFIX,
+            expected_asset_name: cargo_release_expected_asset_name,
+            verification: GithubReleaseVerification::RequiredSha256Digest,
+        }),
+        cargo_fallback_package: None,
+    },
+    ToolPolicy {
         canonical_name: "cross",
         aliases: &[],
         source_label: "GitHub Release (SHA-256 unavailable; unverified)",
@@ -300,6 +317,13 @@ fn git_cliff_expected_asset_name(version: &str) -> Result<String> {
     Ok(format!(
         "git-cliff-{version}-{}.tar.gz",
         git_cliff_target_triple()?
+    ))
+}
+
+fn cargo_release_expected_asset_name(version: &str) -> Result<String> {
+    Ok(format!(
+        "cargo-release-v{version}-{}.tar.gz",
+        cargo_release_target_triple()?
     ))
 }
 
@@ -440,6 +464,20 @@ fn git_cliff_target_triple() -> Result<&'static str> {
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
         _ => bail!(
             "unsupported platform for git-cliff release asset: {}-{}",
+            env::consts::ARCH,
+            env::consts::OS
+        ),
+    }
+}
+
+fn cargo_release_target_triple() -> Result<&'static str> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
+        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
+        _ => bail!(
+            "unsupported platform for cargo-release release asset: {}-{}",
             env::consts::ARCH,
             env::consts::OS
         ),

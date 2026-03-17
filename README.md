@@ -77,6 +77,7 @@ za tool install dust
 za tool install just
 za tool install oha
 za tool install git-cliff
+za tool install cargo-release
 za tool install cross
 
 za tool ls
@@ -238,6 +239,7 @@ Current built-in tool policies:
 | `just` | - | GitHub Release (SHA-256 verify) |
 | `oha` | - | GitHub Release (SHA-256 verify) |
 | `git-cliff` | - | GitHub Release (SHA-256 verify) |
+| `cargo-release` | - | GitHub Release (SHA-256 verify) |
 | `cross` | - | GitHub Release (SHA-256 unavailable; unverified) |
 
 ### Common workflows
@@ -245,7 +247,7 @@ Current built-in tool policies:
 ```bash
 # install the latest release and make it active
 za tool install codex
-za tool install just git-cliff cross
+za tool install just git-cliff cargo-release cross
 
 # install a specific version and make it active
 za tool install codex --version 0.105.0
