@@ -1,8 +1,17 @@
+## [0.1.36] - 2026-03-17
+
+### 🚀 Features
+
+- *(tool)* Support installing multiple tools in one command
 ## [0.1.35] - 2026-03-16
 
 ### 🐛 Bug Fixes
 
 - Ci
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.35
 ## [0.1.34] - 2026-03-16
 
 ### 🚀 Features
