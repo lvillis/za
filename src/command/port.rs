@@ -565,7 +565,7 @@ fn render_port_report(report: &PortReport) -> String {
             ));
         }
     } else {
-        let peer_width = column_width("PEER", peer_width.into_iter());
+        let peer_width = column_width("PEER", peer_width);
         lines.push(format!(
             "{:<proto_width$} {:<address_width$} {:>port_width$} {:<peer_width$} {:<state_width$} {:<pid_width$} {:<process_width$}",
             "PROTO", "ADDRESS", "PORT", "PEER", "STATE", "PID", "PROCESS"
