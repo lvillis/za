@@ -1,3 +1,8 @@
+## [0.1.44] - 2026-03-23
+
+### 🐛 Bug Fixes
+
+- Ci
 ## [0.1.43] - 2026-03-23
 
 ### 🚀 Features
@@ -7,6 +12,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Add .justfile
+- Release za version 0.1.43
 ## [0.1.42] - 2026-03-17
 
 ### 🐛 Bug Fixes
