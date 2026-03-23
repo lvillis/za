@@ -1,8 +1,21 @@
+## [0.1.43] - 2026-03-23
+
+### 🚀 Features
+
+- *(port)* Add local port listing with /proc-based ownership scan
+
+### ⚙️ Miscellaneous Tasks
+
+- Add .justfile
 ## [0.1.42] - 2026-03-17
 
 ### 🐛 Bug Fixes
 
 - *(tool)* Align ls columns for long version strings
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.42
 ## [0.1.41] - 2026-03-17
 
 ### 🚀 Features
