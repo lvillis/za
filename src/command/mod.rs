@@ -8,6 +8,7 @@ pub mod diff;
 pub mod r#gen;
 pub mod git;
 pub mod ide;
+pub mod port;
 pub mod run;
 pub mod tool;
 pub mod za_config;

@@ -75,6 +75,13 @@ fn main() -> Result<()> {
             json_out: json,
             fail_on_high,
         }),
+        cli::Commands::Port { cmd } => {
+            let exit_code = command::port::run(cmd)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         cli::Commands::Tool { user, cmd } => {
             let exit_code = command::tool::run(cmd, user)?;
             if exit_code != 0 {

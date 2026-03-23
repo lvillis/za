@@ -86,6 +86,11 @@ pub enum Commands {
         #[arg(long)]
         fail_on_high: bool,
     },
+    /// Inspect local TCP/UDP port bindings
+    Port {
+        #[command(subcommand)]
+        cmd: PortCommands,
+    },
     /// Manage CLI tools in the current scope
     Tool {
         /// Use user-level paths (`~/.local/...`) instead of system-level paths.
@@ -251,6 +256,33 @@ pub enum ToolCommands {
     Adopt {
         /// Tool name, e.g. `codex`
         tool: String,
+    },
+}
+
+/// `za port` sub-commands
+#[derive(Subcommand)]
+pub enum PortCommands {
+    /// List local TCP/UDP ports and owning processes
+    #[command(name = "ls", alias = "list")]
+    Ls {
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+        /// Include connected and non-listening sockets, not just listening/bound ports.
+        #[arg(long)]
+        all: bool,
+        /// Filter by local port. Repeatable.
+        #[arg(long, value_name = "PORT")]
+        port: Vec<u16>,
+        /// Filter by owning PID. Repeatable.
+        #[arg(long, value_name = "PID", value_parser = clap::value_parser!(u32).range(1..))]
+        pid: Vec<u32>,
+        /// Only include TCP sockets.
+        #[arg(long)]
+        tcp: bool,
+        /// Only include UDP sockets.
+        #[arg(long)]
+        udp: bool,
     },
 }
 
@@ -557,7 +589,7 @@ pub enum DiffRiskFilter {
 mod tests {
     use super::{
         CiCommands, Cli, CodexCommands, Commands, CompletionCommands, CompletionShell,
-        DiffRiskFilter, GhCommands, GitAuthCommands, ToolCommands,
+        DiffRiskFilter, GhCommands, GitAuthCommands, PortCommands, ToolCommands,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -801,6 +833,40 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn port_ls_parses_filters() {
+        let cli = Cli::try_parse_from([
+            "za", "port", "ls", "--json", "--all", "--port", "8080", "--pid", "123", "--tcp",
+        ])
+        .expect("must parse");
+        match cli.cmd {
+            Commands::Port { cmd } => {
+                assert!(matches!(
+                    cmd,
+                    PortCommands::Ls {
+                        json: true,
+                        all: true,
+                        port,
+                        pid,
+                        tcp: true,
+                        udp: false,
+                    } if port == vec![8080] && pid == vec![123]
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn port_ls_rejects_negative_pid_filter() {
+        assert!(Cli::try_parse_from(["za", "port", "ls", "--pid=-1"]).is_err());
+    }
+
+    #[test]
+    fn port_ls_rejects_zero_pid_filter() {
+        assert!(Cli::try_parse_from(["za", "port", "ls", "--pid=0"]).is_err());
     }
 
     #[test]
