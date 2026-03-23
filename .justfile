@@ -5,3 +5,6 @@ ci:
   cargo check --all-features
   cargo clippy --all-targets --all-features -- -D warnings
   cargo test --all-features --locked
+
+patch:
+    cargo release patch --no-publish --execute
