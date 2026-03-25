@@ -17,6 +17,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         cli::Commands::Diff {
+            tui,
             json,
             files,
             name_only,
@@ -27,6 +28,7 @@ fn main() -> Result<()> {
             exclude_risk,
         } => {
             let exit_code = command::diff::run(command::diff::DiffRunOptions {
+                tui,
                 json,
                 files,
                 name_only,

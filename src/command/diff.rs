@@ -1,3 +1,6 @@
+#[path = "diff_tui.rs"]
+mod tui;
+
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::terminal;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -58,6 +61,7 @@ const CONFIG_NAMES: &[&str] = &[
 
 #[derive(Debug, Clone, Default)]
 pub struct DiffRunOptions {
+    pub tui: bool,
     pub json: bool,
     pub files: bool,
     pub name_only: bool,
@@ -67,6 +71,10 @@ pub struct DiffRunOptions {
 }
 
 pub fn run(options: DiffRunOptions) -> Result<i32> {
+    if options.tui {
+        return tui::run_tui(options);
+    }
+
     let repo_root = resolve_repo_root()?;
     let filters = DiffFilterSpec::from_run_options(&options, &repo_root)?;
     let report = collect_workspace_diff(&repo_root, options.files || !options.json, &filters)?;

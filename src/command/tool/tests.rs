@@ -292,6 +292,14 @@ fn tool_policy_matches_alias_and_canonical() {
     let tcping = find_tool_policy("tcping").expect("canonical policy");
     assert_eq!(tcping_alias.canonical_name, "tcping");
     assert_eq!(tcping.canonical_name, "tcping");
+    let motdyn = find_tool_policy("motdyn").expect("canonical policy");
+    assert_eq!(motdyn.canonical_name, "motdyn");
+    assert_eq!(motdyn.cargo_fallback_package, None);
+    assert_eq!(motdyn.source_label, "GitHub Release (SHA-256 verified)");
+    assert_eq!(
+        motdyn.github_release.expect("github policy").verification,
+        GithubReleaseVerification::RequiredSha256Digest
+    );
     let dust = find_tool_policy("dust").expect("canonical policy");
     assert_eq!(dust.canonical_name, "dust");
     let oha = find_tool_policy("oha").expect("canonical policy");
@@ -362,6 +370,7 @@ fn canonical_tool_name_resolves_aliases() {
     assert_eq!(canonical_tool_name("ripgrep"), "rg");
     assert_eq!(canonical_tool_name("fdfind"), "fd");
     assert_eq!(canonical_tool_name("tcping-rs"), "tcping");
+    assert_eq!(canonical_tool_name("motdyn"), "motdyn");
     assert_eq!(canonical_tool_name("docker-compose"), "docker-compose");
     assert_eq!(canonical_tool_name("oha"), "oha");
     assert_eq!(canonical_tool_name("starship"), "starship");
@@ -384,6 +393,7 @@ fn supported_tool_names_csv_contains_all_aliases() {
     assert!(csv.contains("fdfind"));
     assert!(csv.contains("tcping"));
     assert!(csv.contains("tcping-rs"));
+    assert!(csv.contains("motdyn"));
     assert!(csv.contains("dust"));
     assert!(csv.contains("just"));
     assert!(csv.contains("oha"));
@@ -501,6 +511,22 @@ fn cargo_release_policy_expected_asset_name_matches_supported_tarball() {
         asset_name,
         format!("cargo-release-v1.1.1-{expected_target}.tar.gz")
     );
+}
+
+#[test]
+fn motdyn_policy_expected_asset_name_matches_supported_tarball() {
+    let policy = find_tool_policy("motdyn")
+        .expect("policy")
+        .github_release
+        .expect("github policy");
+    let asset_name =
+        (policy.expected_asset_name.expect("asset resolver"))("1.0.8").expect("asset name");
+    let expected_target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+        ("linux", "aarch64") => "aarch64-unknown-linux-musl",
+        other => panic!("unsupported local test platform: {other:?}"),
+    };
+    assert_eq!(asset_name, format!("motdyn-1.0.8-{expected_target}.tar.gz"));
 }
 
 #[test]

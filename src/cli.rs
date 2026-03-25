@@ -19,6 +19,9 @@ pub enum Commands {
     },
     /// Review current Git workspace changes
     Diff {
+        /// Open the continuous review TUI.
+        #[arg(long, conflicts_with_all = ["json", "files", "name_only"])]
+        tui: bool,
         /// Print JSON output for scripting.
         #[arg(long)]
         json: bool,
@@ -801,6 +804,50 @@ mod tests {
         let cli = Cli::try_parse_from([
             "za",
             "diff",
+            "--tui",
+            "--staged",
+            "--path",
+            "src/**",
+            "--exclude-risk",
+            "generated",
+        ])
+        .expect("must parse");
+        match cli.cmd {
+            Commands::Diff {
+                tui,
+                json,
+                files,
+                name_only,
+                staged,
+                unstaged,
+                untracked,
+                path,
+                exclude_risk,
+            } => {
+                assert!(tui);
+                assert!(!json);
+                assert!(!files);
+                assert!(!name_only);
+                assert!(staged);
+                assert!(!unstaged);
+                assert!(!untracked);
+                assert_eq!(path, vec!["src/**"]);
+                assert_eq!(exclude_risk, vec![DiffRiskFilter::Generated]);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn diff_rejects_tui_with_json() {
+        assert!(Cli::try_parse_from(["za", "diff", "--tui", "--json"]).is_err());
+    }
+
+    #[test]
+    fn diff_parses_json_review_filters() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "diff",
             "--json",
             "--files",
             "--name-only",
@@ -813,6 +860,7 @@ mod tests {
         .expect("must parse");
         match cli.cmd {
             Commands::Diff {
+                tui,
                 json,
                 files,
                 name_only,
@@ -822,6 +870,7 @@ mod tests {
                 path,
                 exclude_risk,
             } => {
+                assert!(!tui);
                 assert!(json);
                 assert!(files);
                 assert!(name_only);
