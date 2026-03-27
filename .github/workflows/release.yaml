@@ -183,7 +183,44 @@ jobs:
         env:
           OUTPUT: RELEASE_NOTES.md
 
-      - name: Create or update GitHub Release
+      - name: Compose release notes
+        shell: bash
+        run: |
+          cat > RELEASE_HEADER.md <<EOF
+          ## Release assets
+
+          Formal release contract:
+
+          - Versioned archives plus \`SHA256SUMS\`
+          - Stable archive layout: \`<asset-stem>/za\`, \`LICENSE\`, \`README.md\`
+          - Immutable per-version assets bound to tag \`${{ steps.version.outputs.VERSION }}\`
+
+          Platform matrix:
+
+          - linux/amd64 (musl) -> \`za-${{ steps.version.outputs.VERSION }}-x86_64-unknown-linux-musl.tar.gz\`
+          - linux/amd64 (gnu) -> \`za-${{ steps.version.outputs.VERSION }}-x86_64-unknown-linux-gnu.tar.gz\`
+          - linux/arm64 (musl) -> \`za-${{ steps.version.outputs.VERSION }}-aarch64-unknown-linux-musl.tar.gz\`
+          - linux/armhf (gnu) -> \`za-${{ steps.version.outputs.VERSION }}-arm-unknown-linux-gnueabihf.tar.gz\`
+          - linux/arm/v7 (gnu) -> \`za-${{ steps.version.outputs.VERSION }}-armv7-unknown-linux-gnueabihf.tar.gz\`
+          - darwin/arm64 -> \`za-${{ steps.version.outputs.VERSION }}-aarch64-apple-darwin.tar.gz\`
+          - windows/amd64 -> \`za-${{ steps.version.outputs.VERSION }}-x86_64-pc-windows-msvc.zip\`
+
+          Convenience aliases:
+
+          - \`za-linux-amd64\`
+          - \`za-linux-arm64\`
+          - \`za-linux-armhf\`
+          - \`za-linux-armv7\`
+          - \`za-darwin-arm64\`
+          - \`za-windows-amd64.exe\`
+
+          Convenience aliases are intended for manual latest installs. Pinned automation SHOULD prefer versioned archives plus \`SHA256SUMS\`.
+
+          EOF
+          cat RELEASE_HEADER.md RELEASE_NOTES.md > RELEASE_NOTES.full
+          mv RELEASE_NOTES.full RELEASE_NOTES.md
+
+      - name: Create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -197,8 +234,7 @@ jobs:
             exit 1
           fi
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "${assets[@]}" --clobber
-            gh release edit "$tag" --title "$title" --notes-file RELEASE_NOTES.md
-          else
-            gh release create "$tag" "${assets[@]}" --title "$title" --notes-file RELEASE_NOTES.md
+            echo "Release $tag already exists. Refusing to replace assets for an immutable version."
+            exit 1
           fi
+          gh release create "$tag" "${assets[@]}" --title "$title" --notes-file RELEASE_NOTES.md

@@ -32,20 +32,36 @@
 
 ### GitHub Release
 
+Formal release contract:
+
+- Versioned archives named `za-<version>-<target>.tar.gz` on Unix-like targets and `za-<version>-<target>.zip` on Windows
+- `SHA256SUMS` covering every uploaded asset for that version
+- Stable archive layout: `<asset-stem>/za`, `LICENSE`, `README.md`
+
+Supported release matrix:
+
+| Consumer platform | Rust target | Formal asset | Convenience alias |
+| --- | --- | --- | --- |
+| `linux/amd64 (musl)` | `x86_64-unknown-linux-musl` | `za-<version>-x86_64-unknown-linux-musl.tar.gz` | `za-linux-amd64` |
+| `linux/amd64 (gnu)` | `x86_64-unknown-linux-gnu` | `za-<version>-x86_64-unknown-linux-gnu.tar.gz` | - |
+| `linux/arm64 (musl)` | `aarch64-unknown-linux-musl` | `za-<version>-aarch64-unknown-linux-musl.tar.gz` | `za-linux-arm64` |
+| `linux/armhf (gnu)` | `arm-unknown-linux-gnueabihf` | `za-<version>-arm-unknown-linux-gnueabihf.tar.gz` | `za-linux-armhf` |
+| `linux/arm/v7 (gnu)` | `armv7-unknown-linux-gnueabihf` | `za-<version>-armv7-unknown-linux-gnueabihf.tar.gz` | `za-linux-armv7` |
+| `darwin/arm64` | `aarch64-apple-darwin` | `za-<version>-aarch64-apple-darwin.tar.gz` | `za-darwin-arm64` |
+| `windows/amd64` | `x86_64-pc-windows-msvc` | `za-<version>-x86_64-pc-windows-msvc.zip` | `za-windows-amd64.exe` |
+
+Manual latest install convenience path:
+
 ```bash
 curl -fsSL https://github.com/lvillis/za/releases/latest/download/za-linux-amd64 -o /usr/local/bin/za && chmod +x /usr/local/bin/za
 ```
 
-Stable alias assets are published alongside the versioned release archives, so the install command can stay short.
+This `latest` shortcut is intended for manual installs. Pinned automation and CI SHOULD prefer a versioned archive plus `SHA256SUMS`.
 
-Other common aliases:
+Pinned install example:
 
 ```bash
-za-linux-arm64
-za-linux-armhf
-za-linux-armv7
-za-darwin-arm64
-za-windows-amd64.exe
+VERSION=0.1.44 && curl -fsSLO "https://github.com/lvillis/za/releases/download/${VERSION}/za-${VERSION}-x86_64-unknown-linux-musl.tar.gz" && curl -fsSLO "https://github.com/lvillis/za/releases/download/${VERSION}/SHA256SUMS" && grep "  za-${VERSION}-x86_64-unknown-linux-musl.tar.gz$" SHA256SUMS | sha256sum -c - && tar -xzf "za-${VERSION}-x86_64-unknown-linux-musl.tar.gz" && install -m 0755 "za-${VERSION}-x86_64-unknown-linux-musl/za" /usr/local/bin/za
 ```
 
 If `/usr/local/bin` is not writable, change the output path to somewhere already on `PATH`, such as `~/.local/bin/za`.
