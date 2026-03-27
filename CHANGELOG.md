@@ -1,8 +1,21 @@
+## [0.1.45] - 2026-03-27
+
+### 🚀 Features
+
+- *(diff)* Add diff tui
+
+### 🐛 Bug Fixes
+
+- *(release)* Define immutable binary release contract
 ## [0.1.44] - 2026-03-23
 
 ### 🐛 Bug Fixes
 
 - Ci
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.44
 ## [0.1.43] - 2026-03-23
 
 ### 🚀 Features
