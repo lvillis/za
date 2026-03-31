@@ -760,16 +760,12 @@ fn download_from_url(
             match download_to_path_parallel(&url_parts, url, &asset_path, proxy_scope, plan) {
                 Ok(()) => {}
                 Err(ParallelDownloadError::Unsupported(err)) => {
-                    print_download_stage(
+                    retry_single_stream_after_parallel_failure(
                         interactive,
-                        "download",
                         format!(
                             "range transfer unavailable for `{}`; retrying with single stream ({err:#})",
                             asset_name
                         ),
-                    );
-                    print_download_stage(interactive, "download", "single-stream transfer");
-                    download_to_path_single(
                         &client,
                         &url_parts.path_and_query,
                         url,
@@ -777,7 +773,20 @@ fn download_from_url(
                         total_bytes,
                     )?;
                 }
-                Err(ParallelDownloadError::Failed(err)) => return Err(err),
+                Err(ParallelDownloadError::Failed(err)) => {
+                    retry_single_stream_after_parallel_failure(
+                        interactive,
+                        format!(
+                            "parallel transfer failed for `{}`; retrying with single stream ({err:#})",
+                            asset_name
+                        ),
+                        &client,
+                        &url_parts.path_and_query,
+                        url,
+                        &asset_path,
+                        total_bytes,
+                    )?;
+                }
             }
         } else {
             print_download_stage(interactive, "download", "single-stream transfer");
@@ -832,6 +841,20 @@ fn download_from_url(
         let _ = fs::remove_dir_all(&download_root);
     }
     run
+}
+
+fn retry_single_stream_after_parallel_failure(
+    interactive: bool,
+    reason: String,
+    client: &Client,
+    path_and_query: &str,
+    url: &str,
+    asset_path: &Path,
+    total_bytes: Option<u64>,
+) -> Result<()> {
+    print_download_stage(interactive, "download", reason);
+    print_download_stage(interactive, "download", "single-stream transfer");
+    download_to_path_single(client, path_and_query, url, asset_path, total_bytes)
 }
 
 fn build_download_request<'a>(
@@ -1568,9 +1591,20 @@ fn unique_temp_dir(prefix: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DownloadRange, ParallelDownloadPlan, TEMP_DIR_PREFIX_DOWNLOAD,
-        build_parallel_download_plan, matched_temp_prefix, parse_content_range_total,
-        parse_temp_dir_pid, split_download_ranges,
+        DownloadExtractionMode, DownloadRange, ParallelDownloadPlan, TEMP_DIR_PREFIX_DOWNLOAD,
+        build_parallel_download_plan, download_from_url, matched_temp_prefix,
+        parse_content_range_total, parse_temp_dir_pid, split_download_ranges,
+    };
+    use crate::command::za_config;
+    use std::{
+        io::{Read, Write},
+        net::{Shutdown, TcpListener, TcpStream},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::Duration,
     };
 
     #[test]
@@ -1644,5 +1678,167 @@ mod tests {
                 DownloadRange { start: 7, end: 9 },
             ]
         );
+    }
+
+    #[test]
+    fn download_from_url_falls_back_to_single_stream_after_parallel_read_failure() {
+        let payload = Arc::new(vec![b'z'; 2_400_000]);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test listener");
+        listener
+            .set_nonblocking(true)
+            .expect("configure nonblocking listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let failed_once = Arc::new(AtomicBool::new(false));
+        let server_payload = Arc::clone(&payload);
+        let server_stop = Arc::clone(&stop);
+        let server_failed_once = Arc::clone(&failed_once);
+
+        let server = thread::spawn(move || {
+            while !server_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => handle_test_download_request(
+                        stream,
+                        Arc::clone(&server_payload),
+                        Arc::clone(&server_failed_once),
+                    ),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{}/artifact.tar.gz", addr.port());
+        let pull = download_from_url(
+            &url,
+            None,
+            za_config::ProxyScope::Tool,
+            DownloadExtractionMode::KeepArchive,
+        )
+        .expect("download succeeds after single-stream fallback");
+        let downloaded = std::fs::read(&pull.path).expect("read downloaded asset");
+        assert_eq!(downloaded, *payload);
+
+        drop(pull);
+        stop.store(true, Ordering::SeqCst);
+        server.join().expect("join test server");
+    }
+
+    fn handle_test_download_request(
+        mut stream: TcpStream,
+        payload: Arc<Vec<u8>>,
+        failed_once: Arc<AtomicBool>,
+    ) {
+        let request = read_http_request(&mut stream);
+        let range = parse_http_range_header(&request);
+        match range {
+            Some((0, 0)) => {
+                write_http_response(
+                    &mut stream,
+                    206,
+                    &[("Content-Range", format!("bytes 0-0/{}", payload.len()))],
+                    &payload[..1],
+                    Some(1),
+                );
+            }
+            Some((start, end)) => {
+                let start = start as usize;
+                let end = end as usize;
+                let body = &payload[start..=end];
+                if !failed_once.swap(true, Ordering::SeqCst) {
+                    let truncated_len = body.len() / 2;
+                    write_http_response(
+                        &mut stream,
+                        206,
+                        &[(
+                            "Content-Range",
+                            format!("bytes {start}-{end}/{}", payload.len()),
+                        )],
+                        &body[..truncated_len],
+                        Some(body.len()),
+                    );
+                    let _ = stream.shutdown(Shutdown::Both);
+                } else {
+                    write_http_response(
+                        &mut stream,
+                        206,
+                        &[(
+                            "Content-Range",
+                            format!("bytes {start}-{end}/{}", payload.len()),
+                        )],
+                        body,
+                        Some(body.len()),
+                    );
+                }
+            }
+            None => {
+                write_http_response(
+                    &mut stream,
+                    200,
+                    &[],
+                    payload.as_slice(),
+                    Some(payload.len()),
+                );
+            }
+        }
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk).expect("read request");
+            if read == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..read]);
+            if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(buf).expect("utf8 request")
+    }
+
+    fn parse_http_range_header(request: &str) -> Option<(u64, u64)> {
+        for line in request.lines() {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if !name.eq_ignore_ascii_case("range") {
+                continue;
+            }
+            let value = value.trim();
+            let bytes = value.strip_prefix("bytes=")?;
+            let (start, end) = bytes.split_once('-')?;
+            return Some((start.parse().ok()?, end.parse().ok()?));
+        }
+        None
+    }
+
+    fn write_http_response(
+        stream: &mut TcpStream,
+        status: u16,
+        headers: &[(&str, String)],
+        body: &[u8],
+        content_length: Option<usize>,
+    ) {
+        let reason = match status {
+            200 => "OK",
+            206 => "Partial Content",
+            _ => "Test Response",
+        };
+        write!(stream, "HTTP/1.1 {status} {reason}\r\n").expect("write status line");
+        if let Some(content_length) = content_length {
+            write!(stream, "Content-Length: {content_length}\r\n").expect("write content length");
+        }
+        write!(stream, "Connection: close\r\n").expect("write connection header");
+        for (name, value) in headers {
+            write!(stream, "{name}: {value}\r\n").expect("write header");
+        }
+        write!(stream, "\r\n").expect("write header terminator");
+        stream.write_all(body).expect("write body");
+        stream.flush().expect("flush response");
     }
 }
