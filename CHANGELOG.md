@@ -1,3 +1,14 @@
+## [0.1.46] - 2026-03-31
+
+### 🚀 Features
+
+- *(tool)* Add cargo-nextest
+
+### 🐛 Bug Fixes
+
+- *(ci)* Redesign gh ci output and update hash encoding
+- *(tool)* Fall back to single-stream after range download failures
+- *(tool)* Reduce update output noise
 ## [0.1.45] - 2026-03-27
 
 ### 🚀 Features
@@ -7,6 +18,10 @@
 ### 🐛 Bug Fixes
 
 - *(release)* Define immutable binary release contract
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.45
 ## [0.1.44] - 2026-03-23
 
 ### 🐛 Bug Fixes
