@@ -1,4 +1,5 @@
 use super::*;
+use std::fmt::Write as _;
 
 #[derive(Debug)]
 pub(super) struct WorkspaceContext {
@@ -172,7 +173,12 @@ fn resolve_workspace_root(cwd: &Path) -> Result<PathBuf> {
 pub(super) fn workspace_hash(root: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(root.to_string_lossy().as_bytes());
-    format!("{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 pub(super) fn state_home() -> Result<PathBuf> {

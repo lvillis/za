@@ -88,6 +88,18 @@ impl CiState {
             Self::Success => 6,
         }
     }
+
+    fn badge(self) -> &'static str {
+        match self {
+            Self::Pending => "PEND",
+            Self::Running => "RUN",
+            Self::Success => "OK",
+            Self::Failed => "FAIL",
+            Self::Cancelled => "CANC",
+            Self::Skipped => "SKIP",
+            Self::NoRuns => "NONE",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -811,85 +823,139 @@ fn print_watch_update(report: &CommitCiReport) {
 }
 
 fn print_commit_report(report: &CommitCiReport) {
-    println!("GitHub Actions");
-    println!("Repo: {}", report.repo);
-    println!("Branch: {}", report.branch.as_deref().unwrap_or("-"));
-    println!(
-        "Commit: {}",
-        report
-            .sha
-            .as_deref()
-            .map(short_sha)
-            .unwrap_or_else(|| "-".to_string())
-    );
-    println!("State: {}", report.state.as_str());
-    println!("Summary: {}", format_summary(&report.summary));
-    println!(
-        "Updated: {}",
-        age_label(report.latest_update_at.as_deref()).unwrap_or_else(|| "-".to_string())
-    );
-    if report.runs.is_empty() {
-        println!("No GitHub Actions runs found for this commit.");
-        return;
-    }
-
-    println!(
-        "{:<10} {:<8} {:<8} {:<8} WORKFLOW",
-        "STATE", "ATTEMPT", "UPDATED", "EVENT"
-    );
-    for run in &report.runs {
-        println!(
-            "{:<10} {:<8} {:<8} {:<8} {}",
-            run.state.as_str(),
-            run.run_attempt
-                .map(|attempt| format!("#{attempt}"))
-                .unwrap_or_else(|| "-".to_string()),
-            age_label(run.updated_at.as_deref()).unwrap_or_else(|| "-".to_string()),
-            truncate_end(run.event.as_deref().unwrap_or("-"), 8),
-            truncate_end(&run.name, 80)
-        );
+    for line in render_commit_report_lines(report) {
+        println!("{line}");
     }
 }
 
 fn print_board_output(board: &CiBoardOutput) {
-    println!(
-        "Summary: total={} errors={} failed={} running={} pending={} success={} no_runs={}",
-        board.summary.total,
-        board.summary.errors,
-        board.summary.failed,
-        board.summary.running,
-        board.summary.pending,
-        board.summary.success,
-        board.summary.no_runs
-    );
-    if board.entries.is_empty() {
-        println!("No CI targets found.");
-        return;
+    for line in render_board_output_lines(board) {
+        println!("{line}");
+    }
+}
+
+fn format_summary_compact(summary: &CiSummary) -> String {
+    let mut parts = Vec::new();
+    if summary.failed > 0 {
+        parts.push(format!("{} fail", summary.failed));
+    }
+    if summary.cancelled > 0 {
+        parts.push(format!("{} cancel", summary.cancelled));
+    }
+    if summary.running > 0 {
+        parts.push(format!("{} run", summary.running));
+    }
+    if summary.pending > 0 {
+        parts.push(format!("{} pend", summary.pending));
+    }
+    if summary.success > 0 {
+        parts.push(format!("{} ok", summary.success));
+    }
+    if summary.skipped > 0 {
+        parts.push(format!("{} skip", summary.skipped));
+    }
+    if parts.is_empty() {
+        "no runs".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn format_board_summary(summary: &CiBoardSummary) -> String {
+    let mut parts = Vec::new();
+    if summary.errors > 0 {
+        parts.push(format!("{} err", summary.errors));
+    }
+    if summary.failed > 0 {
+        parts.push(format!("{} fail", summary.failed));
+    }
+    if summary.cancelled > 0 {
+        parts.push(format!("{} cancel", summary.cancelled));
+    }
+    if summary.running > 0 {
+        parts.push(format!("{} run", summary.running));
+    }
+    if summary.pending > 0 {
+        parts.push(format!("{} pend", summary.pending));
+    }
+    if summary.success > 0 {
+        parts.push(format!("{} ok", summary.success));
+    }
+    if summary.no_runs > 0 {
+        parts.push(format!("{} none", summary.no_runs));
+    }
+    if parts.is_empty() {
+        "no targets".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn render_commit_report_lines(report: &CommitCiReport) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{:<5} {}  {}  updated {}  {}",
+        report.state.badge(),
+        report.repo,
+        report
+            .sha
+            .as_deref()
+            .map(short_sha)
+            .unwrap_or_else(|| "-".to_string()),
+        age_label(report.latest_update_at.as_deref()).unwrap_or_else(|| "-".to_string()),
+        format_summary_compact(&report.summary)
+    )];
+
+    if report.runs.is_empty() {
+        lines.push("no workflow runs found for this commit".to_string());
+        return lines;
     }
 
-    println!(
-        "{:<10} {:<28} {:<14} {:<8} {:<8} SUMMARY",
-        "STATE", "REPO", "BRANCH", "SHA", "UPDATED"
-    );
+    lines.push("actions".to_string());
+    for run in ordered_review_runs(&report.runs) {
+        lines.push(render_run_detail_line(run, report));
+    }
+
+    lines
+}
+
+fn render_board_output_lines(board: &CiBoardOutput) -> Vec<String> {
+    let mut lines = vec![format!(
+        "CI  total {}  {}",
+        board.summary.total,
+        format_board_summary(&board.summary)
+    )];
+    if board.entries.is_empty() {
+        lines.push("No CI targets found.".to_string());
+        return lines;
+    }
+
+    lines.push(format!(
+        "{:<5} {:<28} {:<12} {:<7} {:<5} {:>3} {:>4} {:>2}  DETAIL",
+        "ST", "REPO", "BRANCH", "SHA", "AGE", "RUN", "FAIL", "OK"
+    ));
+
     for entry in &board.entries {
         match (&entry.report, &entry.query_error) {
             (_, Some(err)) => {
-                println!(
-                    "{:<10} {:<28} {:<14} {:<8} {:<8} {}",
-                    "error",
+                lines.push(format!(
+                    "{:<5} {:<28} {:<12} {:<7} {:<5} {:>3} {:>4} {:>2}  {}",
+                    "ERR",
                     truncate_end(&entry.target, 28),
                     "-",
                     "-",
                     "-",
+                    "-",
+                    "-",
+                    "-",
                     truncate_end(err, 80)
-                );
+                ));
             }
             (Some(report), None) => {
-                println!(
-                    "{:<10} {:<28} {:<14} {:<8} {:<8} {}",
-                    report.state.as_str(),
+                lines.push(format!(
+                    "{:<5} {:<28} {:<12} {:<7} {:<5} {:>3} {:>4} {:>2}  {}",
+                    report.state.badge(),
                     truncate_end(&report.repo, 28),
-                    truncate_end(report.branch.as_deref().unwrap_or("-"), 14),
+                    truncate_end(report.branch.as_deref().unwrap_or("-"), 12),
                     report
                         .sha
                         .as_deref()
@@ -897,56 +963,31 @@ fn print_board_output(board: &CiBoardOutput) {
                         .unwrap_or_else(|| "-".to_string()),
                     age_label(report.latest_update_at.as_deref())
                         .unwrap_or_else(|| "-".to_string()),
-                    truncate_end(&format_summary(&report.summary), 80)
-                );
+                    report.summary.running + report.summary.pending,
+                    report.summary.failed + report.summary.cancelled,
+                    report.summary.success,
+                    truncate_end(&board_detail(report), 80)
+                ));
             }
             _ => {}
         }
     }
-}
 
-fn format_summary(summary: &CiSummary) -> String {
-    let mut parts = Vec::new();
-    if summary.pending > 0 {
-        parts.push(format!("{} pending", summary.pending));
-    }
-    if summary.running > 0 {
-        parts.push(format!("{} running", summary.running));
-    }
-    if summary.failed > 0 {
-        parts.push(format!("{} failed", summary.failed));
-    }
-    if summary.cancelled > 0 {
-        parts.push(format!("{} cancelled", summary.cancelled));
-    }
-    if summary.skipped > 0 {
-        parts.push(format!("{} skipped", summary.skipped));
-    }
-    if summary.success > 0 {
-        parts.push(format!("{} success", summary.success));
-    }
-    if parts.is_empty() {
-        "no runs".to_string()
-    } else {
-        parts.join(", ")
-    }
+    lines
 }
 
 fn render_watch_update_lines(report: &CommitCiReport) -> Vec<String> {
-    let updated = age_label(report.latest_update_at.as_deref())
-        .map(|value| format!("updated {value} ago"))
-        .unwrap_or_else(|| "updated -".to_string());
     let mut lines = vec![format!(
-        "[{}] {} @ {} {}, {}",
-        report.state.as_str(),
+        "{:<5} {}  {}  updated {}  {}",
+        report.state.badge(),
         report.repo,
         report
             .sha
             .as_deref()
             .map(short_sha)
             .unwrap_or_else(|| "-".to_string()),
-        format_summary(&report.summary),
-        updated
+        age_label(report.latest_update_at.as_deref()).unwrap_or_else(|| "-".to_string()),
+        format_summary_compact(&report.summary)
     )];
 
     if !matches!(report.state, CiState::Pending | CiState::Running) {
@@ -956,25 +997,26 @@ fn render_watch_update_lines(report: &CommitCiReport) -> Vec<String> {
     let detail_runs = watch_detail_runs(report);
     let hidden_runs = detail_runs.len().saturating_sub(WATCH_DETAIL_LIMIT);
     for run in detail_runs.iter().take(WATCH_DETAIL_LIMIT) {
-        lines.push(format!(
-            "  - {:<10} {:<8} {:<8} {:<8} {}",
-            run.state.as_str(),
-            run.run_attempt
-                .map(|attempt| format!("#{attempt}"))
-                .unwrap_or_else(|| "-".to_string()),
-            age_label(run.updated_at.as_deref()).unwrap_or_else(|| "-".to_string()),
-            truncate_end(run.event.as_deref().unwrap_or("-"), 8),
-            truncate_end(&run.name, 80)
-        ));
+        lines.push(render_run_detail_line(run, report));
     }
     if hidden_runs > 0 {
         lines.push(format!(
-            "  - ... {} more non-terminal workflow{}",
+            "  ... {} more active workflow{}",
             hidden_runs,
             if hidden_runs == 1 { "" } else { "s" }
         ));
     }
     lines
+}
+
+fn ordered_review_runs(runs: &[WorkflowRunReport]) -> Vec<&WorkflowRunReport> {
+    let mut runs = runs.iter().collect::<Vec<_>>();
+    runs.sort_by(|a, b| {
+        review_detail_priority(a.state)
+            .cmp(&review_detail_priority(b.state))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    runs
 }
 
 fn watch_detail_runs(report: &CommitCiReport) -> Vec<&WorkflowRunReport> {
@@ -984,23 +1026,71 @@ fn watch_detail_runs(report: &CommitCiReport) -> Vec<&WorkflowRunReport> {
         .filter(|run| !matches!(run.state, CiState::Success | CiState::Skipped))
         .collect::<Vec<_>>();
     runs.sort_by(|a, b| {
-        watch_detail_priority(a.state)
-            .cmp(&watch_detail_priority(b.state))
+        review_detail_priority(a.state)
+            .cmp(&review_detail_priority(b.state))
             .then_with(|| a.name.cmp(&b.name))
     });
     runs
 }
 
-fn watch_detail_priority(state: CiState) -> u8 {
+fn review_detail_priority(state: CiState) -> u8 {
     match state {
-        CiState::Running => 0,
-        CiState::Pending => 1,
-        CiState::Failed => 2,
-        CiState::Cancelled => 3,
+        CiState::Failed => 0,
+        CiState::Cancelled => 1,
+        CiState::Running => 2,
+        CiState::Pending => 3,
         CiState::NoRuns => 4,
         CiState::Skipped => 5,
         CiState::Success => 6,
     }
+}
+
+fn render_run_detail_line(run: &WorkflowRunReport, report: &CommitCiReport) -> String {
+    let age = age_label(run.updated_at.as_deref()).unwrap_or_else(|| "-".to_string());
+    let mut detail = if has_mixed_events(&report.runs) {
+        format!(
+            "{:<8} {}",
+            truncate_end(run.event.as_deref().unwrap_or("-"), 8),
+            truncate_end(&run.name, 80)
+        )
+    } else {
+        truncate_end(&run.name, 88)
+    };
+    if let Some(attempt) = run.run_attempt
+        && attempt > 1
+    {
+        detail.push_str(&format!("  #{}", attempt));
+    }
+    format!("  {:<5} {:<5} {}", run.state.badge(), age, detail)
+}
+
+fn board_detail(report: &CommitCiReport) -> String {
+    let mut parts = Vec::new();
+    if report.summary.cancelled > 0 {
+        parts.push(format!("{} cancel", report.summary.cancelled));
+    }
+    if report.summary.skipped > 0 {
+        parts.push(format!("{} skip", report.summary.skipped));
+    }
+    if report.state == CiState::NoRuns {
+        parts.push("no runs".to_string());
+    }
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn has_mixed_events(runs: &[WorkflowRunReport]) -> bool {
+    let mut distinct = BTreeSet::new();
+    for run in runs {
+        distinct.insert(run.event.as_deref().unwrap_or("-"));
+        if distinct.len() > 1 {
+            return true;
+        }
+    }
+    false
 }
 
 fn age_label(rfc3339: Option<&str>) -> Option<String> {
@@ -1307,7 +1397,8 @@ mod tests {
     use super::{
         CiManifest, CiSourceKind, CiState, CommitCiReport, WorkflowRunReport,
         aggregate_commit_state, latest_head_sha, parse_owner_repo, parse_repo_slug,
-        render_watch_update_lines, workflow_run_state,
+        render_board_output_lines, render_commit_report_lines, render_watch_update_lines,
+        workflow_run_state,
     };
 
     #[test]
@@ -1478,11 +1569,14 @@ repos = ["openai/codex", "/code/za"]
 
         let lines = render_watch_update_lines(&report);
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("[running] lvillis/tele-rs @ babf70d"));
-        assert!(lines[0].contains("1 running, 2 success"));
+        assert!(lines[0].contains("RUN"));
+        assert!(lines[0].contains("lvillis/tele-rs"));
+        assert!(lines[0].contains("babf70d"));
+        assert!(lines[0].contains("1 run"));
+        assert!(lines[0].contains("2 ok"));
         assert!(lines[0].contains("updated"));
         assert!(lines[1].contains("ci / test"));
-        assert!(lines[1].contains("running"));
+        assert!(lines[1].contains("RUN"));
     }
 
     #[test]
@@ -1550,8 +1644,174 @@ repos = ["openai/codex", "/code/za"]
 
         let lines = render_watch_update_lines(&report);
         assert_eq!(lines.len(), 5);
-        assert!(lines[1].contains("run-2"));
-        assert!(lines[2].contains("run-1") || lines[2].contains("run-4"));
-        assert!(lines[4].contains("1 more non-terminal workflow"));
+        assert!(lines[1].contains("FAIL") || lines[1].contains("RUN"));
+        assert!(lines[1].contains("run-3") || lines[1].contains("run-2"));
+        assert!(
+            lines[2].contains("run-2") || lines[2].contains("run-1") || lines[2].contains("run-4")
+        );
+        assert!(lines[4].contains("1 more active workflow"));
+    }
+
+    #[test]
+    fn render_commit_report_lines_list_all_actions_in_review_order() {
+        let report = CommitCiReport {
+            repo: "lvillis/za".to_string(),
+            branch: Some("main".to_string()),
+            sha: Some("15ff429123456789".to_string()),
+            state: CiState::Failed,
+            summary: super::CiSummary {
+                failed: 1,
+                running: 1,
+                success: 1,
+                ..Default::default()
+            },
+            latest_update_at: Some("2026-03-09T00:00:00Z".to_string()),
+            source: CiSourceKind::CurrentRepo,
+            source_path: None,
+            runs: vec![
+                WorkflowRunReport {
+                    id: 1,
+                    name: "build-linux-musl".to_string(),
+                    event: Some("push".to_string()),
+                    state: CiState::Failed,
+                    status: Some("completed".to_string()),
+                    conclusion: Some("failure".to_string()),
+                    run_attempt: Some(1),
+                    updated_at: Some("2026-03-09T00:00:00Z".to_string()),
+                    html_url: None,
+                },
+                WorkflowRunReport {
+                    id: 2,
+                    name: "test-linux-arm64".to_string(),
+                    event: Some("push".to_string()),
+                    state: CiState::Running,
+                    status: Some("in_progress".to_string()),
+                    conclusion: None,
+                    run_attempt: Some(2),
+                    updated_at: Some("2026-03-09T00:00:00Z".to_string()),
+                    html_url: None,
+                },
+                WorkflowRunReport {
+                    id: 3,
+                    name: "lint".to_string(),
+                    event: Some("push".to_string()),
+                    state: CiState::Success,
+                    status: Some("completed".to_string()),
+                    conclusion: Some("success".to_string()),
+                    run_attempt: Some(1),
+                    updated_at: Some("2026-03-09T00:00:00Z".to_string()),
+                    html_url: None,
+                },
+            ],
+        };
+
+        let lines = render_commit_report_lines(&report);
+        assert!(lines[0].contains("FAIL"));
+        assert!(lines[0].contains("1 fail"));
+        assert!(lines[0].contains("1 run"));
+        assert_eq!(lines[1], "actions");
+        assert!(lines[2].contains("FAIL"));
+        assert!(lines[2].contains("build-linux-musl"));
+        assert!(lines[3].contains("RUN"));
+        assert!(lines[3].contains("test-linux-arm64"));
+        assert!(lines[4].contains("OK"));
+        assert!(lines[4].contains("lint"));
+    }
+
+    #[test]
+    fn render_commit_report_lines_show_all_green_actions() {
+        let report = CommitCiReport {
+            repo: "lvillis/za".to_string(),
+            branch: Some("main".to_string()),
+            sha: Some("15ff429123456789".to_string()),
+            state: CiState::Success,
+            summary: super::CiSummary {
+                success: 2,
+                ..Default::default()
+            },
+            latest_update_at: Some("2026-03-09T00:00:00Z".to_string()),
+            source: CiSourceKind::CurrentRepo,
+            source_path: None,
+            runs: vec![
+                WorkflowRunReport {
+                    id: 1,
+                    name: "ci / test".to_string(),
+                    event: Some("push".to_string()),
+                    state: CiState::Success,
+                    status: Some("completed".to_string()),
+                    conclusion: Some("success".to_string()),
+                    run_attempt: Some(1),
+                    updated_at: Some("2026-03-09T00:00:00Z".to_string()),
+                    html_url: None,
+                },
+                WorkflowRunReport {
+                    id: 2,
+                    name: "ci / lint".to_string(),
+                    event: Some("push".to_string()),
+                    state: CiState::Success,
+                    status: Some("completed".to_string()),
+                    conclusion: Some("success".to_string()),
+                    run_attempt: Some(1),
+                    updated_at: Some("2026-03-09T00:00:00Z".to_string()),
+                    html_url: None,
+                },
+            ],
+        };
+
+        let lines = render_commit_report_lines(&report);
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].contains("OK"));
+        assert!(lines[0].contains("2 ok"));
+        assert_eq!(lines[1], "actions");
+        assert!(lines[2].contains("ci / lint") || lines[2].contains("ci / test"));
+        assert!(lines[3].contains("ci / lint") || lines[3].contains("ci / test"));
+    }
+
+    #[test]
+    fn render_board_output_lines_use_compact_dashboard_columns() {
+        let board = super::CiBoardOutput {
+            summary: super::CiBoardSummary {
+                total: 2,
+                failed: 1,
+                success: 1,
+                ..Default::default()
+            },
+            entries: vec![
+                super::CiBoardEntry {
+                    target: "lvillis/za".to_string(),
+                    report: Some(CommitCiReport {
+                        repo: "lvillis/za".to_string(),
+                        branch: Some("main".to_string()),
+                        sha: Some("15ff429123456789".to_string()),
+                        state: CiState::Failed,
+                        summary: super::CiSummary {
+                            failed: 1,
+                            success: 5,
+                            ..Default::default()
+                        },
+                        latest_update_at: Some("2026-03-09T00:00:00Z".to_string()),
+                        source: CiSourceKind::Repo,
+                        source_path: None,
+                        runs: Vec::new(),
+                    }),
+                    query_error: None,
+                },
+                super::CiBoardEntry {
+                    target: "broken/repo".to_string(),
+                    report: None,
+                    query_error: Some("GitHub API returned 404".to_string()),
+                },
+            ],
+        };
+
+        let lines = render_board_output_lines(&board);
+        assert!(lines[0].contains("total 2"));
+        assert!(lines[0].contains("1 fail"));
+        assert!(lines[0].contains("1 ok"));
+        assert!(lines[1].contains("ST"));
+        assert!(lines[1].contains("RUN"));
+        assert!(lines[1].contains("FAIL"));
+        assert!(lines.iter().any(|line| line.contains("lvillis/za")));
+        assert!(lines.iter().any(|line| line.contains("ERR")));
     }
 }

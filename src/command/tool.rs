@@ -21,6 +21,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env,
+    fmt::Write as _,
     fs::{self, File, OpenOptions},
     io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
@@ -1889,7 +1890,12 @@ fn sha256_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(hex)
 }
 
 fn adopt_tool(home: &ToolHome, tool: &str, dry_run: bool) -> Result<()> {
