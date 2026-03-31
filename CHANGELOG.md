@@ -9,6 +9,10 @@
 - *(ci)* Redesign gh ci output and update hash encoding
 - *(tool)* Fall back to single-stream after range download failures
 - *(tool)* Reduce update output noise
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.46
 ## [0.1.45] - 2026-03-27
 
 ### 🚀 Features
