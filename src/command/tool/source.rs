@@ -801,7 +801,6 @@ fn download_from_url(
         ensure_not_interrupted()?;
 
         if let Some(expected_sha256) = expected_sha256 {
-            print_download_stage(interactive, "verify", "sha256");
             verify_sha256_file(&asset_path, expected_sha256)?;
             print_download_stage(interactive, "verify", "sha256 ok");
         }

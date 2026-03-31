@@ -37,7 +37,7 @@ fs4 = { version = "0.13.1", default-features = false, features = ["sync"] }
 # Serialization and integrity checks.
 serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.149", default-features = false, features = ["std"] }
-toml = { version = "1.1.0+spec-1.1.0", default-features = false, features = ["parse", "serde", "display"] }
+toml = { version = "1.1.0", default-features = false, features = ["parse", "serde", "display"] }
 sha2 = { version = "0.11.0", default-features = false }
 
 # HTTP transport and TLS crypto provider.
