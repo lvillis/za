@@ -18,6 +18,8 @@ const DOWNLOAD_READ_CHUNK_SIZE: usize = 64 * 1024;
 const PARALLEL_DOWNLOAD_MIN_BYTES: u64 = 2 * 1024 * 1024;
 const PARALLEL_DOWNLOAD_MIN_PART_BYTES: u64 = 1024 * 1024;
 const PARALLEL_DOWNLOAD_MAX_PARTS: usize = 4;
+const HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS: usize = 3;
+const HTTP_TRANSIENT_RETRY_BASE_DELAY_MS: u64 = 200;
 
 static ACTIVE_TEMP_DIRS: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -608,6 +610,101 @@ fn apply_proxy_with_scope(
     Ok(builder)
 }
 
+fn retry_transient_http_operation<T, F>(
+    interactive: bool,
+    stage: &str,
+    subject: &str,
+    mut operation: F,
+) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+{
+    for attempt in 1..=HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS {
+        ensure_not_interrupted()?;
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if attempt >= HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS || !is_retryable_http_error(&err) {
+                    return Err(err);
+                }
+                if interactive && stage == "download" {
+                    eprintln!();
+                }
+                print_download_stage(
+                    interactive,
+                    stage,
+                    format!(
+                        "retrying {subject} ({}/{}) after transient error: {}",
+                        attempt + 1,
+                        HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS,
+                        summarize_retryable_error(&err)
+                    ),
+                );
+                thread::sleep(transient_http_retry_backoff(attempt));
+            }
+        }
+    }
+    unreachable!("retry loop must return on success or terminal failure")
+}
+
+fn transient_http_retry_backoff(attempt: usize) -> Duration {
+    Duration::from_millis(HTTP_TRANSIENT_RETRY_BASE_DELAY_MS.saturating_mul(attempt.max(1) as u64))
+}
+
+fn summarize_retryable_error(err: &anyhow::Error) -> String {
+    truncate_for_log(&format!("{err:#}").replace('\n', ": "), 180)
+}
+
+fn is_retryable_http_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(reqx_err) = cause.downcast_ref::<reqx::Error>()
+            && is_retryable_reqx_error(reqx_err)
+        {
+            return true;
+        }
+        if let Some(io_err) = cause.downcast_ref::<io::Error>()
+            && matches!(
+                io_err.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::Interrupted
+                    | io::ErrorKind::WouldBlock
+            )
+        {
+            return true;
+        }
+    }
+
+    let message = format!("{err:#}").to_ascii_lowercase();
+    message.contains("unexpected end of file")
+        || message.contains("connection reset")
+        || message.contains("connection aborted")
+        || message.contains("broken pipe")
+        || message.contains("tls connect error")
+        || message.contains("tls handshake eof")
+}
+
+fn is_retryable_reqx_error(err: &reqx::Error) -> bool {
+    match err {
+        reqx::Error::Transport { kind, .. } => matches!(
+            kind,
+            reqx::TransportErrorKind::Dns
+                | reqx::TransportErrorKind::Connect
+                | reqx::TransportErrorKind::Tls
+                | reqx::TransportErrorKind::Read
+        ),
+        reqx::Error::Timeout { phase, .. } => matches!(
+            phase,
+            reqx::TimeoutPhase::Transport | reqx::TimeoutPhase::ResponseBody
+        ),
+        reqx::Error::ReadBody { .. } => true,
+        _ => false,
+    }
+}
+
 fn build_http_client(
     base_url: &str,
     client_name: &str,
@@ -648,34 +745,42 @@ fn fetch_github_release(
     let client = build_http_client(GITHUB_API_BASE, "za-tool-manager", false, proxy_scope)
         .context("build GitHub API client")?;
     let github_token = resolve_github_token()?;
+    let interactive = io::stderr().is_terminal();
 
-    let mut req = client.get(path);
-    req = req
-        .try_header("user-agent", HTTP_USER_AGENT)
-        .context("set GitHub user-agent")?;
-    req = req
-        .try_header("accept", "application/vnd.github+json")
-        .context("set GitHub accept header")?;
-    if let Some(token) = github_token.as_deref() {
-        req = req
-            .try_header("authorization", &format!("Bearer {token}"))
-            .context("set GitHub authorization header")?;
-    }
+    retry_transient_http_operation(
+        interactive,
+        "source",
+        &format!("{project_label} release metadata"),
+        || {
+            let mut req = client.get(path);
+            req = req
+                .try_header("user-agent", HTTP_USER_AGENT)
+                .context("set GitHub user-agent")?;
+            req = req
+                .try_header("accept", "application/vnd.github+json")
+                .context("set GitHub accept header")?;
+            if let Some(token) = github_token.as_deref() {
+                req = req
+                    .try_header("authorization", &format!("Bearer {token}"))
+                    .context("set GitHub authorization header")?;
+            }
 
-    let response = req
-        .send_response()
-        .with_context(|| format!("query {project_label} release metadata ({PROXY_HINT})"))?;
-    let status = response.status();
-    if !status.is_success() {
-        bail!(
-            "query {project_label} release metadata failed: status {} body {}",
-            status,
-            truncate_for_log(&response.text_lossy(), 200)
-        );
-    }
-    response
-        .json::<GithubRelease>()
-        .with_context(|| format!("parse {project_label} release JSON"))
+            let response = req.send_response().with_context(|| {
+                format!("query {project_label} release metadata ({PROXY_HINT})")
+            })?;
+            let status = response.status();
+            if !status.is_success() {
+                bail!(
+                    "query {project_label} release metadata failed: status {} body {}",
+                    status,
+                    truncate_for_log(&response.text_lossy(), 200)
+                );
+            }
+            response
+                .json::<GithubRelease>()
+                .with_context(|| format!("parse {project_label} release JSON"))
+        },
+    )
 }
 
 pub(super) fn parse_release_version(tag_name: &str, tag_prefix: &str) -> Result<String> {
@@ -942,6 +1047,25 @@ fn download_to_path_single(
     asset_path: &Path,
     known_total_bytes: Option<u64>,
 ) -> Result<()> {
+    let interactive = io::stderr().is_terminal();
+    let asset_label = asset_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("asset")
+        .to_string();
+
+    retry_transient_http_operation(interactive, "download", &format!("`{asset_label}`"), || {
+        download_to_path_single_once(client, path_and_query, url, asset_path, known_total_bytes)
+    })
+}
+
+fn download_to_path_single_once(
+    client: &Client,
+    path_and_query: &str,
+    url: &str,
+    asset_path: &Path,
+    known_total_bytes: Option<u64>,
+) -> Result<()> {
     let req = build_download_request(client, path_and_query, None)?;
     let mut resp = req
         .send_response_stream()
@@ -1006,6 +1130,15 @@ fn download_to_path_single(
         true,
         use_tty_line,
     );
+    if let Some(total_bytes) = total_bytes
+        && downloaded != total_bytes
+    {
+        bail!(
+            "download from `{url}` ended after {} bytes, expected {} bytes",
+            downloaded,
+            total_bytes
+        );
+    }
     out.flush()
         .with_context(|| format!("flush downloaded file {}", asset_path.display()))?;
     Ok(())
@@ -1592,15 +1725,16 @@ mod tests {
     use super::{
         DownloadExtractionMode, DownloadRange, ParallelDownloadPlan, TEMP_DIR_PREFIX_DOWNLOAD,
         build_parallel_download_plan, download_from_url, matched_temp_prefix,
-        parse_content_range_total, parse_temp_dir_pid, split_download_ranges,
+        parse_content_range_total, parse_temp_dir_pid, retry_transient_http_operation,
+        split_download_ranges,
     };
     use crate::command::za_config;
     use std::{
-        io::{Read, Write},
+        io::{self, Read, Write},
         net::{Shutdown, TcpListener, TcpStream},
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         thread,
         time::Duration,
@@ -1680,6 +1814,71 @@ mod tests {
     }
 
     #[test]
+    fn retry_transient_http_operation_retries_unexpected_eof_once() {
+        let attempts = AtomicUsize::new(0);
+        let value = retry_transient_http_operation(false, "source", "test metadata", || {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return Err(anyhow::Error::new(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "simulated eof",
+                )));
+            }
+            Ok(42usize)
+        })
+        .expect("retry should succeed on second attempt");
+
+        assert_eq!(value, 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn download_from_url_retries_single_stream_after_transient_read_failure() {
+        let payload = Arc::new(vec![b'y'; 512 * 1024]);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test listener");
+        listener
+            .set_nonblocking(true)
+            .expect("configure nonblocking listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let failed_once = Arc::new(AtomicBool::new(false));
+        let server_payload = Arc::clone(&payload);
+        let server_stop = Arc::clone(&stop);
+        let server_failed_once = Arc::clone(&failed_once);
+
+        let server = thread::spawn(move || {
+            while !server_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => handle_single_stream_retry_request(
+                        stream,
+                        Arc::clone(&server_payload),
+                        Arc::clone(&server_failed_once),
+                    ),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{}/artifact.tar.gz", addr.port());
+        let pull = download_from_url(
+            &url,
+            None,
+            za_config::ProxyScope::Tool,
+            DownloadExtractionMode::KeepArchive,
+        )
+        .expect("single-stream retry should succeed");
+        let downloaded = std::fs::read(&pull.path).expect("read downloaded asset");
+        assert_eq!(downloaded, *payload);
+
+        drop(pull);
+        stop.store(true, Ordering::SeqCst);
+        server.join().expect("join test server");
+    }
+
+    #[test]
     fn download_from_url_falls_back_to_single_stream_after_parallel_read_failure() {
         let payload = Arc::new(vec![b'z'; 2_400_000]);
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test listener");
@@ -1723,6 +1922,44 @@ mod tests {
         drop(pull);
         stop.store(true, Ordering::SeqCst);
         server.join().expect("join test server");
+    }
+
+    fn handle_single_stream_retry_request(
+        mut stream: TcpStream,
+        payload: Arc<Vec<u8>>,
+        failed_once: Arc<AtomicBool>,
+    ) {
+        let request = read_http_request(&mut stream);
+        if parse_http_range_header(&request).is_some() {
+            write_http_response(
+                &mut stream,
+                200,
+                &[],
+                payload.as_slice(),
+                Some(payload.len()),
+            );
+            return;
+        }
+
+        if !failed_once.swap(true, Ordering::SeqCst) {
+            let truncated_len = payload.len() / 2;
+            write_http_response(
+                &mut stream,
+                200,
+                &[],
+                &payload[..truncated_len],
+                Some(payload.len()),
+            );
+            let _ = stream.shutdown(Shutdown::Both);
+        } else {
+            write_http_response(
+                &mut stream,
+                200,
+                &[],
+                payload.as_slice(),
+                Some(payload.len()),
+            );
+        }
     }
 
     fn handle_test_download_request(
