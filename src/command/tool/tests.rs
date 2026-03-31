@@ -337,6 +337,14 @@ fn tool_policy_matches_alias_and_canonical() {
             .verification,
         GithubReleaseVerification::RequiredSha256Digest
     );
+    let nextest = find_tool_policy("cargo-nextest").expect("canonical policy");
+    assert_eq!(nextest.canonical_name, "cargo-nextest");
+    assert_eq!(nextest.cargo_fallback_package, None);
+    assert_eq!(nextest.source_label, "GitHub Release (SHA-256 verified)");
+    assert_eq!(
+        nextest.github_release.expect("github policy").verification,
+        GithubReleaseVerification::RequiredSha256Digest
+    );
     let cross = find_tool_policy("cross").expect("canonical policy");
     assert_eq!(cross.canonical_name, "cross");
     assert_eq!(cross.cargo_fallback_package, None);
@@ -376,6 +384,7 @@ fn canonical_tool_name_resolves_aliases() {
     assert_eq!(canonical_tool_name("starship"), "starship");
     assert_eq!(canonical_tool_name("git-cliff"), "git-cliff");
     assert_eq!(canonical_tool_name("cargo-release"), "cargo-release");
+    assert_eq!(canonical_tool_name("cargo-nextest"), "cargo-nextest");
     assert_eq!(canonical_tool_name("cross"), "cross");
     assert_eq!(canonical_tool_name("blesh"), "ble.sh");
 }
@@ -400,6 +409,7 @@ fn supported_tool_names_csv_contains_all_aliases() {
     assert!(csv.contains("starship"));
     assert!(csv.contains("git-cliff"));
     assert!(csv.contains("cargo-release"));
+    assert!(csv.contains("cargo-nextest"));
     assert!(csv.contains("cross"));
     assert!(csv.contains("ble.sh"));
     assert!(csv.contains("blesh"));
@@ -510,6 +520,29 @@ fn cargo_release_policy_expected_asset_name_matches_supported_tarball() {
     assert_eq!(
         asset_name,
         format!("cargo-release-v1.1.1-{expected_target}.tar.gz")
+    );
+}
+
+#[test]
+fn nextest_policy_expected_asset_name_matches_supported_tarball() {
+    let policy = find_tool_policy("cargo-nextest")
+        .expect("policy")
+        .github_release
+        .expect("github policy");
+    let asset_name =
+        (policy.expected_asset_name.expect("asset resolver"))("0.9.132").expect("asset name");
+    let expected_target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+        ("linux", "aarch64") => "aarch64-unknown-linux-musl",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+        ("windows", "aarch64") => "aarch64-pc-windows-msvc",
+        other => panic!("unsupported local test platform: {other:?}"),
+    };
+    assert_eq!(
+        asset_name,
+        format!("cargo-nextest-0.9.132-{expected_target}.tar.gz")
     );
 }
 

@@ -40,6 +40,9 @@ const GIT_CLIFF_GITHUB_TAG_PREFIX: &str = "v";
 const CARGO_RELEASE_GITHUB_OWNER: &str = "crate-ci";
 const CARGO_RELEASE_GITHUB_REPO: &str = "cargo-release";
 const CARGO_RELEASE_GITHUB_TAG_PREFIX: &str = "v";
+const NEXTEST_GITHUB_OWNER: &str = "nextest-rs";
+const NEXTEST_GITHUB_REPO: &str = "nextest";
+const NEXTEST_GITHUB_TAG_PREFIX: &str = "cargo-nextest-";
 const CROSS_GITHUB_OWNER: &str = "cross-rs";
 const CROSS_GITHUB_REPO: &str = "cross";
 const CROSS_GITHUB_TAG_PREFIX: &str = "v";
@@ -109,7 +112,7 @@ impl ToolPolicy {
     }
 }
 
-const TOOL_POLICIES: [ToolPolicy; 15] = [
+const TOOL_POLICIES: [ToolPolicy; 16] = [
     ToolPolicy {
         canonical_name: "za",
         aliases: &[],
@@ -332,6 +335,23 @@ const TOOL_POLICIES: [ToolPolicy; 15] = [
         cargo_fallback_package: None,
     },
     ToolPolicy {
+        canonical_name: "cargo-nextest",
+        aliases: &[],
+        source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
+        github_release: Some(GithubReleasePolicy {
+            project_label: "cargo-nextest",
+            owner: NEXTEST_GITHUB_OWNER,
+            repo: NEXTEST_GITHUB_REPO,
+            tag_prefix: NEXTEST_GITHUB_TAG_PREFIX,
+            expected_asset_name: Some(nextest_expected_asset_name),
+            verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
+        }),
+        cargo_fallback_package: None,
+    },
+    ToolPolicy {
         canonical_name: "cross",
         aliases: &[],
         source_label: "GitHub Release (SHA-256 unavailable; unverified)",
@@ -463,6 +483,13 @@ fn cargo_release_expected_asset_name(version: &str) -> Result<String> {
     Ok(format!(
         "cargo-release-v{version}-{}.tar.gz",
         cargo_release_target_triple()?
+    ))
+}
+
+fn nextest_expected_asset_name(version: &str) -> Result<String> {
+    Ok(format!(
+        "cargo-nextest-{version}-{}.tar.gz",
+        nextest_target_triple()?
     ))
 }
 
@@ -643,6 +670,22 @@ fn cargo_release_target_triple() -> Result<&'static str> {
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
         _ => bail!(
             "unsupported platform for cargo-release release asset: {}-{}",
+            env::consts::ARCH,
+            env::consts::OS
+        ),
+    }
+}
+
+fn nextest_target_triple() -> Result<&'static str> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
+        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
+        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
+        ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
+        _ => bail!(
+            "unsupported platform for cargo-nextest release asset: {}-{}",
             env::consts::ARCH,
             env::consts::OS
         ),
