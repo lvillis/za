@@ -44,7 +44,7 @@ struct DownloadProbe {
 }
 
 enum ParallelDownloadError {
-    Unsupported(anyhow::Error),
+    Unsupported,
     Failed(anyhow::Error),
 }
 
@@ -628,13 +628,13 @@ where
                     return Err(err);
                 }
                 if interactive && stage == "download" {
-                    eprintln!();
+                    finish_download_tty_line();
                 }
                 print_download_stage(
                     interactive,
                     stage,
                     format!(
-                        "retrying {subject} ({}/{}) after transient error: {}",
+                        "retry {}/{} for {subject} after {}",
                         attempt + 1,
                         HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS,
                         summarize_retryable_error(&err)
@@ -652,7 +652,43 @@ fn transient_http_retry_backoff(attempt: usize) -> Duration {
 }
 
 fn summarize_retryable_error(err: &anyhow::Error) -> String {
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<io::Error>() {
+            return match io_err.kind() {
+                io::ErrorKind::UnexpectedEof => "connection closed early".to_string(),
+                io::ErrorKind::TimedOut => "request timed out".to_string(),
+                io::ErrorKind::ConnectionReset => "connection reset".to_string(),
+                io::ErrorKind::ConnectionAborted => "connection aborted".to_string(),
+                io::ErrorKind::BrokenPipe => "broken pipe".to_string(),
+                io::ErrorKind::Interrupted => "operation interrupted".to_string(),
+                io::ErrorKind::WouldBlock => "socket would block".to_string(),
+                _ => truncate_for_log(&io_err.to_string(), 120),
+            };
+        }
+        if let Some(reqx_err) = cause.downcast_ref::<reqx::Error>() {
+            return summarize_reqx_retryable_error(reqx_err);
+        }
+    }
     truncate_for_log(&format!("{err:#}").replace('\n', ": "), 180)
+}
+
+fn summarize_reqx_retryable_error(err: &reqx::Error) -> String {
+    match err {
+        reqx::Error::Transport { kind, .. } => match kind {
+            reqx::TransportErrorKind::Dns => "dns lookup failed".to_string(),
+            reqx::TransportErrorKind::Connect => "connect failed".to_string(),
+            reqx::TransportErrorKind::Tls => "tls read failed".to_string(),
+            reqx::TransportErrorKind::Read => "connection closed early".to_string(),
+            _ => truncate_for_log(&err.to_string(), 120),
+        },
+        reqx::Error::Timeout { phase, .. } => match phase {
+            reqx::TimeoutPhase::Transport => "request timed out".to_string(),
+            reqx::TimeoutPhase::ResponseBody => "response read timed out".to_string(),
+            _ => truncate_for_log(&err.to_string(), 120),
+        },
+        reqx::Error::ReadBody { .. } => "response body read failed".to_string(),
+        _ => truncate_for_log(&err.to_string(), 120),
+    }
 }
 
 fn is_retryable_http_error(err: &anyhow::Error) -> bool {
@@ -864,12 +900,11 @@ fn download_from_url(
             );
             match download_to_path_parallel(&url_parts, url, &asset_path, proxy_scope, plan) {
                 Ok(()) => {}
-                Err(ParallelDownloadError::Unsupported(err)) => {
+                Err(ParallelDownloadError::Unsupported) => {
                     retry_single_stream_after_parallel_failure(
                         interactive,
                         format!(
-                            "range transfer unavailable for `{}`; retrying with single stream ({err:#})",
-                            asset_name
+                            "range transfer unavailable for `{asset_name}`; falling back to single stream"
                         ),
                         &client,
                         &url_parts.path_and_query,
@@ -882,8 +917,8 @@ fn download_from_url(
                     retry_single_stream_after_parallel_failure(
                         interactive,
                         format!(
-                            "parallel transfer failed for `{}`; retrying with single stream ({err:#})",
-                            asset_name
+                            "parallel transfer interrupted for `{asset_name}` after {}; falling back to single stream",
+                            summarize_retryable_error(&err)
                         ),
                         &client,
                         &url_parts.path_and_query,
@@ -956,6 +991,9 @@ fn retry_single_stream_after_parallel_failure(
     asset_path: &Path,
     total_bytes: Option<u64>,
 ) -> Result<()> {
+    if interactive {
+        finish_download_tty_line();
+    }
     print_download_stage(interactive, "download", reason);
     print_download_stage(interactive, "download", "single-stream transfer");
     download_to_path_single(client, path_and_query, url, asset_path, total_bytes)
@@ -1097,7 +1135,7 @@ fn download_to_path_single_once(
     let use_tty_line = io::stderr().is_terminal();
     if use_tty_line {
         eprint!(
-            "\r{}",
+            "\r\x1b[2K{}",
             render_download_progress_line(downloaded, total_bytes, start.elapsed(), true)
         );
         let _ = io::stderr().flush();
@@ -1250,7 +1288,7 @@ fn spawn_parallel_download_reporter(
         let mut last_report = Instant::now();
         if tty_line {
             eprint!(
-                "\r{}",
+                "\r\x1b[2K{}",
                 render_download_progress_line(
                     progress.load(Ordering::SeqCst),
                     total_bytes,
@@ -1294,17 +1332,7 @@ fn download_range_part(
         )))
     })?;
     if resp.status() != 206 {
-        let status = resp.status();
-        let body = resp
-            .into_text_lossy_limited(1024)
-            .unwrap_or_else(|_| "<body unavailable>".to_string());
-        return Err(ParallelDownloadError::Unsupported(anyhow!(
-            "range request {}-{} returned status {} body {}",
-            range.start,
-            range.end,
-            status,
-            truncate_for_log(&body, 120)
-        )));
+        return Err(ParallelDownloadError::Unsupported);
     }
 
     let mut out = File::create(part_path)
@@ -1337,13 +1365,7 @@ fn download_range_part(
         .with_context(|| format!("flush partial file {}", part_path.display()))
         .map_err(ParallelDownloadError::Failed)?;
     if written != expected {
-        return Err(ParallelDownloadError::Unsupported(anyhow!(
-            "range request {}-{} returned {} bytes, expected {}",
-            range.start,
-            range.end,
-            written,
-            expected
-        )));
+        return Err(ParallelDownloadError::Unsupported);
     }
     Ok(())
 }
@@ -1533,15 +1555,20 @@ fn report_download_progress(
     let line = render_download_progress_line(downloaded, total_bytes, elapsed, tty_line);
     if tty_line {
         if force {
-            eprint!("\r{line}\n");
+            eprint!("\r\x1b[2K{line}\n");
         } else {
-            eprint!("\r{line}");
+            eprint!("\r\x1b[2K{line}");
             let _ = io::stderr().flush();
         }
     } else {
         eprintln!("{line}");
     }
     *last_report = now;
+}
+
+fn finish_download_tty_line() {
+    eprint!("\r\x1b[2K");
+    let _ = io::stderr().flush();
 }
 
 fn verify_sha256_file(path: &Path, expected_hex: &str) -> Result<()> {
