@@ -325,6 +325,8 @@ For large GitHub release assets, `za` will use parallel HTTP range downloads whe
 
 `za deps` defaults to a compact audit view: one verdict line, an `attention` section for high/medium/unknown findings, and a low-risk summary hint. Use `za deps --verbose` to include the low-risk baseline inventory as well.
 
+Human-readable commands honor `--color auto|always|never` and `NO_COLOR`, so CI logs and redirected output can stay plain while interactive terminals keep semantic status colors.
+
 ### Existing binaries adoption
 
 If a supported unmanaged binary is already present in scope bin path (for example `/usr/local/bin/codex`), use `za tool install <tool> --adopt` to move it into the managed store and make it active.

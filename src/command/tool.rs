@@ -46,7 +46,10 @@ use self::policy::{
     tool_policies,
 };
 use self::source::{resolve_install_source, resolve_requested_version};
-use crate::{cli::ToolCommands, command::za_config};
+use crate::{
+    cli::ToolCommands,
+    command::{style as tty_style, za_config},
+};
 
 const HTTP_TIMEOUT_SECS: u64 = 300;
 const GITHUB_API_BASE: &str = "https://api.github.com";
@@ -109,10 +112,13 @@ fn prepare_interruptible_tool_operation() -> Result<()> {
 }
 
 fn print_tool_stage(stage: &str, message: impl AsRef<str>) {
+    let stage_label = format!("{stage:<8}");
+    let styled_stage = style_tool_stage_token(stage, &stage_label);
     if io::stdout().is_terminal() {
-        println!("{} {stage:<8} {}", tool_stage_icon(stage), message.as_ref());
+        let prefix = format!("{} {}", tool_stage_icon(stage), styled_stage);
+        println!("{prefix} {}", style_tool_message(message.as_ref()));
     } else {
-        println!("{stage:<8} {}", message.as_ref());
+        println!("{styled_stage} {}", style_tool_message(message.as_ref()));
     }
 }
 
@@ -137,6 +143,61 @@ fn tool_stage_icon(stage: &str) -> &'static str {
         "fail" => "❌",
         _ => "•",
     }
+}
+
+fn style_tool_stage_token(stage: &str, value: &str) -> String {
+    match stage {
+        "done" | "activate" => tty_style::success(value),
+        "update" | "install" | "sync" => tty_style::active(value),
+        "repair" => tty_style::warning(value),
+        "fail" => tty_style::error(value),
+        _ => tty_style::dim(value),
+    }
+}
+
+fn style_tool_message(message: &str) -> String {
+    let message = style_backticked_segments(message)
+        .replace("(dry-run)", &tty_style::dim("(dry-run)"))
+        .replace("(no changes)", &tty_style::dim("(no changes)"))
+        .replace(" -> ", &format!(" {} ", tty_style::dim("->")))
+        .replace(
+            " already at ",
+            &format!(" {} ", tty_style::dim("already at")),
+        )
+        .replace(
+            " no changes needed",
+            &format!(" {}", tty_style::dim("no changes needed")),
+        );
+    if let Some((prefix, path)) = message.split_once(" from URL ") {
+        format!(
+            "{prefix} {} {}",
+            tty_style::dim("from URL"),
+            tty_style::dim(path)
+        )
+    } else {
+        message
+    }
+}
+
+fn style_backticked_segments(message: &str) -> String {
+    let mut out = String::new();
+    let mut rest = message;
+    while let Some(start) = rest.find('`') {
+        let (before, after_start) = rest.split_at(start);
+        out.push_str(before);
+        let after_start = &after_start[1..];
+        if let Some(end) = after_start.find('`') {
+            let (inner, after_end) = after_start.split_at(end);
+            out.push_str(&tty_style::header(format!("`{inner}`")));
+            rest = &after_end[1..];
+        } else {
+            out.push('`');
+            out.push_str(after_start);
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn new_tool_progress_bar(
@@ -1988,6 +2049,7 @@ fn render_compact_batch_result(
     result: &InstallResult,
     dry_run: bool,
 ) -> (&'static str, String) {
+    let name = styled_tool_ref(&result.tool.name);
     match result.outcome {
         InstallOutcome::Updated | InstallOutcome::Installed => {
             let stage = batch_kind_stage(kind);
@@ -1997,21 +2059,30 @@ fn render_compact_batch_result(
                 {
                     if dry_run {
                         format!(
-                            "`{}` {} -> {} (dry-run)",
-                            result.tool.name, previous, result.tool.version
+                            "{name} {} {} {} {}",
+                            tty_style::dim(previous),
+                            tty_style::dim("->"),
+                            styled_tool_version(&result.tool.version, kind),
+                            tty_style::dim("(dry-run)")
                         )
                     } else {
                         format!(
-                            "`{}` {} -> {}",
-                            result.tool.name, previous, result.tool.version
+                            "{name} {} {} {}",
+                            tty_style::dim(previous),
+                            tty_style::dim("->"),
+                            styled_tool_version(&result.tool.version, kind)
                         )
                     }
                 }
                 _ => {
                     if dry_run {
-                        format!("`{}` {} (dry-run)", result.tool.name, result.tool.version)
+                        format!(
+                            "{name} {} {}",
+                            styled_tool_version(&result.tool.version, kind),
+                            tty_style::dim("(dry-run)")
+                        )
                     } else {
-                        format!("`{}` {}", result.tool.name, result.tool.version)
+                        format!("{name} {}", styled_tool_version(&result.tool.version, kind))
                     }
                 }
             };
@@ -2020,15 +2091,35 @@ fn render_compact_batch_result(
         InstallOutcome::Repaired => (
             "repair",
             if dry_run {
-                format!("`{}` {} (dry-run)", result.tool.name, result.tool.version)
+                format!(
+                    "{name} {} {}",
+                    tty_style::warning(&result.tool.version),
+                    tty_style::dim("(dry-run)")
+                )
             } else {
-                format!("`{}` {}", result.tool.name, result.tool.version)
+                format!("{name} {}", tty_style::warning(&result.tool.version))
             },
         ),
         InstallOutcome::Unchanged => (
             batch_kind_stage(kind),
-            format!("`{}` already at {}", result.tool.name, result.tool.version),
+            format!(
+                "{name} {} {}",
+                tty_style::dim("already at"),
+                tty_style::dim(&result.tool.version)
+            ),
         ),
+    }
+}
+
+fn styled_tool_ref(name: &str) -> String {
+    tty_style::header(format!("`{name}`"))
+}
+
+fn styled_tool_version(version: &str, kind: ToolBatchKind) -> String {
+    match kind {
+        ToolBatchKind::Install | ToolBatchKind::Update | ToolBatchKind::Sync => {
+            tty_style::active(version)
+        }
     }
 }
 
@@ -2037,80 +2128,102 @@ fn render_batch_summary(kind: ToolBatchKind, summary: ToolBatchSummary, dry_run:
     match kind {
         ToolBatchKind::Install => {
             if summary.installed > 0 {
-                parts.push(format!(
-                    "{} {}",
+                parts.push(tool_summary_token(
                     summary.installed,
                     if dry_run {
                         "would install"
                     } else {
                         "installed"
-                    }
+                    },
+                    "active",
                 ));
             }
             if summary.repaired > 0 {
-                parts.push(format!(
-                    "{} {}",
+                parts.push(tool_summary_token(
                     summary.repaired,
-                    if dry_run { "would repair" } else { "repaired" }
+                    if dry_run { "would repair" } else { "repaired" },
+                    "warning",
                 ));
             }
             if summary.unchanged > 0 {
-                parts.push(format!("{} already present", summary.unchanged));
+                parts.push(tool_summary_token(
+                    summary.unchanged,
+                    "already present",
+                    "dim",
+                ));
             }
         }
         ToolBatchKind::Update => {
             if summary.updated > 0 {
-                parts.push(format!(
-                    "{} {}",
+                parts.push(tool_summary_token(
                     summary.updated,
-                    if dry_run { "would update" } else { "updated" }
+                    if dry_run { "would update" } else { "updated" },
+                    "active",
                 ));
             }
             if summary.repaired > 0 {
-                parts.push(format!(
-                    "{} {}",
+                parts.push(tool_summary_token(
                     summary.repaired,
-                    if dry_run { "would repair" } else { "repaired" }
+                    if dry_run { "would repair" } else { "repaired" },
+                    "warning",
                 ));
             }
             if summary.unchanged > 0 {
-                parts.push(format!("{} already latest", summary.unchanged));
+                parts.push(tool_summary_token(
+                    summary.unchanged,
+                    "already latest",
+                    "dim",
+                ));
             }
         }
         ToolBatchKind::Sync => {
             let synced = summary.installed + summary.updated;
             if synced > 0 {
-                parts.push(format!(
-                    "{} {}",
+                parts.push(tool_summary_token(
                     synced,
-                    if dry_run { "would sync" } else { "synced" }
+                    if dry_run { "would sync" } else { "synced" },
+                    "active",
                 ));
             }
             if summary.repaired > 0 {
-                parts.push(format!(
-                    "{} {}",
+                parts.push(tool_summary_token(
                     summary.repaired,
-                    if dry_run { "would repair" } else { "repaired" }
+                    if dry_run { "would repair" } else { "repaired" },
+                    "warning",
                 ));
             }
             if summary.unchanged > 0 {
-                parts.push(format!("{} already aligned", summary.unchanged));
+                parts.push(tool_summary_token(
+                    summary.unchanged,
+                    "already aligned",
+                    "dim",
+                ));
             }
         }
     }
 
     if summary.failed > 0 {
-        parts.push(format!("{} failed", summary.failed));
+        parts.push(tool_summary_token(summary.failed, "failed", "error"));
     }
 
     if parts.is_empty() {
         if dry_run {
-            "dry-run complete".to_string()
+            tty_style::dim("dry-run complete")
         } else {
-            "no managed tools changed".to_string()
+            tty_style::dim("no managed tools changed")
         }
     } else {
         parts.join(", ")
+    }
+}
+
+fn tool_summary_token(count: usize, label: &str, tone: &str) -> String {
+    let token = format!("{count} {label}");
+    match tone {
+        "active" => tty_style::active(token),
+        "warning" => tty_style::warning(token),
+        "error" => tty_style::error(token),
+        _ => tty_style::dim(token),
     }
 }
 

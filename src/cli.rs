@@ -5,6 +5,9 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "za", version)]
 pub struct Cli {
+    /// Control ANSI color output for human-readable commands.
+    #[arg(long, global = true, value_enum, default_value_t = ColorWhen::Auto)]
+    pub color: ColorWhen,
     #[command(subcommand)]
     pub cmd: Commands,
 }
@@ -331,6 +334,13 @@ pub enum CompletionCommands {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ColorWhen {
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum CompletionShell {
     Bash,
     Zsh,
@@ -609,7 +619,7 @@ pub enum DiffRiskFilter {
 #[cfg(test)]
 mod tests {
     use super::{
-        CiCommands, Cli, CodexCommands, Commands, CompletionCommands, CompletionShell,
+        CiCommands, Cli, CodexCommands, ColorWhen, Commands, CompletionCommands, CompletionShell,
         DiffRiskFilter, GhCommands, GitAuthCommands, PortCommands, ToolCommands,
     };
     use clap::Parser;
@@ -645,6 +655,13 @@ mod tests {
             },
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn global_color_flag_parses_before_subcommand() {
+        let cli = Cli::try_parse_from(["za", "--color", "never", "deps"]).expect("must parse");
+        assert_eq!(cli.color, ColorWhen::Never);
+        assert!(matches!(cli.cmd, Commands::Deps { .. }));
     }
 
     #[test]

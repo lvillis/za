@@ -1,6 +1,9 @@
 use crate::{
     cli::CiCommands,
-    command::za_config::{self, ProxyScope},
+    command::{
+        style as tty_style,
+        za_config::{self, ProxyScope},
+    },
 };
 use anyhow::{Context, Result, anyhow, bail};
 use humantime::parse_rfc3339_weak;
@@ -837,80 +840,91 @@ fn print_board_output(board: &CiBoardOutput) {
 fn format_summary_compact(summary: &CiSummary) -> String {
     let mut parts = Vec::new();
     if summary.failed > 0 {
-        parts.push(format!("{} fail", summary.failed));
+        parts.push(ci_summary_token(summary.failed, "fail", CiState::Failed));
     }
     if summary.cancelled > 0 {
-        parts.push(format!("{} cancel", summary.cancelled));
+        parts.push(ci_summary_token(
+            summary.cancelled,
+            "cancel",
+            CiState::Cancelled,
+        ));
     }
     if summary.running > 0 {
-        parts.push(format!("{} run", summary.running));
+        parts.push(ci_summary_token(summary.running, "run", CiState::Running));
     }
     if summary.pending > 0 {
-        parts.push(format!("{} pend", summary.pending));
+        parts.push(ci_summary_token(summary.pending, "pend", CiState::Pending));
     }
     if summary.success > 0 {
-        parts.push(format!("{} ok", summary.success));
+        parts.push(ci_summary_token(summary.success, "ok", CiState::Success));
     }
     if summary.skipped > 0 {
-        parts.push(format!("{} skip", summary.skipped));
+        parts.push(ci_summary_token(summary.skipped, "skip", CiState::Skipped));
     }
     if parts.is_empty() {
-        "no runs".to_string()
+        tty_style::dim("no runs")
     } else {
-        parts.join(" · ")
+        parts.join(&format!(" {} ", tty_style::dim("·")))
     }
 }
 
 fn format_board_summary(summary: &CiBoardSummary) -> String {
     let mut parts = Vec::new();
     if summary.errors > 0 {
-        parts.push(format!("{} err", summary.errors));
+        parts.push(tty_style::error(format!("{} err", summary.errors)));
     }
     if summary.failed > 0 {
-        parts.push(format!("{} fail", summary.failed));
+        parts.push(ci_summary_token(summary.failed, "fail", CiState::Failed));
     }
     if summary.cancelled > 0 {
-        parts.push(format!("{} cancel", summary.cancelled));
+        parts.push(ci_summary_token(
+            summary.cancelled,
+            "cancel",
+            CiState::Cancelled,
+        ));
     }
     if summary.running > 0 {
-        parts.push(format!("{} run", summary.running));
+        parts.push(ci_summary_token(summary.running, "run", CiState::Running));
     }
     if summary.pending > 0 {
-        parts.push(format!("{} pend", summary.pending));
+        parts.push(ci_summary_token(summary.pending, "pend", CiState::Pending));
     }
     if summary.success > 0 {
-        parts.push(format!("{} ok", summary.success));
+        parts.push(ci_summary_token(summary.success, "ok", CiState::Success));
     }
     if summary.no_runs > 0 {
-        parts.push(format!("{} none", summary.no_runs));
+        parts.push(ci_summary_token(summary.no_runs, "none", CiState::NoRuns));
     }
     if parts.is_empty() {
-        "no targets".to_string()
+        tty_style::dim("no targets")
     } else {
-        parts.join(" · ")
+        parts.join(&format!(" {} ", tty_style::dim("·")))
     }
 }
 
 fn render_commit_report_lines(report: &CommitCiReport) -> Vec<String> {
+    let sha = report
+        .sha
+        .as_deref()
+        .map(short_sha)
+        .unwrap_or_else(|| "-".to_string());
+    let updated = age_label(report.latest_update_at.as_deref()).unwrap_or_else(|| "-".to_string());
     let mut lines = vec![format!(
-        "{:<5} {}  {}  updated {}  {}",
-        report.state.badge(),
-        report.repo,
-        report
-            .sha
-            .as_deref()
-            .map(short_sha)
-            .unwrap_or_else(|| "-".to_string()),
-        age_label(report.latest_update_at.as_deref()).unwrap_or_else(|| "-".to_string()),
+        "{} {}  {}  {} {}  {}",
+        style_ci_badge(report.state, 5),
+        tty_style::header(&report.repo),
+        tty_style::dim(sha),
+        tty_style::dim("updated"),
+        tty_style::dim(updated),
         format_summary_compact(&report.summary)
     )];
 
     if report.runs.is_empty() {
-        lines.push("no workflow runs found for this commit".to_string());
+        lines.push(tty_style::dim("no workflow runs found for this commit"));
         return lines;
     }
 
-    lines.push("actions".to_string());
+    lines.push(tty_style::header("actions"));
     for run in ordered_review_runs(&report.runs) {
         lines.push(render_run_detail_line(run, report));
     }
@@ -920,52 +934,59 @@ fn render_commit_report_lines(report: &CommitCiReport) -> Vec<String> {
 
 fn render_board_output_lines(board: &CiBoardOutput) -> Vec<String> {
     let mut lines = vec![format!(
-        "CI  total {}  {}",
-        board.summary.total,
+        "{}  {} {}  {}",
+        tty_style::header("CI"),
+        tty_style::dim("total"),
+        tty_style::header(board.summary.total.to_string()),
         format_board_summary(&board.summary)
     )];
     if board.entries.is_empty() {
-        lines.push("No CI targets found.".to_string());
+        lines.push(tty_style::dim("No CI targets found."));
         return lines;
     }
 
-    lines.push(format!(
+    lines.push(tty_style::dim(format!(
         "{:<5} {:<28} {:<12} {:<7} {:<5} {:>3} {:>4} {:>2}  DETAIL",
         "ST", "REPO", "BRANCH", "SHA", "AGE", "RUN", "FAIL", "OK"
-    ));
+    )));
 
     for entry in &board.entries {
         match (&entry.report, &entry.query_error) {
             (_, Some(err)) => {
                 lines.push(format!(
-                    "{:<5} {:<28} {:<12} {:<7} {:<5} {:>3} {:>4} {:>2}  {}",
-                    "ERR",
+                    "{} {:<28} {:<12} {:<7} {:<5} {:>3} {:>4} {:>2}  {}",
+                    style_error_badge(5),
                     truncate_end(&entry.target, 28),
-                    "-",
-                    "-",
-                    "-",
-                    "-",
-                    "-",
-                    "-",
+                    style_ci_dim_field("-", 12),
+                    style_ci_dim_field("-", 7),
+                    style_ci_dim_field("-", 5),
+                    style_ci_dim_number("-", 3),
+                    style_ci_dim_number("-", 4),
+                    style_ci_dim_number("-", 2),
                     truncate_end(err, 80)
                 ));
             }
             (Some(report), None) => {
+                let active = report.summary.running + report.summary.pending;
+                let failures = report.summary.failed + report.summary.cancelled;
+                let success = report.summary.success;
+                let sha = report
+                    .sha
+                    .as_deref()
+                    .map(short_sha)
+                    .unwrap_or_else(|| "-".to_string());
+                let age = age_label(report.latest_update_at.as_deref())
+                    .unwrap_or_else(|| "-".to_string());
                 lines.push(format!(
-                    "{:<5} {:<28} {:<12} {:<7} {:<5} {:>3} {:>4} {:>2}  {}",
-                    report.state.badge(),
-                    truncate_end(&report.repo, 28),
-                    truncate_end(report.branch.as_deref().unwrap_or("-"), 12),
-                    report
-                        .sha
-                        .as_deref()
-                        .map(short_sha)
-                        .unwrap_or_else(|| "-".to_string()),
-                    age_label(report.latest_update_at.as_deref())
-                        .unwrap_or_else(|| "-".to_string()),
-                    report.summary.running + report.summary.pending,
-                    report.summary.failed + report.summary.cancelled,
-                    report.summary.success,
+                    "{} {} {:<12} {:<7} {:<5} {:>3} {:>4} {:>2}  {}",
+                    style_ci_badge(report.state, 5),
+                    style_ci_repo_field(&report.repo, 28),
+                    style_ci_dim_field(report.branch.as_deref().unwrap_or("-"), 12),
+                    style_ci_dim_field(&sha, 7),
+                    style_ci_dim_field(&age, 5),
+                    style_ci_metric(active, 3, CiState::Running),
+                    style_ci_metric(failures, 4, CiState::Failed),
+                    style_ci_metric(success, 2, CiState::Success),
                     truncate_end(&board_detail(report), 80)
                 ));
             }
@@ -977,16 +998,19 @@ fn render_board_output_lines(board: &CiBoardOutput) -> Vec<String> {
 }
 
 fn render_watch_update_lines(report: &CommitCiReport) -> Vec<String> {
+    let sha = report
+        .sha
+        .as_deref()
+        .map(short_sha)
+        .unwrap_or_else(|| "-".to_string());
+    let updated = age_label(report.latest_update_at.as_deref()).unwrap_or_else(|| "-".to_string());
     let mut lines = vec![format!(
-        "{:<5} {}  {}  updated {}  {}",
-        report.state.badge(),
-        report.repo,
-        report
-            .sha
-            .as_deref()
-            .map(short_sha)
-            .unwrap_or_else(|| "-".to_string()),
-        age_label(report.latest_update_at.as_deref()).unwrap_or_else(|| "-".to_string()),
+        "{} {}  {}  {} {}  {}",
+        style_ci_badge(report.state, 5),
+        tty_style::header(&report.repo),
+        tty_style::dim(sha),
+        tty_style::dim("updated"),
+        tty_style::dim(updated),
         format_summary_compact(&report.summary)
     )];
 
@@ -1001,7 +1025,8 @@ fn render_watch_update_lines(report: &CommitCiReport) -> Vec<String> {
     }
     if hidden_runs > 0 {
         lines.push(format!(
-            "  ... {} more active workflow{}",
+            "  {} {} more active workflow{}",
+            tty_style::dim("..."),
             hidden_runs,
             if hidden_runs == 1 { "" } else { "s" }
         ));
@@ -1049,36 +1074,110 @@ fn render_run_detail_line(run: &WorkflowRunReport, report: &CommitCiReport) -> S
     let age = age_label(run.updated_at.as_deref()).unwrap_or_else(|| "-".to_string());
     let mut detail = if has_mixed_events(&report.runs) {
         format!(
-            "{:<8} {}",
-            truncate_end(run.event.as_deref().unwrap_or("-"), 8),
-            truncate_end(&run.name, 80)
+            "{} {}",
+            style_ci_dim_field(&truncate_end(run.event.as_deref().unwrap_or("-"), 8), 8),
+            style_ci_subject(&truncate_end(&run.name, 80), run.state)
         )
     } else {
-        truncate_end(&run.name, 88)
+        style_ci_subject(&truncate_end(&run.name, 88), run.state)
     };
     if let Some(attempt) = run.run_attempt
         && attempt > 1
     {
-        detail.push_str(&format!("  #{}", attempt));
+        detail.push_str(&format!("  {}", tty_style::dim(format!("#{attempt}"))));
     }
-    format!("  {:<5} {:<5} {}", run.state.badge(), age, detail)
+    format!(
+        "  {} {} {}",
+        style_ci_badge(run.state, 5),
+        style_ci_dim_field(&age, 5),
+        detail
+    )
 }
 
 fn board_detail(report: &CommitCiReport) -> String {
     let mut parts = Vec::new();
     if report.summary.cancelled > 0 {
-        parts.push(format!("{} cancel", report.summary.cancelled));
+        parts.push(tty_style::dim(format!(
+            "{} cancel",
+            report.summary.cancelled
+        )));
     }
     if report.summary.skipped > 0 {
-        parts.push(format!("{} skip", report.summary.skipped));
+        parts.push(tty_style::dim(format!("{} skip", report.summary.skipped)));
     }
     if report.state == CiState::NoRuns {
-        parts.push("no runs".to_string());
+        parts.push(tty_style::dim("no runs"));
     }
     if parts.is_empty() {
-        "-".to_string()
+        tty_style::dim("-")
     } else {
-        parts.join(" · ")
+        parts.join(&format!(" {} ", tty_style::dim("·")))
+    }
+}
+
+fn ci_summary_token(count: usize, label: &str, state: CiState) -> String {
+    let text = if count == 0 && label == "no runs" {
+        label.to_string()
+    } else {
+        format!("{count} {label}")
+    };
+    match state {
+        CiState::Success => tty_style::success(text),
+        CiState::Failed => tty_style::error(text),
+        CiState::Cancelled | CiState::Pending => tty_style::warning(text),
+        CiState::Running => tty_style::active(text),
+        CiState::Skipped | CiState::NoRuns => tty_style::dim(text),
+    }
+}
+
+fn style_ci_badge(state: CiState, width: usize) -> String {
+    let label = format!("{:<width$}", state.badge());
+    match state {
+        CiState::Success => tty_style::success(label),
+        CiState::Failed => tty_style::error(label),
+        CiState::Cancelled | CiState::Pending => tty_style::warning(label),
+        CiState::Running => tty_style::active(label),
+        CiState::Skipped | CiState::NoRuns => tty_style::dim(label),
+    }
+}
+
+fn style_error_badge(width: usize) -> String {
+    tty_style::error(format!("{:<width$}", "ERR"))
+}
+
+fn style_ci_repo_field(value: &str, width: usize) -> String {
+    tty_style::header(format!("{:<width$}", truncate_end(value, width)))
+}
+
+fn style_ci_dim_field(value: &str, width: usize) -> String {
+    tty_style::dim(format!("{:<width$}", truncate_end(value, width)))
+}
+
+fn style_ci_dim_number(value: &str, width: usize) -> String {
+    tty_style::dim(format!("{value:>width$}"))
+}
+
+fn style_ci_metric(value: usize, width: usize, state: CiState) -> String {
+    let plain = format!("{value:>width$}");
+    if value == 0 {
+        return tty_style::dim(plain);
+    }
+    match state {
+        CiState::Success => tty_style::success(plain),
+        CiState::Failed => tty_style::error(plain),
+        CiState::Cancelled | CiState::Pending => tty_style::warning(plain),
+        CiState::Running => tty_style::active(plain),
+        CiState::Skipped | CiState::NoRuns => tty_style::dim(plain),
+    }
+}
+
+fn style_ci_subject(value: &str, state: CiState) -> String {
+    match state {
+        CiState::Success => tty_style::success(value),
+        CiState::Failed => tty_style::error(value),
+        CiState::Cancelled | CiState::Pending => tty_style::warning(value),
+        CiState::Running => tty_style::active(value),
+        CiState::Skipped | CiState::NoRuns => tty_style::header(value),
     }
 }
 

@@ -3,7 +3,7 @@
 mod api;
 mod model;
 
-use crate::command::za_config;
+use crate::command::{style as tty_style, za_config};
 use anyhow::{Context, Result, anyhow, bail};
 use humantime::format_rfc3339_seconds;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -563,22 +563,27 @@ fn render_report_lines(
 
     if !attention.is_empty() {
         lines.push(String::new());
-        lines.push("attention".to_string());
+        lines.push(tty_style::header("attention"));
         lines.extend(render_record_table(&attention));
     }
 
     if verbose {
         if !low.is_empty() {
             lines.push(String::new());
-            lines.push("baseline".to_string());
+            lines.push(tty_style::header("baseline"));
             lines.extend(render_record_table(&low));
         }
         lines.push(String::new());
-        lines.push(format!("manifest  {}", manifest_path.display()));
+        lines.push(format!(
+            "{}  {}",
+            tty_style::dim("manifest"),
+            manifest_path.display()
+        ));
     } else if !low.is_empty() {
         lines.push(String::new());
         lines.push(format!(
-            "low       {} low-risk entr{} hidden; rerun with `za deps --verbose` for the full inventory",
+            "{}       {} low-risk entr{} hidden; rerun with `za deps --verbose` for the full inventory",
+            tty_style::dim("low"),
             low.len(),
             if low.len() == 1 { "y is" } else { "ies are" }
         ));
@@ -597,11 +602,13 @@ fn render_report_summary_line(
         .and_then(|name| name.to_str())
         .map(str::to_string)
         .unwrap_or_else(|| manifest_path.to_string_lossy().into_owned());
+    let verdict = style_report_verdict(&format!("{:<5}", report_verdict(summary)), summary);
     format!(
-        "{:<5}  {}  {} deps  {}",
-        report_verdict(summary),
-        manifest,
-        total,
+        "{}  {}  {} {}  {}",
+        verdict,
+        tty_style::header(manifest),
+        tty_style::header(total.to_string()),
+        tty_style::dim("deps"),
         render_summary_counts(summary)
     )
 }
@@ -621,21 +628,21 @@ fn report_verdict(summary: &AuditSummary) -> &'static str {
 fn render_summary_counts(summary: &AuditSummary) -> String {
     let mut parts = Vec::new();
     if summary.high > 0 {
-        parts.push(format!("{} high", summary.high));
+        parts.push(tty_style::error(format!("{} high", summary.high)));
     }
     if summary.medium > 0 {
-        parts.push(format!("{} medium", summary.medium));
+        parts.push(tty_style::warning(format!("{} medium", summary.medium)));
     }
     if summary.unknown > 0 {
-        parts.push(format!("{} unknown", summary.unknown));
+        parts.push(tty_style::active(format!("{} unknown", summary.unknown)));
     }
     if summary.low > 0 {
-        parts.push(format!("{} low", summary.low));
+        parts.push(tty_style::dim(format!("{} low", summary.low)));
     }
     if parts.is_empty() {
-        "no findings".to_string()
+        tty_style::dim("no findings")
     } else {
-        parts.join(" · ")
+        parts.join(&format!(" {} ", tty_style::dim("·")))
     }
 }
 
@@ -651,22 +658,40 @@ fn render_record_table(records: &[&DepAuditRecord]) -> Vec<String> {
     let kinds_width = column_width(records, "kinds", |record| &record.kinds, 12);
 
     let mut lines = Vec::with_capacity(records.len() + 1);
-    lines.push(format!(
+    lines.push(tty_style::dim(format!(
         "{:<5}  {:<name_width$}  {:<req_width$}  {:<latest_width$}  {:<kinds_width$}  note",
         "risk", "name", "req", "latest", "kinds",
-    ));
+    )));
 
     for record in records {
-        lines.push(format!(
-            "{:<5}  {:<name_width$}  {:<req_width$}  {:<latest_width$}  {:<kinds_width$}  {}",
-            record_risk_label(record.risk),
-            truncate(&record.name, name_width),
-            truncate(&record.requirement, req_width),
-            truncate(
+        let risk = style_record_risk(
+            &format!("{:<5}", record_risk_label(record.risk)),
+            record.risk,
+        );
+        let name = style_dep_name_cell(&truncate(&record.name, name_width), name_width);
+        let requirement = tty_style::dim(format!(
+            "{:<req_width$}",
+            truncate(&record.requirement, req_width)
+        ));
+        let latest = style_dep_latest_cell(
+            &truncate(
                 record.latest_version.as_deref().unwrap_or("-"),
-                latest_width
+                latest_width,
             ),
-            truncate(&record.kinds, kinds_width),
+            latest_width,
+            record.latest_version.is_some(),
+        );
+        let kinds = tty_style::dim(format!(
+            "{:<kinds_width$}",
+            truncate(&record.kinds, kinds_width)
+        ));
+        lines.push(format!(
+            "{}  {}  {}  {}  {}  {}",
+            risk,
+            name,
+            requirement,
+            latest,
+            kinds,
             summarize_record_note(record),
         ));
     }
@@ -703,9 +728,43 @@ fn record_risk_label(risk: RiskLevel) -> &'static str {
 
 fn summarize_record_note(record: &DepAuditRecord) -> String {
     if record.notes.is_empty() {
-        return "-".to_string();
+        return tty_style::dim("-");
     }
     truncate(&record.notes.join("; "), 96)
+}
+
+fn style_dep_name_cell(value: &str, width: usize) -> String {
+    tty_style::header(format!("{value:<width$}"))
+}
+
+fn style_dep_latest_cell(value: &str, width: usize, has_latest: bool) -> String {
+    let padded = format!("{value:<width$}");
+    if has_latest {
+        tty_style::active(padded)
+    } else {
+        tty_style::dim(padded)
+    }
+}
+
+fn style_report_verdict(value: &str, summary: &AuditSummary) -> String {
+    if summary.high > 0 {
+        tty_style::error(value)
+    } else if summary.medium > 0 {
+        tty_style::warning(value)
+    } else if summary.unknown > 0 {
+        tty_style::active(value)
+    } else {
+        tty_style::success(value)
+    }
+}
+
+fn style_record_risk(value: &str, risk: RiskLevel) -> String {
+    match risk {
+        RiskLevel::High => tty_style::error(value),
+        RiskLevel::Medium => tty_style::warning(value),
+        RiskLevel::Low => tty_style::dim(value),
+        RiskLevel::Unknown => tty_style::active(value),
+    }
 }
 
 fn write_json_report(

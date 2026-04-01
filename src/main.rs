@@ -8,6 +8,11 @@ fn main() -> Result<()> {
     init_tls_crypto_provider()?;
 
     let args = cli::Cli::parse();
+    command::style::set_color_mode(match args.color {
+        cli::ColorWhen::Auto => command::style::ColorMode::Auto,
+        cli::ColorWhen::Always => command::style::ColorMode::Always,
+        cli::ColorWhen::Never => command::style::ColorMode::Never,
+    });
     match args.cmd {
         cli::Commands::Completion { cmd } => {
             let exit_code = command::completion::run(cmd)?;

@@ -1281,7 +1281,7 @@ fn is_unborn_head(stderr: &str) -> bool {
 }
 
 fn color_enabled() -> bool {
-    io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
+    crate::command::style::stdout_color_enabled()
 }
 
 fn terminal_width() -> Option<usize> {
