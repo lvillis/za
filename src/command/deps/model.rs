@@ -37,15 +37,6 @@ pub(super) enum RiskLevel {
 }
 
 impl RiskLevel {
-    pub(super) fn as_str(self) -> &'static str {
-        match self {
-            Self::High => "high",
-            Self::Medium => "medium",
-            Self::Low => "low",
-            Self::Unknown => "unknown",
-        }
-    }
-
     pub(super) fn weight(self) -> u8 {
         match self {
             Self::High => 4,
