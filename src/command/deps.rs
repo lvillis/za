@@ -50,6 +50,7 @@ pub struct DepsRunOptions {
     pub include_optional: bool,
     pub json_out: Option<PathBuf>,
     pub fail_on_high: bool,
+    pub verbose: bool,
 }
 
 pub fn run(opts: DepsRunOptions) -> Result<()> {
@@ -62,6 +63,7 @@ pub fn run(opts: DepsRunOptions) -> Result<()> {
         include_optional,
         json_out,
         fail_on_high,
+        verbose,
     } = opts;
 
     let manifest_path = canonical_manifest_path(manifest_path)?;
@@ -84,7 +86,7 @@ pub fn run(opts: DepsRunOptions) -> Result<()> {
     sort_records(&mut records);
 
     let summary = build_summary(&records);
-    print_report(&manifest_path, &summary, &records);
+    print_report(&manifest_path, &summary, &records, verbose);
 
     if let Some(path) = json_out {
         write_json_report(path, &manifest_path, &summary, &records)?;
@@ -528,71 +530,182 @@ fn build_summary(records: &[DepAuditRecord]) -> AuditSummary {
     summary
 }
 
-fn print_report(manifest_path: &Path, summary: &AuditSummary, records: &[DepAuditRecord]) {
-    println!("Dependency Governance Audit");
-    println!("Manifest: {}", manifest_path.display());
-    println!(
-        "Summary: high={} medium={} low={} unknown={}",
-        summary.high, summary.medium, summary.low, summary.unknown
-    );
-    println!(
-        "{:<18} {:<15} {:<8} {:<6} {:<16} {:<8} {:<8} {:<10} {:<10} {:<9} NOTES",
-        "NAME",
-        "REQ",
-        "RISK",
-        "YANKED",
-        "LICENSE",
-        "MSRV",
-        "STARS",
-        "REL_AGE_D",
-        "PUSH_AGE_D",
-        "ARCHIVED"
-    );
-    for rec in records {
-        let yanked = rec
-            .latest_version_yanked
-            .map(|v| if v { "yes" } else { "no" }.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let license = rec
-            .latest_version_license
-            .clone()
-            .unwrap_or_else(|| "-".to_string());
-        let msrv = rec
-            .latest_version_rust_version
-            .clone()
-            .unwrap_or_else(|| "-".to_string());
-        let stars = rec
-            .github_stars
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let release_age = rec
-            .latest_release_age_days
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let push_age = rec
-            .github_push_age_days
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let archived = rec
-            .github_archived
-            .map(|v| if v { "yes" } else { "no" }.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let notes = rec.notes.join("; ");
-        println!(
-            "{:<18} {:<15} {:<8} {:<6} {:<16} {:<8} {:<8} {:<10} {:<10} {:<9} {}",
-            rec.name,
-            truncate(&rec.requirement, 15),
-            rec.risk.as_str(),
-            yanked,
-            truncate(&license, 16),
-            truncate(&msrv, 8),
-            stars,
-            release_age,
-            push_age,
-            archived,
-            truncate(&notes, 120)
-        );
+fn print_report(
+    manifest_path: &Path,
+    summary: &AuditSummary,
+    records: &[DepAuditRecord],
+    verbose: bool,
+) {
+    for line in render_report_lines(manifest_path, summary, records, verbose) {
+        println!("{line}");
     }
+}
+
+fn render_report_lines(
+    manifest_path: &Path,
+    summary: &AuditSummary,
+    records: &[DepAuditRecord],
+    verbose: bool,
+) -> Vec<String> {
+    let mut lines = vec![render_report_summary_line(
+        manifest_path,
+        summary,
+        records.len(),
+    )];
+    let attention = records
+        .iter()
+        .filter(|record| record.risk != RiskLevel::Low)
+        .collect::<Vec<_>>();
+    let low = records
+        .iter()
+        .filter(|record| record.risk == RiskLevel::Low)
+        .collect::<Vec<_>>();
+
+    if !attention.is_empty() {
+        lines.push(String::new());
+        lines.push("attention".to_string());
+        lines.extend(render_record_table(&attention));
+    }
+
+    if verbose {
+        if !low.is_empty() {
+            lines.push(String::new());
+            lines.push("baseline".to_string());
+            lines.extend(render_record_table(&low));
+        }
+        lines.push(String::new());
+        lines.push(format!("manifest  {}", manifest_path.display()));
+    } else if !low.is_empty() {
+        lines.push(String::new());
+        lines.push(format!(
+            "low       {} low-risk entr{} hidden; rerun with `za deps --verbose` for the full inventory",
+            low.len(),
+            if low.len() == 1 { "y is" } else { "ies are" }
+        ));
+    }
+
+    lines
+}
+
+fn render_report_summary_line(
+    manifest_path: &Path,
+    summary: &AuditSummary,
+    total: usize,
+) -> String {
+    let manifest = manifest_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| manifest_path.to_string_lossy().into_owned());
+    format!(
+        "{:<5}  {}  {} deps  {}",
+        report_verdict(summary),
+        manifest,
+        total,
+        render_summary_counts(summary)
+    )
+}
+
+fn report_verdict(summary: &AuditSummary) -> &'static str {
+    if summary.high > 0 {
+        "HIGH"
+    } else if summary.medium > 0 {
+        "MED"
+    } else if summary.unknown > 0 {
+        "WARN"
+    } else {
+        "OK"
+    }
+}
+
+fn render_summary_counts(summary: &AuditSummary) -> String {
+    let mut parts = Vec::new();
+    if summary.high > 0 {
+        parts.push(format!("{} high", summary.high));
+    }
+    if summary.medium > 0 {
+        parts.push(format!("{} medium", summary.medium));
+    }
+    if summary.unknown > 0 {
+        parts.push(format!("{} unknown", summary.unknown));
+    }
+    if summary.low > 0 {
+        parts.push(format!("{} low", summary.low));
+    }
+    if parts.is_empty() {
+        "no findings".to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn render_record_table(records: &[&DepAuditRecord]) -> Vec<String> {
+    let name_width = column_width(records, "name", |record| &record.name, 24);
+    let req_width = column_width(records, "req", |record| &record.requirement, 16);
+    let latest_width = column_width(
+        records,
+        "latest",
+        |record| record.latest_version.as_deref().unwrap_or("-"),
+        14,
+    );
+    let kinds_width = column_width(records, "kinds", |record| &record.kinds, 12);
+
+    let mut lines = Vec::with_capacity(records.len() + 1);
+    lines.push(format!(
+        "{:<5}  {:<name_width$}  {:<req_width$}  {:<latest_width$}  {:<kinds_width$}  note",
+        "risk", "name", "req", "latest", "kinds",
+    ));
+
+    for record in records {
+        lines.push(format!(
+            "{:<5}  {:<name_width$}  {:<req_width$}  {:<latest_width$}  {:<kinds_width$}  {}",
+            record_risk_label(record.risk),
+            truncate(&record.name, name_width),
+            truncate(&record.requirement, req_width),
+            truncate(
+                record.latest_version.as_deref().unwrap_or("-"),
+                latest_width
+            ),
+            truncate(&record.kinds, kinds_width),
+            summarize_record_note(record),
+        ));
+    }
+
+    lines
+}
+
+fn column_width<'a, F>(
+    records: &[&'a DepAuditRecord],
+    header: &str,
+    value: F,
+    max_width: usize,
+) -> usize
+where
+    F: Fn(&'a DepAuditRecord) -> &'a str,
+{
+    records
+        .iter()
+        .map(|record| value(record).chars().count())
+        .max()
+        .unwrap_or(header.chars().count())
+        .max(header.chars().count())
+        .min(max_width)
+}
+
+fn record_risk_label(risk: RiskLevel) -> &'static str {
+    match risk {
+        RiskLevel::High => "HIGH",
+        RiskLevel::Medium => "MED",
+        RiskLevel::Low => "LOW",
+        RiskLevel::Unknown => "WARN",
+    }
+}
+
+fn summarize_record_note(record: &DepAuditRecord) -> String {
+    if record.notes.is_empty() {
+        return "-".to_string();
+    }
+    truncate(&record.notes.join("; "), 96)
 }
 
 fn write_json_report(

@@ -126,6 +126,7 @@ fn tool_stage_icon(stage: &str) -> &'static str {
     match stage {
         "resolve" => "🔎",
         "update" => "⬆️",
+        "sync" => "🔄",
         "repair" => "🔧",
         "source" => "📦",
         "install" => "📥",
@@ -316,6 +317,7 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
             version,
             adopt,
             dry_run,
+            verbose,
         } => {
             if dry_run {
                 install_tools(
@@ -325,6 +327,7 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
                     adopt,
                     ToolAction::Install,
                     true,
+                    verbose,
                 )?;
                 Ok(0)
             } else {
@@ -337,6 +340,7 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
                         adopt,
                         ToolAction::Install,
                         false,
+                        verbose,
                     )
                 })
             }
@@ -365,9 +369,20 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
                 })
             }
         }
-        ToolCommands::Sync { file } => {
-            let home_for_action = home.clone();
-            run_mutating_tool_command(&home, scope, move || sync_manifest(&home_for_action, &file))
+        ToolCommands::Sync {
+            file,
+            dry_run,
+            verbose,
+        } => {
+            if dry_run {
+                sync_manifest(&home, &file, true, verbose)?;
+                Ok(0)
+            } else {
+                let home_for_action = home.clone();
+                run_mutating_tool_command(&home, scope, move || {
+                    sync_manifest(&home_for_action, &file, false, verbose)
+                })
+            }
         }
         ToolCommands::Uninstall { tool, version } => {
             let home_for_action = home.clone();
@@ -398,6 +413,7 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
                     None,
                     true,
                     ToolAction::Install,
+                    false,
                     false,
                 )
             })
@@ -1140,7 +1156,15 @@ fn install(
     let update_target_is_healthy =
         current_matches_target && already_installed && manifest_exists && active_exists;
     let planned_outcome = match options.action {
-        ToolAction::Install => InstallOutcome::Installed,
+        ToolAction::Install => {
+            if update_target_is_healthy {
+                InstallOutcome::Unchanged
+            } else if already_installed && current_matches_target {
+                InstallOutcome::Repaired
+            } else {
+                InstallOutcome::Installed
+            }
+        }
         ToolAction::Update => {
             if update_target_is_healthy {
                 InstallOutcome::Unchanged
@@ -1678,6 +1702,7 @@ fn install_tools(
     adopt: bool,
     action: ToolAction,
     dry_run: bool,
+    verbose: bool,
 ) -> Result<()> {
     if adopt && version.is_some() {
         bail!("`za tool install --adopt` does not accept `--version`");
@@ -1711,46 +1736,51 @@ fn install_tools(
     }
 
     let total = requested_names.len();
-    for (idx, name) in requested_names.iter().enumerate() {
-        if total > 1 {
-            println!("➡️  [{}/{}] {}", idx + 1, total, name);
-        }
-        if adopt {
+    if adopt {
+        for (idx, name) in requested_names.iter().enumerate() {
+            if total > 1 {
+                println!("➡️  [{}/{}] {}", idx + 1, total, name);
+            }
             adopt_tool(home, name, dry_run)?;
-        } else {
-            let _ = install(
-                home,
-                ToolSpec::from_args(name, version)?,
-                match action {
-                    ToolAction::Install => {
-                        InstallOptions::install(za_config::ProxyScope::Tool).dry_run(dry_run)
-                    }
-                    ToolAction::Update => {
-                        InstallOptions::update(za_config::ProxyScope::Tool).dry_run(dry_run)
-                    }
-                },
-            )?;
         }
+        return Ok(());
     }
-    Ok(())
+
+    let specs = requested_names
+        .iter()
+        .map(|name| ToolSpec::from_args(name, version))
+        .collect::<Result<Vec<_>>>()?;
+    let kind = match action {
+        ToolAction::Install => ToolBatchKind::Install,
+        ToolAction::Update => ToolBatchKind::Update,
+    };
+    run_tool_batch(home, kind, specs, dry_run, verbose, None)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolBatchKind {
+    Install,
+    Update,
+    Sync,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct UpdateBatchSummary {
+struct ToolBatchSummary {
+    installed: usize,
     updated: usize,
     repaired: usize,
     unchanged: usize,
     failed: usize,
 }
 
-impl UpdateBatchSummary {
+impl ToolBatchSummary {
     fn record(self, outcome: InstallOutcome) -> Self {
         let mut updated = self;
         match outcome {
+            InstallOutcome::Installed => updated.installed += 1,
             InstallOutcome::Updated => updated.updated += 1,
             InstallOutcome::Repaired => updated.repaired += 1,
             InstallOutcome::Unchanged => updated.unchanged += 1,
-            InstallOutcome::Installed => updated.updated += 1,
         }
         updated
     }
@@ -1788,92 +1818,86 @@ fn update_tools(
         return Ok(());
     }
 
-    let total = requested_names.len();
-    let batch_mode = total > 1 || all || tools.is_empty();
+    let specs = requested_names
+        .iter()
+        .map(|name| ToolSpec::from_args(name, version))
+        .collect::<Result<Vec<_>>>()?;
+    run_tool_batch(home, ToolBatchKind::Update, specs, dry_run, verbose, None)
+}
+
+fn run_tool_batch(
+    home: &ToolHome,
+    kind: ToolBatchKind,
+    specs: Vec<ToolSpec>,
+    dry_run: bool,
+    verbose: bool,
+    source_label: Option<&str>,
+) -> Result<()> {
+    let total = specs.len();
+    let batch_mode = total > 1 || matches!(kind, ToolBatchKind::Update | ToolBatchKind::Sync);
     let compact_mode = batch_mode && !verbose;
-    let mut summary = UpdateBatchSummary::default();
+    let mut summary = ToolBatchSummary::default();
     let mut failed_tools = Vec::new();
 
     if compact_mode {
-        print_tool_stage("update", format!("checking {total} managed tool(s)"));
+        print_tool_stage(
+            batch_kind_stage(kind),
+            batch_start_message(kind, total, source_label),
+        );
     }
 
-    let latest_lookup = if version.is_none() {
-        Some(resolve_latest_checks_for_names(&requested_names)?)
-    } else {
-        None
-    };
+    let latest_lookup = resolve_batch_latest_lookup(&specs)?;
 
-    for (idx, name) in requested_names.iter().enumerate() {
+    for (idx, requested) in specs.iter().enumerate() {
         ensure_not_interrupted()?;
         if batch_mode && !compact_mode {
-            println!("➡️  [{}/{}] {}", idx + 1, total, name);
+            println!("➡️  [{}/{}] {}", idx + 1, total, requested.name);
         }
 
-        let resolved_version = if let Some(version) = version {
-            Some(version.to_string())
-        } else {
-            match latest_lookup
-                .as_ref()
-                .and_then(|lookup| lookup.latest_by_name.get(name))
-                .cloned()
-                .unwrap_or(LatestCheck::Unsupported)
-            {
-                LatestCheck::Latest(version) => Some(version),
-                LatestCheck::Error(err) => {
-                    summary.failed += 1;
-                    failed_tools.push(name.clone());
-                    let message = if compact_mode {
-                        summarize_tool_update_error(&err)
-                    } else {
-                        err.clone()
-                    };
-                    print_tool_stage("fail", format!("`{name}` {message}"));
-                    if total == 1 {
-                        bail!("{err}");
-                    }
-                    continue;
+        let resolved_spec = match resolve_batch_tool_spec(requested, latest_lookup.as_ref()) {
+            Ok(spec) => spec,
+            Err(err) => {
+                summary.failed += 1;
+                failed_tools.push(requested.name.clone());
+                let message = if compact_mode {
+                    summarize_tool_update_error(&err.to_string())
+                } else {
+                    err.to_string()
+                };
+                print_tool_stage("fail", format!("`{}` {message}", requested.name));
+                if total == 1 {
+                    return Err(err);
                 }
-                LatestCheck::Unsupported => {
-                    summary.failed += 1;
-                    failed_tools.push(name.clone());
-                    print_tool_stage(
-                        "fail",
-                        format!("`{name}` latest version resolution is not supported"),
-                    );
-                    if total == 1 {
-                        bail!("latest version resolution is not supported for `{name}`");
-                    }
-                    continue;
-                }
+                continue;
             }
         };
 
-        match install(
-            home,
-            ToolSpec::from_args(name, resolved_version.as_deref())?,
-            InstallOptions::update(za_config::ProxyScope::Tool)
-                .dry_run(dry_run)
-                .emit_stages(!compact_mode),
-        ) {
+        let options = match kind {
+            ToolBatchKind::Install => InstallOptions::install(za_config::ProxyScope::Tool),
+            ToolBatchKind::Update | ToolBatchKind::Sync => {
+                InstallOptions::update(za_config::ProxyScope::Tool)
+            }
+        }
+        .dry_run(dry_run)
+        .emit_stages(!compact_mode);
+
+        match install(home, resolved_spec, options) {
             Ok(result) => {
                 summary = summary.record(result.outcome);
                 if compact_mode && result.outcome != InstallOutcome::Unchanged {
-                    let (stage, message) = render_compact_update_result(&result, dry_run);
+                    let (stage, message) = render_compact_batch_result(kind, &result, dry_run);
                     print_tool_stage(stage, message);
                 }
             }
             Err(err) => {
                 summary.failed += 1;
-                failed_tools.push(name.clone());
-                if compact_mode {
-                    print_tool_stage(
-                        "fail",
-                        format!("`{name}` {}", summarize_tool_update_error(&err.to_string())),
-                    );
+                failed_tools.push(requested.name.clone());
+                let message = if compact_mode {
+                    summarize_tool_update_error(&err.to_string())
                 } else {
-                    print_tool_stage("fail", format!("`{name}` {}", err));
-                }
+                    err.to_string()
+                };
+                print_tool_stage("fail", format!("`{}` {message}", requested.name));
                 if total == 1 {
                     return Err(err);
                 }
@@ -1882,7 +1906,7 @@ fn update_tools(
     }
 
     if batch_mode {
-        print_tool_stage("done", render_update_summary(summary, dry_run));
+        print_tool_stage("done", render_batch_summary(kind, summary, dry_run));
     }
 
     if failed_tools.is_empty() {
@@ -1890,17 +1914,84 @@ fn update_tools(
     }
 
     bail!(
-        "tool update finished with {} failure(s): {}",
+        "{} finished with {} failure(s): {}",
+        batch_kind_noun(kind),
         failed_tools.len(),
         failed_tools.join(", ")
     )
 }
 
-fn render_compact_update_result(result: &InstallResult, dry_run: bool) -> (&'static str, String) {
+fn resolve_batch_latest_lookup(specs: &[ToolSpec]) -> Result<Option<HashMap<String, LatestCheck>>> {
+    let unresolved_names = specs
+        .iter()
+        .filter(|spec| spec.version.is_none())
+        .map(|spec| spec.name.clone())
+        .collect::<Vec<_>>();
+    if unresolved_names.is_empty() {
+        return Ok(None);
+    }
+    let lookup = resolve_latest_checks_for_names(&unresolved_names)?;
+    Ok(Some(lookup.latest_by_name))
+}
+
+fn resolve_batch_tool_spec(
+    requested: &ToolSpec,
+    latest_lookup: Option<&HashMap<String, LatestCheck>>,
+) -> Result<ToolSpec> {
+    if requested.version.is_some() {
+        return Ok(requested.clone());
+    }
+
+    match latest_lookup
+        .and_then(|lookup| lookup.get(&requested.name))
+        .cloned()
+        .unwrap_or(LatestCheck::Unsupported)
+    {
+        LatestCheck::Latest(version) => ToolSpec::from_args(&requested.name, Some(&version)),
+        LatestCheck::Error(err) => Err(anyhow!(err)),
+        LatestCheck::Unsupported => bail!(
+            "latest version resolution is not supported for `{}`",
+            requested.name
+        ),
+    }
+}
+
+fn batch_kind_stage(kind: ToolBatchKind) -> &'static str {
+    match kind {
+        ToolBatchKind::Install => "install",
+        ToolBatchKind::Update => "update",
+        ToolBatchKind::Sync => "sync",
+    }
+}
+
+fn batch_kind_noun(kind: ToolBatchKind) -> &'static str {
+    match kind {
+        ToolBatchKind::Install => "tool install",
+        ToolBatchKind::Update => "tool update",
+        ToolBatchKind::Sync => "tool sync",
+    }
+}
+
+fn batch_start_message(kind: ToolBatchKind, total: usize, source_label: Option<&str>) -> String {
+    match kind {
+        ToolBatchKind::Install => format!("preparing {total} tool(s)"),
+        ToolBatchKind::Update => format!("checking {total} managed tool(s)"),
+        ToolBatchKind::Sync => match source_label {
+            Some(label) => format!("syncing {total} tool(s) from {label}"),
+            None => format!("syncing {total} tool(s)"),
+        },
+    }
+}
+
+fn render_compact_batch_result(
+    kind: ToolBatchKind,
+    result: &InstallResult,
+    dry_run: bool,
+) -> (&'static str, String) {
     match result.outcome {
-        InstallOutcome::Updated | InstallOutcome::Installed => (
-            "update",
-            match result.previous_active.as_deref() {
+        InstallOutcome::Updated | InstallOutcome::Installed => {
+            let stage = batch_kind_stage(kind);
+            let message = match result.previous_active.as_deref() {
                 Some(previous)
                     if normalize_version(previous) != normalize_version(&result.tool.version) =>
                 {
@@ -1918,16 +2009,14 @@ fn render_compact_update_result(result: &InstallResult, dry_run: bool) -> (&'sta
                 }
                 _ => {
                     if dry_run {
-                        format!(
-                            "`{}` -> {} (dry-run)",
-                            result.tool.name, result.tool.version
-                        )
+                        format!("`{}` {} (dry-run)", result.tool.name, result.tool.version)
                     } else {
-                        format!("`{}` -> {}", result.tool.name, result.tool.version)
+                        format!("`{}` {}", result.tool.name, result.tool.version)
                     }
                 }
-            },
-        ),
+            };
+            (stage, message)
+        }
         InstallOutcome::Repaired => (
             "repair",
             if dry_run {
@@ -1937,9 +2026,91 @@ fn render_compact_update_result(result: &InstallResult, dry_run: bool) -> (&'sta
             },
         ),
         InstallOutcome::Unchanged => (
-            "update",
+            batch_kind_stage(kind),
             format!("`{}` already at {}", result.tool.name, result.tool.version),
         ),
+    }
+}
+
+fn render_batch_summary(kind: ToolBatchKind, summary: ToolBatchSummary, dry_run: bool) -> String {
+    let mut parts = Vec::new();
+    match kind {
+        ToolBatchKind::Install => {
+            if summary.installed > 0 {
+                parts.push(format!(
+                    "{} {}",
+                    summary.installed,
+                    if dry_run {
+                        "would install"
+                    } else {
+                        "installed"
+                    }
+                ));
+            }
+            if summary.repaired > 0 {
+                parts.push(format!(
+                    "{} {}",
+                    summary.repaired,
+                    if dry_run { "would repair" } else { "repaired" }
+                ));
+            }
+            if summary.unchanged > 0 {
+                parts.push(format!("{} already present", summary.unchanged));
+            }
+        }
+        ToolBatchKind::Update => {
+            if summary.updated > 0 {
+                parts.push(format!(
+                    "{} {}",
+                    summary.updated,
+                    if dry_run { "would update" } else { "updated" }
+                ));
+            }
+            if summary.repaired > 0 {
+                parts.push(format!(
+                    "{} {}",
+                    summary.repaired,
+                    if dry_run { "would repair" } else { "repaired" }
+                ));
+            }
+            if summary.unchanged > 0 {
+                parts.push(format!("{} already latest", summary.unchanged));
+            }
+        }
+        ToolBatchKind::Sync => {
+            let synced = summary.installed + summary.updated;
+            if synced > 0 {
+                parts.push(format!(
+                    "{} {}",
+                    synced,
+                    if dry_run { "would sync" } else { "synced" }
+                ));
+            }
+            if summary.repaired > 0 {
+                parts.push(format!(
+                    "{} {}",
+                    summary.repaired,
+                    if dry_run { "would repair" } else { "repaired" }
+                ));
+            }
+            if summary.unchanged > 0 {
+                parts.push(format!("{} already aligned", summary.unchanged));
+            }
+        }
+    }
+
+    if summary.failed > 0 {
+        parts.push(format!("{} failed", summary.failed));
+    }
+
+    if parts.is_empty() {
+        if dry_run {
+            "dry-run complete".to_string()
+        } else {
+            "no managed tools changed".to_string()
+        }
+    } else {
+        parts.join(", ")
     }
 }
 
@@ -1958,39 +2129,6 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
     format!("{truncated}…")
 }
 
-fn render_update_summary(summary: UpdateBatchSummary, dry_run: bool) -> String {
-    let mut parts = Vec::new();
-    if summary.updated > 0 {
-        parts.push(format!(
-            "{} {}",
-            summary.updated,
-            if dry_run { "would update" } else { "updated" }
-        ));
-    }
-    if summary.repaired > 0 {
-        parts.push(format!(
-            "{} {}",
-            summary.repaired,
-            if dry_run { "would repair" } else { "repaired" }
-        ));
-    }
-    if summary.unchanged > 0 {
-        parts.push(format!("{} already latest", summary.unchanged));
-    }
-    if summary.failed > 0 {
-        parts.push(format!("{} failed", summary.failed));
-    }
-    if parts.is_empty() {
-        if dry_run {
-            "dry-run complete".to_string()
-        } else {
-            "no managed tools changed".to_string()
-        }
-    } else {
-        parts.join(", ")
-    }
-}
-
 fn normalize_requested_tool_names(names: &[String]) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -2003,32 +2141,20 @@ fn normalize_requested_tool_names(names: &[String]) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn sync_manifest(home: &ToolHome, file: &Path) -> Result<()> {
+fn sync_manifest(home: &ToolHome, file: &Path, dry_run: bool, verbose: bool) -> Result<()> {
     let specs = load_sync_specs_from_manifest(file)?;
-    println!("🔄 Syncing {} tool(s) from {}", specs.len(), file.display());
-
-    let mut failures = Vec::new();
-    for (idx, spec) in specs.iter().enumerate() {
-        ensure_not_interrupted()?;
-        println!("➡️  [{}/{}] {}", idx + 1, specs.len(), spec);
-        if let Err(err) = install(
-            home,
-            ToolSpec::parse(spec)?,
-            InstallOptions::update(za_config::ProxyScope::Tool),
-        ) {
-            failures.push(format!("{spec}: {err:#}"));
-        }
-    }
-
-    if failures.is_empty() {
-        println!("✅ Sync complete: {} tool(s) are up-to-date", specs.len());
-        return Ok(());
-    }
-
-    bail!(
-        "sync completed with {} failure(s):\n- {}",
-        failures.len(),
-        failures.join("\n- ")
+    let source_label = file.display().to_string();
+    let parsed = specs
+        .iter()
+        .map(|spec| ToolSpec::parse(spec))
+        .collect::<Result<Vec<_>>>()?;
+    run_tool_batch(
+        home,
+        ToolBatchKind::Sync,
+        parsed,
+        dry_run,
+        verbose,
+        Some(&source_label),
     )
 }
 

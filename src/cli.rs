@@ -88,6 +88,9 @@ pub enum Commands {
         /// Exit with non-zero status when any high-risk dependency is found.
         #[arg(long)]
         fail_on_high: bool,
+        /// Print low-risk entries in addition to attention items.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Inspect local TCP/UDP port bindings
     Port {
@@ -166,6 +169,9 @@ pub enum ToolCommands {
         /// Preview the resolved install plan without downloading or changing any files.
         #[arg(long)]
         dry_run: bool,
+        /// Print per-tool resolution and stage details.
+        #[arg(long)]
+        verbose: bool,
     },
     /// List managed tools and availability in this scope
     #[command(name = "ls", alias = "list")]
@@ -222,6 +228,12 @@ pub enum ToolCommands {
         /// Manifest path.
         #[arg(long, value_name = "PATH", default_value = "za.tools.toml")]
         file: PathBuf,
+        /// Preview the resolved sync plan without downloading or changing any files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print per-tool resolution and stage details.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Remove one or all installed tool versions
     #[command(alias = "rm")]
@@ -649,6 +661,7 @@ mod tests {
                         version: Some(version),
                         adopt: false,
                         dry_run: false,
+                        verbose: false,
                     } if tools == vec!["codex"] && version == "0.105.0"
                 ));
             }
@@ -670,6 +683,7 @@ mod tests {
                         version: None,
                         adopt: false,
                         dry_run: false,
+                        verbose: false,
                     } if tools == vec!["just", "cross"]
                 ));
             }
@@ -761,6 +775,7 @@ mod tests {
                         version: None,
                         adopt: true,
                         dry_run: false,
+                        verbose: false,
                     } if tools == vec!["codex"]
                 ));
             }
@@ -781,7 +796,29 @@ mod tests {
                         version: None,
                         adopt: false,
                         dry_run: true,
+                        verbose: false,
                     } if tools == vec!["ble.sh"]
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn tool_install_parses_verbose_flag() {
+        let cli = Cli::try_parse_from(["za", "tool", "install", "just", "cross", "--verbose"])
+            .expect("must parse");
+        match cli.cmd {
+            Commands::Tool { cmd, .. } => {
+                assert!(matches!(
+                    cmd,
+                    ToolCommands::Install {
+                        tools,
+                        version: None,
+                        adopt: false,
+                        dry_run: false,
+                        verbose: true,
+                    } if tools == vec!["just", "cross"]
                 ));
             }
             _ => panic!("unexpected command"),
@@ -847,6 +884,63 @@ mod tests {
                         verbose: true,
                     } if tools.is_empty()
                 ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn tool_sync_parses_flags() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "tool",
+            "sync",
+            "--file",
+            "za.tools.toml",
+            "--dry-run",
+            "--verbose",
+        ])
+        .expect("must parse");
+        match cli.cmd {
+            Commands::Tool { user, cmd } => {
+                assert!(!user);
+                assert!(matches!(
+                    cmd,
+                    ToolCommands::Sync {
+                        file,
+                        dry_run: true,
+                        verbose: true,
+                    } if file == std::path::Path::new("za.tools.toml")
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn deps_parses_verbose_flag() {
+        let cli = Cli::try_parse_from(["za", "deps", "--verbose"]).expect("must parse");
+        match cli.cmd {
+            Commands::Deps {
+                manifest_path,
+                github_token,
+                jobs,
+                include_dev,
+                include_build,
+                include_optional,
+                json,
+                fail_on_high,
+                verbose,
+            } => {
+                assert!(manifest_path.is_none());
+                assert!(github_token.is_none());
+                assert!(jobs.is_none());
+                assert!(!include_dev);
+                assert!(!include_build);
+                assert!(!include_optional);
+                assert!(json.is_none());
+                assert!(!fail_on_high);
+                assert!(verbose);
             }
             _ => panic!("unexpected command"),
         }

@@ -270,6 +270,7 @@ Current built-in tool policies:
 # install the latest release and make it active
 za tool install codex
 za tool install just starship ble.sh git-cliff cargo-release cargo-nextest cross
+za tool install just starship ble.sh --verbose
 
 # install a specific version and make it active
 za tool install codex --version 0.105.0
@@ -299,6 +300,10 @@ za tool update
 za tool update --all
 za tool update --all --verbose
 
+# sync from a manifest
+za tool sync
+za tool sync --dry-run --verbose
+
 # adopt an existing unmanaged binary already on disk
 za tool install codex --adopt
 
@@ -313,8 +318,12 @@ za tool uninstall codex
 
 `za tool install --dry-run` and `za tool update --dry-run` resolve the target version and source policy, preview activation/shell-init changes, and make no filesystem changes.
 
+Multi-tool `za tool install`, `za tool update`, and `za tool sync` default to compact batch output: they show the plan summary plus changed/repaired/failed entries only. Use `--verbose` to expand per-tool `resolve` / `source` / `install` / `activate` / `prune` stages.
+
 `za tool install` and `za tool update` are interruption-safe: pressing `Ctrl+C` aborts cleanly and temporary download directories are removed automatically (stale leftovers are cleaned on next run). Output is stage-oriented (`resolve`, `source`, `install`, `activate`, `prune`) so it is obvious where a run is spending time.
 For large GitHub release assets, `za` will use parallel HTTP range downloads when the upstream supports it, emit explicit `download` / `verify` / `extract` stages, and automatically fall back to a single stream otherwise.
+
+`za deps` defaults to a compact audit view: one verdict line, an `attention` section for high/medium/unknown findings, and a low-risk summary hint. Use `za deps --verbose` to include the low-risk baseline inventory as well.
 
 ### Existing binaries adoption
 

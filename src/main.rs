@@ -67,6 +67,7 @@ fn main() -> Result<()> {
             include_optional,
             json,
             fail_on_high,
+            verbose,
         } => command::deps::run(command::deps::DepsRunOptions {
             manifest_path,
             github_token_override: github_token,
@@ -76,6 +77,7 @@ fn main() -> Result<()> {
             include_optional,
             json_out: json,
             fail_on_high,
+            verbose,
         }),
         cli::Commands::Port { cmd } => {
             let exit_code = command::port::run(cmd)?;
