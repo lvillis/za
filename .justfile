@@ -4,7 +4,7 @@ ci:
   cargo fmt --all --check
   cargo check --all-features
   cargo clippy --all-targets --all-features -- -D warnings
-  cargo test --all-features --locked
+  cargo nextest run --all-features --locked
 
 patch:
     cargo release patch --no-publish --execute
