@@ -1,3 +1,25 @@
+## [0.1.48] - 2026-04-01
+
+### 🚀 Features
+
+- *(tool)* Add compact bulk updates with parallel checks
+- *(deps)* Add compact audit output with verbose inventory
+- *(tool)* Unify batch install, update, and sync output
+- *(cli)* Add shared semantic terminal colors
+
+### 🐛 Bug Fixes
+
+- *(tool)* Retry transient release metadata and downloads
+- *(tool)* Smooth download retry and fallback output
+
+### ⚙️ Miscellaneous Tasks
+
+- *(test)* Run nextest with the correct cargo subcommand
+## [0.1.47] - 2026-03-31
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.47
 ## [0.1.46] - 2026-03-31
 
 ### 🚀 Features
