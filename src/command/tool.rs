@@ -34,9 +34,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use self::listing::{
+    LatestCheck, UnmanagedBinary, list_installed, list_outdated, resolve_latest_checks_for_names,
+    show_catalog, show_tool,
+};
 #[cfg(test)]
-use self::listing::{LatestCheck, latest_check_progress_message, list_update_status};
-use self::listing::{UnmanagedBinary, list_installed, list_outdated, show_catalog, show_tool};
+use self::listing::{latest_check_progress_message, list_update_status};
 use self::policy::{
     GithubReleasePolicy, PackagePolicy, ToolLayout, ToolPolicy,
     canonical_tool_name as canonical_tool_name_impl, find_tool_policy, supported_tool_names_csv,
@@ -113,16 +116,24 @@ fn print_tool_stage(stage: &str, message: impl AsRef<str>) {
     }
 }
 
+fn print_tool_stage_if(enabled: bool, stage: &str, message: impl AsRef<str>) {
+    if enabled {
+        print_tool_stage(stage, message);
+    }
+}
+
 fn tool_stage_icon(stage: &str) -> &'static str {
     match stage {
         "resolve" => "🔎",
         "update" => "⬆️",
+        "repair" => "🔧",
         "source" => "📦",
         "install" => "📥",
         "activate" => "✅",
         "prune" => "🧹",
         "next" => "ℹ️",
         "done" => "✅",
+        "fail" => "❌",
         _ => "•",
     }
 }
@@ -331,30 +342,25 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
             }
         }
         ToolCommands::Update {
+            all,
             tools,
             version,
             dry_run,
+            verbose,
         } => {
             if dry_run {
-                install_tools(
-                    &home,
-                    &tools,
-                    version.as_deref(),
-                    false,
-                    ToolAction::Update,
-                    true,
-                )?;
+                update_tools(&home, all, &tools, version.as_deref(), true, verbose)?;
                 Ok(0)
             } else {
                 let home_for_action = home.clone();
                 run_mutating_tool_command(&home, scope, move || {
-                    install_tools(
+                    update_tools(
                         &home_for_action,
+                        all,
                         &tools,
                         version.as_deref(),
                         false,
-                        ToolAction::Update,
-                        false,
+                        verbose,
                     )
                 })
             }
@@ -441,7 +447,7 @@ pub fn update_self(user: bool, check: bool, version: Option<String>) -> Result<i
         ToolSpec::parse(&target_spec)?,
         InstallOptions::update(za_config::ProxyScope::Update).with_prune(false),
     )?;
-    if let Err(err) = verify_self_update(&home, &installed) {
+    if let Err(err) = verify_self_update(&home, &installed.tool) {
         let rollback_res =
             rollback_self_update(&home, previous_active.as_deref(), backup.as_deref());
         if let Some(path) = backup.as_ref() {
@@ -458,7 +464,7 @@ pub fn update_self(user: bool, check: bool, version: Option<String>) -> Result<i
     if let Some(path) = backup.as_ref() {
         let _ = fs::remove_file(path);
     }
-    let removed = prune_non_active_versions(&home, &installed)?;
+    let removed = prune_non_active_versions(&home, &installed.tool)?;
     if !removed.is_empty() {
         print_tool_stage(
             "prune",
@@ -467,7 +473,7 @@ pub fn update_self(user: bool, check: bool, version: Option<String>) -> Result<i
     }
     print_tool_stage(
         "done",
-        format!("self-update complete: {}", installed.image()),
+        format!("self-update complete: {}", installed.tool.image()),
     );
     Ok(0)
 }
@@ -624,6 +630,7 @@ struct InstallOptions {
     prune_after_activation: bool,
     proxy_scope: za_config::ProxyScope,
     dry_run: bool,
+    emit_stages: bool,
 }
 
 impl InstallOptions {
@@ -634,6 +641,7 @@ impl InstallOptions {
             prune_after_activation: true,
             proxy_scope,
             dry_run: false,
+            emit_stages: true,
         }
     }
 
@@ -644,6 +652,7 @@ impl InstallOptions {
             prune_after_activation: true,
             proxy_scope,
             dry_run: false,
+            emit_stages: true,
         }
     }
 
@@ -654,6 +663,7 @@ impl InstallOptions {
             prune_after_activation: false,
             proxy_scope,
             dry_run: false,
+            emit_stages: true,
         }
     }
 
@@ -666,6 +676,26 @@ impl InstallOptions {
         self.dry_run = dry_run;
         self
     }
+
+    fn emit_stages(mut self, emit_stages: bool) -> Self {
+        self.emit_stages = emit_stages;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallOutcome {
+    Installed,
+    Updated,
+    Repaired,
+    Unchanged,
+}
+
+#[derive(Debug, Clone)]
+struct InstallResult {
+    tool: ToolRef,
+    outcome: InstallOutcome,
+    previous_active: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1060,7 +1090,11 @@ fn select_extracted_payload_root(unpack_dir: &Path) -> Result<PathBuf> {
     }
 }
 
-fn install(home: &ToolHome, mut requested: ToolSpec, options: InstallOptions) -> Result<ToolRef> {
+fn install(
+    home: &ToolHome,
+    mut requested: ToolSpec,
+    options: InstallOptions,
+) -> Result<InstallResult> {
     ensure_not_interrupted()?;
 
     requested.name = canonical_tool_name(&requested.name);
@@ -1078,7 +1112,8 @@ fn install(home: &ToolHome, mut requested: ToolSpec, options: InstallOptions) ->
     } else if let Some(adopted) = adoption.as_ref() {
         adopted.version.clone()
     } else {
-        print_tool_stage(
+        print_tool_stage_if(
+            options.emit_stages,
             "resolve",
             format!("latest version for `{}`", requested.name),
         );
@@ -1097,29 +1132,82 @@ fn install(home: &ToolHome, mut requested: ToolSpec, options: InstallOptions) ->
     let previous_active = read_current_version(home, &tool.name)?;
     let dst = home.install_path(&tool);
     let already_installed = dst.exists();
+    let manifest_exists = home.manifest_path(&tool).exists();
+    let active_exists = home.active_path(&tool.name).exists();
+    let current_matches_target = previous_active
+        .as_deref()
+        .is_some_and(|current| normalize_version(current) == normalize_version(&tool.version));
+    let update_target_is_healthy =
+        current_matches_target && already_installed && manifest_exists && active_exists;
+    let planned_outcome = match options.action {
+        ToolAction::Install => InstallOutcome::Installed,
+        ToolAction::Update => {
+            if update_target_is_healthy {
+                InstallOutcome::Unchanged
+            } else if previous_active.as_deref().is_some_and(|current| {
+                normalize_version(current) != normalize_version(&tool.version)
+            }) {
+                InstallOutcome::Updated
+            } else {
+                InstallOutcome::Repaired
+            }
+        }
+    };
 
     if options.action == ToolAction::Update {
-        match previous_active.as_deref() {
-            Some(current)
-                if normalize_version(current) == normalize_version(&tool.version)
-                    && already_installed =>
-            {
-                print_tool_stage(
+        match planned_outcome {
+            InstallOutcome::Unchanged => {
+                print_tool_stage_if(
+                    options.emit_stages,
                     "update",
-                    format!("`{}` already at {}", tool.name, tool.version),
+                    format!("`{}` already at {} (no changes)", tool.name, tool.version),
+                );
+                if options.dry_run && options.emit_stages {
+                    print_tool_stage("next", "no changes needed");
+                }
+                return Ok(InstallResult {
+                    tool,
+                    outcome: InstallOutcome::Unchanged,
+                    previous_active,
+                });
+            }
+            InstallOutcome::Repaired if current_matches_target => {
+                print_tool_stage_if(
+                    options.emit_stages,
+                    "repair",
+                    format!("`{}` {}", tool.name, tool.version),
                 );
             }
-            Some(current) => print_tool_stage(
-                "update",
-                format!("`{}` {} -> {}", tool.name, current, tool.version),
-            ),
-            None => print_tool_stage("update", format!("`{}` -> {}", tool.name, tool.version)),
+            InstallOutcome::Repaired => {
+                print_tool_stage_if(
+                    options.emit_stages,
+                    "repair",
+                    format!("`{}` -> {}", tool.name, tool.version),
+                );
+            }
+            InstallOutcome::Updated => match previous_active.as_deref() {
+                Some(current) => print_tool_stage_if(
+                    options.emit_stages,
+                    "update",
+                    format!("`{}` {} -> {}", tool.name, current, tool.version),
+                ),
+                None => print_tool_stage_if(
+                    options.emit_stages,
+                    "update",
+                    format!("`{}` -> {}", tool.name, tool.version),
+                ),
+            },
+            InstallOutcome::Installed => {}
         }
     }
 
     if options.dry_run {
         preview_install(home, &tool, adoption.as_ref(), already_installed, options)?;
-        return Ok(tool);
+        return Ok(InstallResult {
+            tool,
+            outcome: planned_outcome,
+            previous_active,
+        });
     }
 
     if !already_installed {
@@ -1128,7 +1216,8 @@ fn install(home: &ToolHome, mut requested: ToolSpec, options: InstallOptions) ->
         }
 
         let source = if let Some(adopted) = adoption.filter(|a| a.version == tool.version) {
-            print_tool_stage(
+            print_tool_stage_if(
+                options.emit_stages,
                 "source",
                 format!("adopting existing binary {}", adopted.path.display()),
             );
@@ -1139,7 +1228,8 @@ fn install(home: &ToolHome, mut requested: ToolSpec, options: InstallOptions) ->
             }
         } else {
             ensure_not_interrupted()?;
-            print_tool_stage(
+            print_tool_stage_if(
+                options.emit_stages,
                 "source",
                 format!("fetching `{}` {}", tool.name, tool.version),
             );
@@ -1160,17 +1250,23 @@ fn install(home: &ToolHome, mut requested: ToolSpec, options: InstallOptions) ->
             }
         };
         write_manifest(home, &tool, &source)?;
-        print_tool_stage(
+        print_tool_stage_if(
+            options.emit_stages,
             "install",
             format!("{} from {}", tool.image(), source.detail),
         );
     } else {
         ensure_manifest(home, &tool)?;
-        print_tool_stage("install", format!("already installed {}", tool.image()));
+        print_tool_stage_if(
+            options.emit_stages,
+            "install",
+            format!("already installed {}", tool.image()),
+        );
     }
 
     activate_tool(home, &tool)?;
-    print_tool_stage(
+    print_tool_stage_if(
+        options.emit_stages,
         "activate",
         format!(
             "{} (path: {})",
@@ -1178,11 +1274,12 @@ fn install(home: &ToolHome, mut requested: ToolSpec, options: InstallOptions) ->
             home.active_path(&tool.name).display()
         ),
     );
-    ensure_post_activation_integrations(home, &tool)?;
+    ensure_post_activation_integrations(home, &tool, options.emit_stages)?;
     if options.prune_after_activation {
         let removed = prune_non_active_versions(home, &tool)?;
         if !removed.is_empty() {
-            print_tool_stage(
+            print_tool_stage_if(
+                options.emit_stages,
                 "prune",
                 format!(
                     "removed old `{}` versions: {}",
@@ -1193,7 +1290,11 @@ fn install(home: &ToolHome, mut requested: ToolSpec, options: InstallOptions) ->
         }
     }
 
-    Ok(tool)
+    Ok(InstallResult {
+        tool,
+        outcome: planned_outcome,
+        previous_active,
+    })
 }
 
 fn preview_install(
@@ -1205,7 +1306,8 @@ fn preview_install(
 ) -> Result<()> {
     if !already_installed {
         if let Some(adopted) = adoption.filter(|a| a.version == tool.version) {
-            print_tool_stage(
+            print_tool_stage_if(
+                options.emit_stages,
                 "source",
                 format!("would adopt existing binary {}", adopted.path.display()),
             );
@@ -1219,7 +1321,8 @@ fn preview_install(
                     });
                 }
             };
-            print_tool_stage(
+            print_tool_stage_if(
+                options.emit_stages,
                 "source",
                 format!(
                     "would fetch `{}` {} from {}",
@@ -1227,12 +1330,21 @@ fn preview_install(
                 ),
             );
         }
-        print_tool_stage("install", format!("would install {}", tool.image()));
+        print_tool_stage_if(
+            options.emit_stages,
+            "install",
+            format!("would install {}", tool.image()),
+        );
     } else {
-        print_tool_stage("install", format!("already installed {}", tool.image()));
+        print_tool_stage_if(
+            options.emit_stages,
+            "install",
+            format!("already installed {}", tool.image()),
+        );
     }
 
-    print_tool_stage(
+    print_tool_stage_if(
+        options.emit_stages,
         "activate",
         format!(
             "would activate {} (path: {})",
@@ -1240,11 +1352,12 @@ fn preview_install(
             home.active_path(&tool.name).display()
         ),
     );
-    preview_post_activation_integrations(home, tool)?;
+    preview_post_activation_integrations(home, tool, options.emit_stages)?;
     if options.prune_after_activation {
         let removed = stale_versions_to_prune(home, tool)?;
         if !removed.is_empty() {
-            print_tool_stage(
+            print_tool_stage_if(
+                options.emit_stages,
                 "prune",
                 format!(
                     "would remove old `{}` versions: {}",
@@ -1254,27 +1367,39 @@ fn preview_install(
             );
         }
     }
-    print_tool_stage("next", "dry-run only; no changes were made");
+    print_tool_stage_if(
+        options.emit_stages,
+        "next",
+        "dry-run only; no changes were made",
+    );
     Ok(())
 }
 
-fn ensure_post_activation_integrations(home: &ToolHome, tool: &ToolRef) -> Result<()> {
+fn ensure_post_activation_integrations(
+    home: &ToolHome,
+    tool: &ToolRef,
+    emit_stages: bool,
+) -> Result<()> {
     match tool.name.as_str() {
-        "starship" => ensure_starship_bash_init(),
-        "ble.sh" => ensure_blesh_bash_init(home, tool),
+        "starship" => ensure_starship_bash_init(emit_stages),
+        "ble.sh" => ensure_blesh_bash_init(home, tool, emit_stages),
         _ => Ok(()),
     }
 }
 
-fn preview_post_activation_integrations(home: &ToolHome, tool: &ToolRef) -> Result<()> {
+fn preview_post_activation_integrations(
+    home: &ToolHome,
+    tool: &ToolRef,
+    emit_stages: bool,
+) -> Result<()> {
     match tool.name.as_str() {
-        "starship" => preview_starship_bash_init(),
-        "ble.sh" => preview_blesh_bash_init(home, tool),
+        "starship" => preview_starship_bash_init(emit_stages),
+        "ble.sh" => preview_blesh_bash_init(home, tool, emit_stages),
         _ => Ok(()),
     }
 }
 
-fn ensure_starship_bash_init() -> Result<()> {
+fn ensure_starship_bash_init(emit_stages: bool) -> Result<()> {
     let rc_path = resolve_home_dir()?.join(".bashrc");
     let change = upsert_managed_block(
         &rc_path,
@@ -1284,7 +1409,8 @@ fn ensure_starship_bash_init() -> Result<()> {
         starship_bash_init_block(),
     )
     .with_context(|| format!("configure starship bash init in `{}`", rc_path.display()))?;
-    print_tool_stage(
+    print_tool_stage_if(
+        emit_stages,
         "next",
         format!(
             "starship bash init {} in {}; open a new JetBrains bash shell or `source {}`",
@@ -1296,7 +1422,7 @@ fn ensure_starship_bash_init() -> Result<()> {
     Ok(())
 }
 
-fn preview_starship_bash_init() -> Result<()> {
+fn preview_starship_bash_init(emit_stages: bool) -> Result<()> {
     let rc_path = resolve_home_dir()?.join(".bashrc");
     let change = preview_managed_block(
         &rc_path,
@@ -1305,7 +1431,8 @@ fn preview_starship_bash_init() -> Result<()> {
         ManagedBlockPosition::Bottom,
         starship_bash_init_block(),
     )?;
-    print_tool_stage(
+    print_tool_stage_if(
+        emit_stages,
         "next",
         format!(
             "starship bash init would be {} in {}",
@@ -1322,7 +1449,7 @@ fn resolve_home_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("cannot resolve home directory: set `HOME`"))
 }
 
-fn ensure_blesh_bash_init(home: &ToolHome, tool: &ToolRef) -> Result<()> {
+fn ensure_blesh_bash_init(home: &ToolHome, tool: &ToolRef, emit_stages: bool) -> Result<()> {
     let rc_path = resolve_home_dir()?.join(".bashrc");
     let active_path = home.active_path(&tool.name);
     let top_change = upsert_managed_block(
@@ -1346,7 +1473,8 @@ fn ensure_blesh_bash_init(home: &ToolHome, tool: &ToolRef) -> Result<()> {
             rc_path.display()
         )
     })?;
-    print_tool_stage(
+    print_tool_stage_if(
+        emit_stages,
         "next",
         format!(
             "ble.sh bash init top={} bottom={} in {}; open a new JetBrains bash shell or `source {}`",
@@ -1359,7 +1487,7 @@ fn ensure_blesh_bash_init(home: &ToolHome, tool: &ToolRef) -> Result<()> {
     Ok(())
 }
 
-fn preview_blesh_bash_init(home: &ToolHome, tool: &ToolRef) -> Result<()> {
+fn preview_blesh_bash_init(home: &ToolHome, tool: &ToolRef, emit_stages: bool) -> Result<()> {
     let rc_path = resolve_home_dir()?.join(".bashrc");
     let active_path = home.active_path(&tool.name);
     let top_change = preview_managed_block(
@@ -1376,7 +1504,8 @@ fn preview_blesh_bash_init(home: &ToolHome, tool: &ToolRef) -> Result<()> {
         ManagedBlockPosition::Bottom,
         blesh_bash_init_bottom_block(),
     )?;
-    print_tool_stage(
+    print_tool_stage_if(
+        emit_stages,
         "next",
         format!(
             "ble.sh bash init would set top={} bottom={} in {}",
@@ -1604,6 +1733,262 @@ fn install_tools(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct UpdateBatchSummary {
+    updated: usize,
+    repaired: usize,
+    unchanged: usize,
+    failed: usize,
+}
+
+impl UpdateBatchSummary {
+    fn record(self, outcome: InstallOutcome) -> Self {
+        let mut updated = self;
+        match outcome {
+            InstallOutcome::Updated => updated.updated += 1,
+            InstallOutcome::Repaired => updated.repaired += 1,
+            InstallOutcome::Unchanged => updated.unchanged += 1,
+            InstallOutcome::Installed => updated.updated += 1,
+        }
+        updated
+    }
+}
+
+fn update_tools(
+    home: &ToolHome,
+    all: bool,
+    tools: &[String],
+    version: Option<&str>,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<()> {
+    if all && !tools.is_empty() {
+        bail!("`za tool update --all` does not accept tool names");
+    }
+    if all && version.is_some() {
+        bail!("`za tool update --all` does not accept `--version`");
+    }
+    if version.is_some() && tools.len() != 1 {
+        bail!("`za tool update --version` requires exactly one tool name");
+    }
+
+    let requested_names = if all || tools.is_empty() {
+        collect_managed_tool_names(home)?
+    } else {
+        normalize_requested_tool_names(tools)?
+    };
+
+    if requested_names.is_empty() {
+        println!(
+            "No managed tools installed in {} scope.",
+            home.scope.label()
+        );
+        return Ok(());
+    }
+
+    let total = requested_names.len();
+    let batch_mode = total > 1 || all || tools.is_empty();
+    let compact_mode = batch_mode && !verbose;
+    let mut summary = UpdateBatchSummary::default();
+    let mut failed_tools = Vec::new();
+
+    if compact_mode {
+        print_tool_stage("update", format!("checking {total} managed tool(s)"));
+    }
+
+    let latest_lookup = if version.is_none() {
+        Some(resolve_latest_checks_for_names(&requested_names)?)
+    } else {
+        None
+    };
+
+    for (idx, name) in requested_names.iter().enumerate() {
+        ensure_not_interrupted()?;
+        if batch_mode && !compact_mode {
+            println!("➡️  [{}/{}] {}", idx + 1, total, name);
+        }
+
+        let resolved_version = if let Some(version) = version {
+            Some(version.to_string())
+        } else {
+            match latest_lookup
+                .as_ref()
+                .and_then(|lookup| lookup.latest_by_name.get(name))
+                .cloned()
+                .unwrap_or(LatestCheck::Unsupported)
+            {
+                LatestCheck::Latest(version) => Some(version),
+                LatestCheck::Error(err) => {
+                    summary.failed += 1;
+                    failed_tools.push(name.clone());
+                    let message = if compact_mode {
+                        summarize_tool_update_error(&err)
+                    } else {
+                        err.clone()
+                    };
+                    print_tool_stage("fail", format!("`{name}` {message}"));
+                    if total == 1 {
+                        bail!("{err}");
+                    }
+                    continue;
+                }
+                LatestCheck::Unsupported => {
+                    summary.failed += 1;
+                    failed_tools.push(name.clone());
+                    print_tool_stage(
+                        "fail",
+                        format!("`{name}` latest version resolution is not supported"),
+                    );
+                    if total == 1 {
+                        bail!("latest version resolution is not supported for `{name}`");
+                    }
+                    continue;
+                }
+            }
+        };
+
+        match install(
+            home,
+            ToolSpec::from_args(name, resolved_version.as_deref())?,
+            InstallOptions::update(za_config::ProxyScope::Tool)
+                .dry_run(dry_run)
+                .emit_stages(!compact_mode),
+        ) {
+            Ok(result) => {
+                summary = summary.record(result.outcome);
+                if compact_mode && result.outcome != InstallOutcome::Unchanged {
+                    let (stage, message) = render_compact_update_result(&result, dry_run);
+                    print_tool_stage(stage, message);
+                }
+            }
+            Err(err) => {
+                summary.failed += 1;
+                failed_tools.push(name.clone());
+                if compact_mode {
+                    print_tool_stage(
+                        "fail",
+                        format!("`{name}` {}", summarize_tool_update_error(&err.to_string())),
+                    );
+                } else {
+                    print_tool_stage("fail", format!("`{name}` {}", err));
+                }
+                if total == 1 {
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    if batch_mode {
+        print_tool_stage("done", render_update_summary(summary, dry_run));
+    }
+
+    if failed_tools.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "tool update finished with {} failure(s): {}",
+        failed_tools.len(),
+        failed_tools.join(", ")
+    )
+}
+
+fn render_compact_update_result(result: &InstallResult, dry_run: bool) -> (&'static str, String) {
+    match result.outcome {
+        InstallOutcome::Updated | InstallOutcome::Installed => (
+            "update",
+            match result.previous_active.as_deref() {
+                Some(previous)
+                    if normalize_version(previous) != normalize_version(&result.tool.version) =>
+                {
+                    if dry_run {
+                        format!(
+                            "`{}` {} -> {} (dry-run)",
+                            result.tool.name, previous, result.tool.version
+                        )
+                    } else {
+                        format!(
+                            "`{}` {} -> {}",
+                            result.tool.name, previous, result.tool.version
+                        )
+                    }
+                }
+                _ => {
+                    if dry_run {
+                        format!(
+                            "`{}` -> {} (dry-run)",
+                            result.tool.name, result.tool.version
+                        )
+                    } else {
+                        format!("`{}` -> {}", result.tool.name, result.tool.version)
+                    }
+                }
+            },
+        ),
+        InstallOutcome::Repaired => (
+            "repair",
+            if dry_run {
+                format!("`{}` {} (dry-run)", result.tool.name, result.tool.version)
+            } else {
+                format!("`{}` {}", result.tool.name, result.tool.version)
+            },
+        ),
+        InstallOutcome::Unchanged => (
+            "update",
+            format!("`{}` already at {}", result.tool.name, result.tool.version),
+        ),
+    }
+}
+
+fn summarize_tool_update_error(err: &str) -> String {
+    truncate_text(err, 160)
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let truncated = text
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    format!("{truncated}…")
+}
+
+fn render_update_summary(summary: UpdateBatchSummary, dry_run: bool) -> String {
+    let mut parts = Vec::new();
+    if summary.updated > 0 {
+        parts.push(format!(
+            "{} {}",
+            summary.updated,
+            if dry_run { "would update" } else { "updated" }
+        ));
+    }
+    if summary.repaired > 0 {
+        parts.push(format!(
+            "{} {}",
+            summary.repaired,
+            if dry_run { "would repair" } else { "repaired" }
+        ));
+    }
+    if summary.unchanged > 0 {
+        parts.push(format!("{} already latest", summary.unchanged));
+    }
+    if summary.failed > 0 {
+        parts.push(format!("{} failed", summary.failed));
+    }
+    if parts.is_empty() {
+        if dry_run {
+            "dry-run complete".to_string()
+        } else {
+            "no managed tools changed".to_string()
+        }
+    } else {
+        parts.join(", ")
+    }
 }
 
 fn normalize_requested_tool_names(names: &[String]) -> Result<Vec<String>> {
@@ -1916,7 +2301,7 @@ fn adopt_tool(home: &ToolHome, tool: &str, dry_run: bool) -> Result<()> {
         InstallOptions::adopt(za_config::ProxyScope::Tool).dry_run(dry_run),
     )?;
     if !dry_run {
-        println!("✅ Adopted {}", installed.image());
+        println!("✅ Adopted {}", installed.tool.image());
     }
     Ok(())
 }

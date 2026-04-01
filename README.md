@@ -296,6 +296,8 @@ za tool ls --outdated --fail-on-check-errors
 # update one tool or refresh everything managed in this scope
 za tool update codex
 za tool update
+za tool update --all
+za tool update --all --verbose
 
 # adopt an existing unmanaged binary already on disk
 za tool install codex --adopt

@@ -190,6 +190,9 @@ pub enum ToolCommands {
     },
     /// Update tools to the newest available version
     Update {
+        /// Update all managed tools in this scope.
+        #[arg(long)]
+        all: bool,
         /// Tool names. Omit to update all managed tools in this scope.
         tools: Vec<String>,
         /// Pin the update target to a specific version. Requires exactly one tool.
@@ -198,6 +201,9 @@ pub enum ToolCommands {
         /// Preview the resolved update plan without downloading or changing any files.
         #[arg(long)]
         dry_run: bool,
+        /// Print per-tool resolution and stage details.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Show detailed managed state for one tool
     #[command(alias = "inspect")]
@@ -681,9 +687,11 @@ mod tests {
                 assert!(matches!(
                     cmd,
                     ToolCommands::Update {
+                        all: false,
                         tools,
                         version: None,
                         dry_run: false,
+                        verbose: false,
                     } if tools == vec!["codex", "rg"]
                 ));
             }
@@ -789,10 +797,55 @@ mod tests {
                 assert!(matches!(
                     cmd,
                     ToolCommands::Update {
+                        all: false,
                         tools,
                         version: None,
                         dry_run: true,
+                        verbose: false,
                     } if tools == vec!["codex"]
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn tool_update_parses_all_flag() {
+        let cli = Cli::try_parse_from(["za", "tool", "update", "--all"]).expect("must parse");
+        match cli.cmd {
+            Commands::Tool { user, cmd } => {
+                assert!(!user);
+                assert!(matches!(
+                    cmd,
+                    ToolCommands::Update {
+                        all: true,
+                        tools,
+                        version: None,
+                        dry_run: false,
+                        verbose: false,
+                    } if tools.is_empty()
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn tool_update_parses_verbose_flag() {
+        let cli = Cli::try_parse_from(["za", "tool", "update", "--all", "--verbose"])
+            .expect("must parse");
+        match cli.cmd {
+            Commands::Tool { user, cmd } => {
+                assert!(!user);
+                assert!(matches!(
+                    cmd,
+                    ToolCommands::Update {
+                        all: true,
+                        tools,
+                        version: None,
+                        dry_run: false,
+                        verbose: true,
+                    } if tools.is_empty()
                 ));
             }
             _ => panic!("unexpected command"),

@@ -1,11 +1,13 @@
 use super::policy::GithubReleaseVerification;
 use super::{
-    LatestCheck, ManagedBlockPosition, ManagedFileChange, STARSHIP_BASH_INIT_END_MARKER,
-    STARSHIP_BASH_INIT_START_MARKER, ToolHome, ToolRef, ToolScope, ToolSpec, canonical_tool_name,
-    cleanup_legacy_current_dir_artifacts, collect_managed_tool_names, command_candidates,
-    extract_version_from_text, find_tool_policy, latest_check_progress_message, list_update_status,
-    load_sync_specs_from_manifest, normalize_version, prune_non_active_versions, source,
-    starship_bash_init_block, supported_tool_names_csv, upsert_managed_block,
+    InstallOutcome, InstallResult, LatestCheck, ManagedBlockPosition, ManagedFileChange,
+    STARSHIP_BASH_INIT_END_MARKER, STARSHIP_BASH_INIT_START_MARKER, ToolHome, ToolRef, ToolScope,
+    ToolSpec, UpdateBatchSummary, canonical_tool_name, cleanup_legacy_current_dir_artifacts,
+    collect_managed_tool_names, command_candidates, extract_version_from_text, find_tool_policy,
+    latest_check_progress_message, list_update_status, load_sync_specs_from_manifest,
+    normalize_version, prune_non_active_versions, render_compact_update_result,
+    render_update_summary, source, starship_bash_init_block, supported_tool_names_csv,
+    upsert_managed_block,
 };
 use std::{fs, time::Duration};
 
@@ -230,6 +232,66 @@ fn latest_check_progress_message_summarizes_result() {
     assert_eq!(
         latest_check_progress_message(policy, &LatestCheck::Error("boom".to_string())),
         "codex failed"
+    );
+}
+
+#[test]
+fn render_update_summary_mentions_updates_repairs_and_failures() {
+    let summary = UpdateBatchSummary {
+        updated: 2,
+        repaired: 1,
+        unchanged: 3,
+        failed: 1,
+    };
+    assert_eq!(
+        render_update_summary(summary, false),
+        "2 updated, 1 repaired, 3 already latest, 1 failed"
+    );
+}
+
+#[test]
+fn render_update_summary_uses_dry_run_wording() {
+    let summary = UpdateBatchSummary {
+        updated: 2,
+        repaired: 1,
+        unchanged: 3,
+        failed: 0,
+    };
+    assert_eq!(
+        render_update_summary(summary, true),
+        "2 would update, 1 would repair, 3 already latest"
+    );
+}
+
+#[test]
+fn render_compact_update_result_shows_updated_versions() {
+    let result = InstallResult {
+        tool: ToolRef {
+            name: "codex".to_string(),
+            version: "0.118.0".to_string(),
+        },
+        outcome: InstallOutcome::Updated,
+        previous_active: Some("0.117.0".to_string()),
+    };
+    assert_eq!(
+        render_compact_update_result(&result, false),
+        ("update", "`codex` 0.117.0 -> 0.118.0".to_string())
+    );
+}
+
+#[test]
+fn render_compact_update_result_shows_repair_concisely() {
+    let result = InstallResult {
+        tool: ToolRef {
+            name: "ble.sh".to_string(),
+            version: "nightly-20260310+b99cadb".to_string(),
+        },
+        outcome: InstallOutcome::Repaired,
+        previous_active: Some("nightly-20260310+b99cadb".to_string()),
+    };
+    assert_eq!(
+        render_compact_update_result(&result, false),
+        ("repair", "`ble.sh` nightly-20260310+b99cadb".to_string())
     );
 }
 

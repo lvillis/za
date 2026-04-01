@@ -275,8 +275,8 @@ impl ToolUpdateCacheState {
 }
 
 #[derive(Debug)]
-struct LatestLookup {
-    latest_by_name: HashMap<String, LatestCheck>,
+pub(super) struct LatestLookup {
+    pub(super) latest_by_name: HashMap<String, LatestCheck>,
 }
 
 pub(super) fn list_installed(home: &ToolHome, json: bool) -> Result<i32> {
@@ -909,7 +909,7 @@ fn print_unmanaged_binaries_text(unmanaged: &[UnmanagedBinary]) {
     }
 }
 
-fn resolve_latest_checks_for_names(names: &[String]) -> Result<LatestLookup> {
+pub(super) fn resolve_latest_checks_for_names(names: &[String]) -> Result<LatestLookup> {
     let mut latest_by_name: HashMap<String, LatestCheck> = HashMap::new();
     let mut policy_tasks = Vec::new();
     let mut policy_seen: HashMap<&'static str, ()> = HashMap::new();
