@@ -1,3 +1,8 @@
+## [0.1.49] - 2026-04-03
+
+### 🚜 Refactor
+
+- *(completion)* Align completion integration with shellcomp 0.1.11
 ## [0.1.48] - 2026-04-01
 
 ### 🚀 Features
@@ -15,6 +20,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(test)* Run nextest with the correct cargo subcommand
+- Release za version 0.1.48
 ## [0.1.47] - 2026-03-31
 
 ### ⚙️ Miscellaneous Tasks
