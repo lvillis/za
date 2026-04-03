@@ -1577,6 +1577,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "shellcomp"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cec226533eb5e23262c3497ab275c9318a3f33b6b10c3edd6e62c5fcaf09cc3f"
+dependencies = [
+ "clap",
+ "clap_complete",
+]
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2382,7 +2392,6 @@ version = "0.1.48"
 dependencies = [
  "anyhow",
  "clap",
- "clap_complete",
  "crossterm",
  "flate2",
  "fs4",
@@ -2396,6 +2405,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "shellcomp",
  "signal-hook 0.4.3",
  "tar",
  "toml",

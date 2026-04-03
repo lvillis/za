@@ -213,11 +213,13 @@ Or let `za` install into common user-level locations:
 za completion install bash
 za completion install zsh
 za completion install fish
+za completion install elvish
+za completion install powershell
 ```
 
-`za completion install` now prints the activation mode, change status, and availability. Bash prefers the system `bash-completion` loader when a loader is detected and falls back to a managed `~/.bashrc` block otherwise; zsh uses a managed `~/.zshrc` block so `fpath` and `compinit` are wired consistently.
+`za completion install` now uses `shellcomp` for install and activation management, while preserving `za`'s legacy marker migration for existing users. Bash prefers the system `bash-completion` loader when a loader is detected and falls back to a managed `~/.bashrc` block otherwise; zsh uses a managed `~/.zshrc` block so `fpath` and `compinit` are wired consistently; PowerShell and Elvish now also have managed profile wiring by default.
 
-Use `--path` when you want a non-default target, or for shells without a built-in install target:
+Use `--path` when you want a non-default target:
 
 ```bash
 za completion install powershell --path ~/.config/powershell/completions/za.ps1

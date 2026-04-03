@@ -22,7 +22,7 @@ include = [
 # Error handling and CLI surface.
 anyhow = { version = "1.0.102", default-features = false, features = ["std"] }
 clap = { version = "4.6.0", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions", "color"] }
-clap_complete = { version = "4.6.0", default-features = false }
+shellcomp = { version = "0.1.11", default-features = false, features = ["clap"] }
 indicatif = { version = "0.18.4", default-features = false, features = ["unicode-width"] }
 humantime = { version = "2.3.0", default-features = false }
 crossterm = { version = "0.29.0", default-features = false, features = ["events"] }
