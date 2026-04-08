@@ -1,8 +1,17 @@
+## [0.1.50] - 2026-04-08
+
+### 🚀 Features
+
+- *(tool)* Add bpftop release policy
 ## [0.1.49] - 2026-04-03
 
 ### 🚜 Refactor
 
 - *(completion)* Align completion integration with shellcomp 0.1.11
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.49
 ## [0.1.48] - 2026-04-01
 
 ### 🚀 Features
