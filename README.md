@@ -257,6 +257,7 @@ Current built-in tool policies:
 | `fd` | `fdfind` | GitHub Release (SHA-256 verify) |
 | `tcping` | `tcping-rs` | GitHub Release (SHA-256 verify) |
 | `dust` | - | GitHub Release (SHA-256 verify) |
+| `bpftop` | - | GitHub Release (SHA-256 verify) |
 | `just` | - | GitHub Release (SHA-256 verify) |
 | `oha` | - | GitHub Release (SHA-256 verify) |
 | `starship` | - | GitHub Release (SHA-256 verify) |
@@ -271,7 +272,7 @@ Current built-in tool policies:
 ```bash
 # install the latest release and make it active
 za tool install codex
-za tool install just starship ble.sh git-cliff cargo-release cargo-nextest cross
+za tool install just bpftop starship ble.sh git-cliff cargo-release cargo-nextest cross
 za tool install just starship ble.sh --verbose
 
 # install a specific version and make it active

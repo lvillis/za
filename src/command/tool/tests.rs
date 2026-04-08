@@ -364,6 +364,14 @@ fn tool_policy_matches_alias_and_canonical() {
         motdyn.github_release.expect("github policy").verification,
         GithubReleaseVerification::RequiredSha256Digest
     );
+    let bpftop = find_tool_policy("bpftop").expect("canonical policy");
+    assert_eq!(bpftop.canonical_name, "bpftop");
+    assert_eq!(bpftop.cargo_fallback_package, None);
+    assert_eq!(bpftop.source_label, "GitHub Release (SHA-256 verified)");
+    assert_eq!(
+        bpftop.github_release.expect("github policy").verification,
+        GithubReleaseVerification::RequiredSha256Digest
+    );
     let dust = find_tool_policy("dust").expect("canonical policy");
     assert_eq!(dust.canonical_name, "dust");
     let oha = find_tool_policy("oha").expect("canonical policy");
@@ -443,6 +451,7 @@ fn canonical_tool_name_resolves_aliases() {
     assert_eq!(canonical_tool_name("fdfind"), "fd");
     assert_eq!(canonical_tool_name("tcping-rs"), "tcping");
     assert_eq!(canonical_tool_name("motdyn"), "motdyn");
+    assert_eq!(canonical_tool_name("bpftop"), "bpftop");
     assert_eq!(canonical_tool_name("docker-compose"), "docker-compose");
     assert_eq!(canonical_tool_name("oha"), "oha");
     assert_eq!(canonical_tool_name("starship"), "starship");
@@ -467,6 +476,7 @@ fn supported_tool_names_csv_contains_all_aliases() {
     assert!(csv.contains("tcping"));
     assert!(csv.contains("tcping-rs"));
     assert!(csv.contains("motdyn"));
+    assert!(csv.contains("bpftop"));
     assert!(csv.contains("dust"));
     assert!(csv.contains("just"));
     assert!(csv.contains("oha"));
@@ -624,6 +634,22 @@ fn motdyn_policy_expected_asset_name_matches_supported_tarball() {
         other => panic!("unsupported local test platform: {other:?}"),
     };
     assert_eq!(asset_name, format!("motdyn-1.0.8-{expected_target}.tar.gz"));
+}
+
+#[test]
+fn bpftop_policy_expected_asset_name_matches_supported_binary() {
+    let policy = find_tool_policy("bpftop")
+        .expect("policy")
+        .github_release
+        .expect("github policy");
+    let asset_name =
+        (policy.expected_asset_name.expect("asset resolver"))("0.7.1").expect("asset name");
+    let expected_target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        other => panic!("unsupported local test platform: {other:?}"),
+    };
+    assert_eq!(asset_name, format!("bpftop-{expected_target}"));
 }
 
 #[test]
