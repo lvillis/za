@@ -30,6 +30,7 @@ fn main() -> Result<()> {
             unstaged,
             untracked,
             path,
+            kind,
             exclude_risk,
         } => {
             let exit_code = command::diff::run(command::diff::DiffRunOptions {
@@ -46,6 +47,10 @@ fn main() -> Result<()> {
                 .into_iter()
                 .filter_map(|(enabled, scope)| enabled.then_some(scope))
                 .collect(),
+                kinds: kind
+                    .into_iter()
+                    .map(command::diff::DiffFileKind::from)
+                    .collect(),
                 exclude_risks: exclude_risk
                     .into_iter()
                     .map(command::diff::DiffRiskKind::from)

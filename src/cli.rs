@@ -46,6 +46,9 @@ pub enum Commands {
         /// Restrict results to paths matching this gitignore-style glob. Repeatable.
         #[arg(long, value_name = "GLOB")]
         path: Vec<String>,
+        /// Only include files matching these change kinds. Repeatable.
+        #[arg(long, value_enum, value_name = "KIND")]
+        kind: Vec<DiffKindFilter>,
         /// Hide files carrying the selected review risk tag. Repeatable.
         #[arg(long, value_enum, value_name = "RISK")]
         exclude_risk: Vec<DiffRiskFilter>,
@@ -815,12 +818,23 @@ pub enum DiffRiskFilter {
     Lockfile,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum DiffKindFilter {
+    Code,
+    Test,
+    Docs,
+    Config,
+    Generated,
+    Binary,
+    Other,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         CiCommands, Cli, CodexCommands, ColorWhen, Commands, CompletionCommands, CompletionShell,
-        DepsCommands, DiffRiskFilter, GhCommands, GitAuthCommands, PortCommands, PortSignal,
-        ToolCommands,
+        DepsCommands, DiffKindFilter, DiffRiskFilter, GhCommands, GitAuthCommands, PortCommands,
+        PortSignal, ToolCommands,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -1426,6 +1440,8 @@ mod tests {
             "diff",
             "--tui",
             "--staged",
+            "--kind",
+            "code",
             "--path",
             "src/**",
             "--exclude-risk",
@@ -1441,6 +1457,7 @@ mod tests {
                 staged,
                 unstaged,
                 untracked,
+                kind,
                 path,
                 exclude_risk,
             } => {
@@ -1451,6 +1468,7 @@ mod tests {
                 assert!(staged);
                 assert!(!unstaged);
                 assert!(!untracked);
+                assert_eq!(kind, vec![DiffKindFilter::Code]);
                 assert_eq!(path, vec!["src/**"]);
                 assert_eq!(exclude_risk, vec![DiffRiskFilter::Generated]);
             }
@@ -1472,6 +1490,8 @@ mod tests {
             "--files",
             "--name-only",
             "--staged",
+            "--kind",
+            "docs",
             "--path",
             "src/**",
             "--exclude-risk",
@@ -1487,6 +1507,7 @@ mod tests {
                 staged,
                 unstaged,
                 untracked,
+                kind,
                 path,
                 exclude_risk,
             } => {
@@ -1497,8 +1518,38 @@ mod tests {
                 assert!(staged);
                 assert!(!unstaged);
                 assert!(!untracked);
+                assert_eq!(kind, vec![DiffKindFilter::Docs]);
                 assert_eq!(path, vec!["src/**"]);
                 assert_eq!(exclude_risk, vec![DiffRiskFilter::Generated]);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn diff_parses_multiple_kind_filters() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "diff",
+            "--kind",
+            "code",
+            "--kind",
+            "docs",
+            "--unstaged",
+        ])
+        .expect("must parse");
+        match cli.cmd {
+            Commands::Diff {
+                staged,
+                unstaged,
+                untracked,
+                kind,
+                ..
+            } => {
+                assert!(!staged);
+                assert!(unstaged);
+                assert!(!untracked);
+                assert_eq!(kind, vec![DiffKindFilter::Code, DiffKindFilter::Docs]);
             }
             _ => panic!("unexpected command"),
         }

@@ -24,6 +24,7 @@ const LARGE_DIFF_THRESHOLD_MAX: u64 = 1200;
 const LARGE_DIFF_HISTORY_COMMITS: usize = 200;
 const LARGE_DIFF_HISTORY_MIN_SAMPLES: usize = 32;
 const LARGE_DIFF_HISTORY_PERCENTILE: usize = 90;
+const DIFF_REPORT_SCHEMA_VERSION: u8 = 2;
 const GENERATED_MARKERS: &[&str] = &[
     "/dist/",
     "/build/",
@@ -67,6 +68,7 @@ pub struct DiffRunOptions {
     pub name_only: bool,
     pub path_patterns: Vec<String>,
     pub scopes: Vec<DiffScope>,
+    pub kinds: Vec<DiffFileKind>,
     pub exclude_risks: Vec<DiffRiskKind>,
 }
 
@@ -122,6 +124,19 @@ pub enum DiffRiskKind {
     Lockfile,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffFileKind {
+    Code,
+    Test,
+    Docs,
+    Config,
+    Generated,
+    Binary,
+    #[default]
+    Other,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 enum DiffRiskLevel {
@@ -163,6 +178,7 @@ struct DiffFileStat {
     deletions: u64,
     binary: bool,
     status: DiffStatus,
+    kind: DiffFileKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     primary_scope: Option<DiffScope>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -178,7 +194,18 @@ struct DiffSection {
     deletions: u64,
     binary_files: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    kind_breakdown: Vec<DiffKindStat>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     file_stats: Vec<DiffFileStat>,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+struct DiffKindStat {
+    kind: DiffFileKind,
+    files: usize,
+    additions: u64,
+    deletions: u64,
+    binary_files: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -200,6 +227,8 @@ struct DiffWorkspaceOutput {
 struct DiffFilterSummary {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     scopes: Vec<DiffScope>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    kinds: Vec<DiffFileKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     path_patterns: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -366,7 +395,7 @@ fn collect_workspace_diff(
     );
 
     Ok(DiffWorkspaceOutput {
-        schema_version: 1,
+        schema_version: DIFF_REPORT_SCHEMA_VERSION,
         repo_root: repo_root.display().to_string(),
         head,
         clean,
@@ -387,6 +416,7 @@ fn build_diff_section(
 ) -> DiffSection {
     finalize_entries(&mut entries, risk_policy);
     sort_section_entries(&mut entries);
+    let kind_breakdown = build_kind_breakdown(&entries);
     let additions = entries.iter().map(|entry| entry.additions).sum();
     let deletions = entries.iter().map(|entry| entry.deletions).sum();
     let binary_files = entries.iter().filter(|entry| entry.binary).count();
@@ -399,6 +429,7 @@ fn build_diff_section(
         additions,
         deletions,
         binary_files,
+        kind_breakdown,
         file_stats: entries,
     }
 }
@@ -422,6 +453,7 @@ fn build_total_section(
                     deletions: 0,
                     binary: false,
                     status: entry.status,
+                    kind: DiffFileKind::Other,
                     primary_scope: None,
                     scopes: Vec::new(),
                     risks: Vec::new(),
@@ -445,6 +477,7 @@ fn build_total_section(
     let mut entries = merged.into_values().collect::<Vec<_>>();
     finalize_entries(&mut entries, risk_policy);
     sort_review_entries(&mut entries);
+    let kind_breakdown = build_kind_breakdown(&entries);
     let additions = entries.iter().map(|entry| entry.additions).sum();
     let deletions = entries.iter().map(|entry| entry.deletions).sum();
     let binary_files = entries.iter().filter(|entry| entry.binary).count();
@@ -457,6 +490,7 @@ fn build_total_section(
         additions,
         deletions,
         binary_files,
+        kind_breakdown,
         file_stats: entries,
     }
 }
@@ -465,6 +499,7 @@ impl DiffFilterSpec {
     fn from_run_options(options: &DiffRunOptions, repo_root: &Path) -> Result<Self> {
         let summary = DiffFilterSummary {
             scopes: normalize_scope_filters(&options.scopes),
+            kinds: normalize_kind_filters(&options.kinds),
             path_patterns: options.path_patterns.clone(),
             exclude_risks: normalize_risk_filters(&options.exclude_risks),
         };
@@ -623,6 +658,13 @@ fn normalize_risk_filters(risks: &[DiffRiskKind]) -> Vec<DiffRiskKind> {
     normalized
 }
 
+fn normalize_kind_filters(kinds: &[DiffFileKind]) -> Vec<DiffFileKind> {
+    let mut normalized = kinds.to_vec();
+    normalized.sort_by_key(|kind| kind.summary_rank());
+    normalized.dedup();
+    normalized
+}
+
 fn apply_filters(entries: Vec<DiffFileStat>, filters: &DiffFilterSpec) -> Vec<DiffFileStat> {
     entries
         .into_iter()
@@ -637,6 +679,10 @@ fn entry_matches_filters(entry: &DiffFileStat, filters: &DiffFilterSpec) -> bool
             .iter()
             .any(|scope| filters.summary.scopes.contains(scope))
     {
+        return false;
+    }
+
+    if !filters.summary.kinds.is_empty() && !filters.summary.kinds.contains(&entry.kind) {
         return false;
     }
 
@@ -673,6 +719,7 @@ fn finalize_entries(entries: &mut [DiffFileStat], risk_policy: &DiffRiskPolicy) 
             .flatten();
         entry.renamed_to = entry.renamed_from.as_ref().map(|_| entry.path.clone());
         entry.risks = detect_risks(entry, risk_policy);
+        entry.kind = classify_file_kind(entry);
     }
 }
 
@@ -751,6 +798,7 @@ fn collect_untracked_entries(repo_root: &Path) -> Result<Vec<DiffFileStat>> {
                 deletions: entry.deletions,
                 binary: entry.binary,
                 status: DiffStatus::Untracked,
+                kind: DiffFileKind::Other,
                 primary_scope: Some(DiffScope::Untracked),
                 scopes: vec![DiffScope::Untracked],
                 risks: Vec::new(),
@@ -853,6 +901,7 @@ fn merge_diff_entries(
                 deletions: entry.deletions,
                 binary: entry.binary,
                 status: DiffStatus::Unknown,
+                kind: DiffFileKind::Other,
                 primary_scope: Some(scope),
                 scopes: vec![scope],
                 risks: Vec::new(),
@@ -872,6 +921,7 @@ fn merge_diff_entries(
                 deletions: 0,
                 binary: false,
                 status: entry.status,
+                kind: DiffFileKind::Other,
                 primary_scope: Some(scope),
                 scopes: vec![scope],
                 risks: Vec::new(),
@@ -967,6 +1017,20 @@ impl From<crate::cli::DiffRiskFilter> for DiffRiskKind {
             crate::cli::DiffRiskFilter::Generated => Self::Generated,
             crate::cli::DiffRiskFilter::Large => Self::Large,
             crate::cli::DiffRiskFilter::Lockfile => Self::Lockfile,
+        }
+    }
+}
+
+impl From<crate::cli::DiffKindFilter> for DiffFileKind {
+    fn from(value: crate::cli::DiffKindFilter) -> Self {
+        match value {
+            crate::cli::DiffKindFilter::Code => Self::Code,
+            crate::cli::DiffKindFilter::Test => Self::Test,
+            crate::cli::DiffKindFilter::Docs => Self::Docs,
+            crate::cli::DiffKindFilter::Config => Self::Config,
+            crate::cli::DiffKindFilter::Generated => Self::Generated,
+            crate::cli::DiffKindFilter::Binary => Self::Binary,
+            crate::cli::DiffKindFilter::Other => Self::Other,
         }
     }
 }
@@ -1146,28 +1210,7 @@ fn review_impact(entry: &DiffFileStat) -> u64 {
 }
 
 fn review_category_rank(entry: &DiffFileStat) -> usize {
-    let path = entry.path.to_ascii_lowercase();
-    if is_config_like_path(&path) || is_ci_like_path(&path) {
-        return 0;
-    }
-    if is_source_like_path(&path) {
-        return 1;
-    }
-    if is_test_like_path(&path) {
-        return 2;
-    }
-    if is_doc_like_path(&path) {
-        return 3;
-    }
-    if entry.risks.iter().any(|risk| {
-        matches!(
-            risk.kind,
-            DiffRiskKind::Binary | DiffRiskKind::Generated | DiffRiskKind::Lockfile
-        )
-    }) {
-        return 5;
-    }
-    4
+    entry.kind.review_rank()
 }
 
 fn is_ci_like_path(path: &str) -> bool {
@@ -1220,8 +1263,70 @@ fn is_test_like_path(path: &str) -> bool {
 fn is_doc_like_path(path: &str) -> bool {
     path.starts_with("docs/")
         || path.ends_with(".md")
+        || path.ends_with(".mdx")
         || path.ends_with(".rst")
         || path.ends_with(".txt")
+}
+
+fn classify_file_kind(entry: &DiffFileStat) -> DiffFileKind {
+    let path = entry.path.to_ascii_lowercase();
+    if entry.binary
+        || entry
+            .risks
+            .iter()
+            .any(|risk| matches!(risk.kind, DiffRiskKind::Binary))
+    {
+        return DiffFileKind::Binary;
+    }
+    if entry
+        .risks
+        .iter()
+        .any(|risk| matches!(risk.kind, DiffRiskKind::Generated))
+    {
+        return DiffFileKind::Generated;
+    }
+    if is_doc_like_path(&path) {
+        return DiffFileKind::Docs;
+    }
+    if is_test_like_path(&path) {
+        return DiffFileKind::Test;
+    }
+    if is_ci_like_path(&path)
+        || is_config_like_path(&path)
+        || entry.risks.iter().any(|risk| {
+            matches!(
+                risk.kind,
+                DiffRiskKind::Config | DiffRiskKind::Ci | DiffRiskKind::Lockfile
+            )
+        })
+    {
+        return DiffFileKind::Config;
+    }
+    if is_source_like_path(&path) {
+        return DiffFileKind::Code;
+    }
+    DiffFileKind::Other
+}
+
+fn build_kind_breakdown(entries: &[DiffFileStat]) -> Vec<DiffKindStat> {
+    let mut kinds = BTreeMap::<DiffFileKind, DiffKindStat>::new();
+    for entry in entries {
+        let stat = kinds.entry(entry.kind).or_insert_with(|| DiffKindStat {
+            kind: entry.kind,
+            files: 0,
+            additions: 0,
+            deletions: 0,
+            binary_files: 0,
+        });
+        stat.files += 1;
+        stat.additions = stat.additions.saturating_add(entry.additions);
+        stat.deletions = stat.deletions.saturating_add(entry.deletions);
+        stat.binary_files += usize::from(entry.binary);
+    }
+
+    let mut breakdown = kinds.into_values().collect::<Vec<_>>();
+    breakdown.sort_by_key(|stat| stat.kind.summary_rank());
+    breakdown
 }
 
 fn git_head_short(repo_root: &Path) -> Result<Option<String>> {
@@ -1340,6 +1445,11 @@ fn render_diff_report(report: &DiffWorkspaceOutput, options: RenderOptions) -> S
             "no changes matched current filters"
         ));
         lines.push(render_workspace_summary(report, use_color));
+        let workspace_kind_summary =
+            render_kind_summary(&report.workspace_total, &report.filters, use_color);
+        if !workspace_kind_summary.is_empty() {
+            lines.push(workspace_kind_summary);
+        }
         return lines.join("\n") + "\n";
     }
 
@@ -1369,6 +1479,11 @@ fn render_diff_report(report: &DiffWorkspaceOutput, options: RenderOptions) -> S
             String::new()
         }
     ));
+
+    let kind_summary = render_kind_summary(&report.total, &report.filters, use_color);
+    if !kind_summary.is_empty() {
+        lines.push(kind_summary);
+    }
 
     let scope_summary = render_scope_summary(report, use_color);
     if !scope_summary.is_empty() {
@@ -1427,6 +1542,17 @@ fn render_filter_summary(filters: &DiffFilterSummary, use_color: bool) -> String
                 .join(",")
         ));
     }
+    if !filters.kinds.is_empty() {
+        parts.push(format!(
+            "kind={}",
+            filters
+                .kinds
+                .iter()
+                .map(|kind| kind.label())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
     if !filters.path_patterns.is_empty() {
         parts.push(format!("path={}", filters.path_patterns.join(",")));
     }
@@ -1479,6 +1605,94 @@ fn render_workspace_summary(report: &DiffWorkspaceOutput, use_color: bool) -> St
             String::new()
         }
     )
+}
+
+fn render_kind_summary(
+    section: &DiffSection,
+    filters: &DiffFilterSummary,
+    use_color: bool,
+) -> String {
+    if section.kind_breakdown.is_empty()
+        || (section.kind_breakdown.len() == 1 && filters.kinds.is_empty())
+    {
+        return String::new();
+    }
+
+    let show_other_explicitly = filters.kinds.contains(&DiffFileKind::Other);
+    let hide_other_row = !show_other_explicitly && section.kind_breakdown.len() > 1;
+    let hidden_other = hide_other_row
+        .then(|| {
+            section
+                .kind_breakdown
+                .iter()
+                .find(|stat| stat.kind == DiffFileKind::Other)
+                .cloned()
+        })
+        .flatten();
+    let visible_stats = section
+        .kind_breakdown
+        .iter()
+        .filter(|stat| !(hide_other_row && stat.kind == DiffFileKind::Other))
+        .collect::<Vec<_>>();
+
+    if visible_stats.is_empty() {
+        return String::new();
+    }
+
+    let kind_width = visible_stats
+        .iter()
+        .map(|stat| stat.kind.label().chars().count())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let file_width = visible_stats
+        .iter()
+        .map(|stat| stat.files.to_string().len())
+        .max()
+        .unwrap_or(1);
+    let add_width = visible_stats
+        .iter()
+        .map(|stat| format!("+{}", stat.additions).len())
+        .max()
+        .unwrap_or(2);
+    let del_width = visible_stats
+        .iter()
+        .map(|stat| format!("-{}", stat.deletions).len())
+        .max()
+        .unwrap_or(2);
+
+    let mut header = style_dim("kinds", use_color);
+    if let Some(other) = &hidden_other {
+        header.push_str("  ");
+        header.push_str(&style_dim(
+            &format!(
+                "{} other {} hidden",
+                other.files,
+                pluralize(other.files, "file", "files")
+            ),
+            use_color,
+        ));
+    }
+
+    let mut lines = vec![header];
+    for stat in visible_stats {
+        let label = format!("{:<width$}", stat.kind.label(), width = kind_width);
+        lines.push(format!(
+            "  {}  {:>file_width$} {:<5}  {}  {}",
+            style_kind_label(&label, stat.kind, use_color),
+            stat.files,
+            pluralize(stat.files, "file", "files"),
+            colorize_additions(
+                format!("{:>add_width$}", format!("+{}", stat.additions)),
+                use_color
+            ),
+            colorize_deletions(
+                format!("{:>del_width$}", format!("-{}", stat.deletions)),
+                use_color
+            ),
+        ));
+    }
+    lines.join("\n")
 }
 
 fn render_attention_summary(
@@ -1982,6 +2196,19 @@ fn style_bold(value: &str, use_color: bool) -> String {
     style_ansi(value, &["1"], use_color)
 }
 
+fn style_kind_label(value: &str, kind: DiffFileKind, use_color: bool) -> String {
+    let codes = match kind {
+        DiffFileKind::Code => ["1", "37"].as_slice(),
+        DiffFileKind::Test => ["36", "1"].as_slice(),
+        DiffFileKind::Docs => ["35", "1"].as_slice(),
+        DiffFileKind::Config => ["33", "1"].as_slice(),
+        DiffFileKind::Generated => ["2", "35"].as_slice(),
+        DiffFileKind::Binary => ["36", "1"].as_slice(),
+        DiffFileKind::Other => ["2"].as_slice(),
+    };
+    style_ansi(value, codes, use_color)
+}
+
 fn style_risk(value: &str, level: DiffRiskLevel, use_color: bool) -> String {
     let codes = match level {
         DiffRiskLevel::High => ["31", "1"],
@@ -2117,6 +2344,43 @@ impl DiffRiskKind {
     }
 }
 
+impl DiffFileKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Test => "test",
+            Self::Docs => "docs",
+            Self::Config => "config",
+            Self::Generated => "generated",
+            Self::Binary => "binary",
+            Self::Other => "other",
+        }
+    }
+
+    fn summary_rank(self) -> usize {
+        match self {
+            Self::Code => 0,
+            Self::Test => 1,
+            Self::Docs => 2,
+            Self::Config => 3,
+            Self::Generated => 4,
+            Self::Binary => 5,
+            Self::Other => 6,
+        }
+    }
+
+    fn review_rank(self) -> usize {
+        match self {
+            Self::Config => 0,
+            Self::Code => 1,
+            Self::Test => 2,
+            Self::Docs => 3,
+            Self::Other => 4,
+            Self::Generated | Self::Binary => 5,
+        }
+    }
+}
+
 impl DiffStatus {
     fn short_label(self) -> &'static str {
         match self {
@@ -2136,12 +2400,12 @@ impl DiffStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        DIFF_STAT_FILLED_BLOCK, DiffFileStat, DiffFilterSpec, DiffFilterSummary,
-        DiffLargeThresholdSource, DiffRisk, DiffRiskKind, DiffRiskLevel, DiffRiskPolicy, DiffScope,
-        DiffSection, DiffStatus, DiffWorkspaceOutput, NumstatPathMode, RenderOptions,
-        collect_workspace_diff, compute_large_diff_threshold, parse_diff_status,
-        parse_historical_diff_samples, parse_name_status_z, parse_numstat_z, render_diff_report,
-        resolve_repo_root_from,
+        DIFF_REPORT_SCHEMA_VERSION, DIFF_STAT_FILLED_BLOCK, DiffFileKind, DiffFileStat,
+        DiffFilterSpec, DiffFilterSummary, DiffLargeThresholdSource, DiffRisk, DiffRiskKind,
+        DiffRiskLevel, DiffRiskPolicy, DiffScope, DiffSection, DiffStatus, DiffWorkspaceOutput,
+        NumstatPathMode, RenderOptions, collect_workspace_diff, compute_large_diff_threshold,
+        parse_diff_status, parse_historical_diff_samples, parse_name_status_z, parse_numstat_z,
+        render_diff_report, resolve_repo_root_from,
     };
     use anyhow::Result;
     use std::{
@@ -2364,7 +2628,7 @@ mod tests {
     #[test]
     fn render_diff_report_adds_ansi_colors_when_enabled() {
         let report = DiffWorkspaceOutput {
-            schema_version: 1,
+            schema_version: DIFF_REPORT_SCHEMA_VERSION,
             repo_root: "/tmp/repo".to_string(),
             head: Some("abc1234".to_string()),
             clean: false,
@@ -2380,6 +2644,13 @@ mod tests {
                 additions: 3,
                 deletions: 1,
                 binary_files: 0,
+                kind_breakdown: vec![super::DiffKindStat {
+                    kind: DiffFileKind::Code,
+                    files: 1,
+                    additions: 3,
+                    deletions: 1,
+                    binary_files: 0,
+                }],
                 file_stats: Vec::new(),
             },
             staged: DiffSection {
@@ -2387,6 +2658,13 @@ mod tests {
                 additions: 3,
                 deletions: 1,
                 binary_files: 0,
+                kind_breakdown: vec![super::DiffKindStat {
+                    kind: DiffFileKind::Code,
+                    files: 1,
+                    additions: 3,
+                    deletions: 1,
+                    binary_files: 0,
+                }],
                 file_stats: vec![DiffFileStat {
                     path: "src/main.rs".to_string(),
                     previous_path: None,
@@ -2396,6 +2674,7 @@ mod tests {
                     deletions: 1,
                     binary: false,
                     status: DiffStatus::Modified,
+                    kind: DiffFileKind::Code,
                     primary_scope: Some(DiffScope::Staged),
                     scopes: vec![DiffScope::Staged],
                     risks: vec![DiffRisk {
@@ -2411,6 +2690,13 @@ mod tests {
                 additions: 3,
                 deletions: 1,
                 binary_files: 0,
+                kind_breakdown: vec![super::DiffKindStat {
+                    kind: DiffFileKind::Code,
+                    files: 1,
+                    additions: 3,
+                    deletions: 1,
+                    binary_files: 0,
+                }],
                 file_stats: vec![DiffFileStat {
                     path: "src/main.rs".to_string(),
                     previous_path: None,
@@ -2420,6 +2706,7 @@ mod tests {
                     deletions: 1,
                     binary: false,
                     status: DiffStatus::Modified,
+                    kind: DiffFileKind::Code,
                     primary_scope: Some(DiffScope::Staged),
                     scopes: vec![DiffScope::Staged],
                     risks: vec![DiffRisk {
@@ -2459,6 +2746,7 @@ mod tests {
         let filters = DiffFilterSpec {
             summary: DiffFilterSummary {
                 scopes: vec![DiffScope::Unstaged],
+                kinds: Vec::new(),
                 path_patterns: vec!["src/**".to_string()],
                 exclude_risks: Vec::new(),
             },
@@ -2494,6 +2782,7 @@ mod tests {
         let filters = DiffFilterSpec {
             summary: DiffFilterSummary {
                 scopes: Vec::new(),
+                kinds: Vec::new(),
                 path_patterns: Vec::new(),
                 exclude_risks: vec![DiffRiskKind::Lockfile],
             },
@@ -2515,6 +2804,127 @@ mod tests {
                 .iter()
                 .any(|entry| entry.risks.iter().any(|risk| risk.kind == DiffRiskKind::Ci))
         );
+    }
+
+    #[test]
+    fn collect_workspace_diff_tracks_kind_breakdown() {
+        let dir = TempDir::new("kind-breakdown").expect("temp dir");
+        init_repo(&dir.path).expect("init repo");
+        write_file(dir.path.join("src/main.rs"), "fn main() {}\n").expect("write src");
+        write_file(dir.path.join("README.md"), "hello\n").expect("write readme");
+        write_file(dir.path.join("Cargo.toml"), "[package]\nname = \"demo\"\n")
+            .expect("write manifest");
+        git(&dir.path, &["add", "."]).expect("git add");
+        git(&dir.path, &["commit", "-qm", "init"]).expect("git commit");
+
+        write_file(
+            dir.path.join("src/main.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n",
+        )
+        .expect("modify src");
+        write_file(dir.path.join("README.md"), "hello\nworld\n").expect("modify readme");
+        write_file(
+            dir.path.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("modify manifest");
+
+        let report = collect_workspace_diff(Path::new(&dir.path), true, &no_filters())
+            .expect("collect diff");
+        let kinds = report
+            .total
+            .kind_breakdown
+            .iter()
+            .map(|stat| (stat.kind, stat.files))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                (DiffFileKind::Code, 1),
+                (DiffFileKind::Docs, 1),
+                (DiffFileKind::Config, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_workspace_diff_can_filter_by_kind() {
+        let dir = TempDir::new("kind-filter").expect("temp dir");
+        init_repo(&dir.path).expect("init repo");
+        write_file(dir.path.join("src/main.rs"), "fn main() {}\n").expect("write src");
+        write_file(dir.path.join("README.md"), "hello\n").expect("write readme");
+        git(&dir.path, &["add", "."]).expect("git add");
+        git(&dir.path, &["commit", "-qm", "init"]).expect("git commit");
+
+        write_file(
+            dir.path.join("src/main.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n",
+        )
+        .expect("modify src");
+        write_file(dir.path.join("README.md"), "hello\nworld\n").expect("modify readme");
+
+        let filters = DiffFilterSpec {
+            summary: DiffFilterSummary {
+                scopes: Vec::new(),
+                kinds: vec![DiffFileKind::Docs],
+                path_patterns: Vec::new(),
+                exclude_risks: Vec::new(),
+            },
+            path_matcher: None,
+        };
+        let report =
+            collect_workspace_diff(Path::new(&dir.path), true, &filters).expect("collect diff");
+        assert_eq!(report.total.files, 1);
+        assert_eq!(report.total.file_stats[0].path, "README.md");
+        assert_eq!(report.total.file_stats[0].kind, DiffFileKind::Docs);
+    }
+
+    #[test]
+    fn render_diff_report_shows_kind_summary_for_mixed_changes() {
+        let dir = TempDir::new("kind-render").expect("temp dir");
+        init_repo(&dir.path).expect("init repo");
+        write_file(dir.path.join("src/main.rs"), "fn main() {}\n").expect("write src");
+        write_file(dir.path.join("README.md"), "hello\n").expect("write readme");
+        git(&dir.path, &["add", "."]).expect("git add");
+        git(&dir.path, &["commit", "-qm", "init"]).expect("git commit");
+
+        write_file(
+            dir.path.join("src/main.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n",
+        )
+        .expect("modify src");
+        write_file(dir.path.join("README.md"), "hello\nworld\n").expect("modify readme");
+
+        let report = collect_workspace_diff(Path::new(&dir.path), true, &no_filters())
+            .expect("collect diff");
+        let rendered = render_diff_report(&report, render_options(false, false, false));
+        assert!(rendered.contains("kinds"));
+        assert!(rendered.contains("code"));
+        assert!(rendered.contains("docs"));
+    }
+
+    #[test]
+    fn render_diff_report_de_emphasizes_other_kind_when_mixed() {
+        let dir = TempDir::new("kind-render-other").expect("temp dir");
+        init_repo(&dir.path).expect("init repo");
+        write_file(dir.path.join("src/main.rs"), "fn main() {}\n").expect("write src");
+        write_file(dir.path.join("README.md"), "hello\n").expect("write readme");
+        git(&dir.path, &["add", "."]).expect("git add");
+        git(&dir.path, &["commit", "-qm", "init"]).expect("git commit");
+
+        write_file(
+            dir.path.join("src/main.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n",
+        )
+        .expect("modify src");
+        write_file(dir.path.join("README.md"), "hello\nworld\n").expect("modify readme");
+        write_file(dir.path.join(".scratch"), "").expect("write other");
+
+        let report = collect_workspace_diff(Path::new(&dir.path), true, &no_filters())
+            .expect("collect diff");
+        let rendered = render_diff_report(&report, render_options(false, false, false));
+        assert!(rendered.contains("1 other file hidden"));
+        assert!(!rendered.contains("\n  other"));
     }
 
     fn init_repo(path: &Path) -> Result<()> {

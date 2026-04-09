@@ -668,6 +668,7 @@ impl DiffTuiApp {
         DiffFilterSpec {
             summary: DiffFilterSummary {
                 scopes: self.scope_filter.as_summary_scopes(),
+                kinds: self.base_filters.summary.kinds.clone(),
                 path_patterns: self.base_filters.summary.path_patterns.clone(),
                 exclude_risks: self.base_filters.summary.exclude_risks.clone(),
             },
@@ -1893,29 +1894,14 @@ fn primary_badge(entry: &DiffFileStat) -> (&'static str, Style) {
 }
 
 fn review_category_group_label(entry: &DiffFileStat) -> &'static str {
-    let path = entry.path.to_ascii_lowercase();
-    if is_ci_like_path(&path) || is_config_like_path(&path) {
-        "Config & CI"
-    } else if is_source_like_path(&path) {
-        "Source"
-    } else if is_test_like_path(&path) {
-        "Tests"
-    } else if is_doc_like_path(&path) {
-        "Docs"
-    } else if entry
-        .risks
-        .iter()
-        .any(|risk| matches!(risk.kind, DiffRiskKind::Binary))
-    {
-        "Binary"
-    } else if entry
-        .risks
-        .iter()
-        .any(|risk| matches!(risk.kind, DiffRiskKind::Generated))
-    {
-        "Generated"
-    } else {
-        "Other"
+    match entry.kind {
+        DiffFileKind::Config => "Config & CI",
+        DiffFileKind::Code => "Source",
+        DiffFileKind::Test => "Tests",
+        DiffFileKind::Docs => "Docs",
+        DiffFileKind::Generated => "Generated",
+        DiffFileKind::Binary => "Binary",
+        DiffFileKind::Other => "Other",
     }
 }
 
@@ -2105,31 +2091,14 @@ fn empty_glyph(use_unicode_stat: bool) -> &'static str {
 }
 
 fn review_category_label(entry: &DiffFileStat) -> &'static str {
-    let path = entry.path.to_ascii_lowercase();
-    if is_ci_like_path(&path) {
-        "ci"
-    } else if is_config_like_path(&path) {
-        "config"
-    } else if is_source_like_path(&path) {
-        "source"
-    } else if is_test_like_path(&path) {
-        "test"
-    } else if is_doc_like_path(&path) {
-        "docs"
-    } else if entry
-        .risks
-        .iter()
-        .any(|risk| matches!(risk.kind, DiffRiskKind::Generated))
-    {
-        "generated"
-    } else if entry
-        .risks
-        .iter()
-        .any(|risk| matches!(risk.kind, DiffRiskKind::Binary))
-    {
-        "binary"
-    } else {
-        "other"
+    match entry.kind {
+        DiffFileKind::Config => "config",
+        DiffFileKind::Code => "source",
+        DiffFileKind::Test => "test",
+        DiffFileKind::Docs => "docs",
+        DiffFileKind::Generated => "generated",
+        DiffFileKind::Binary => "binary",
+        DiffFileKind::Other => "other",
     }
 }
 
@@ -2341,6 +2310,7 @@ mod tests {
             deletions: 1,
             binary: false,
             status: DiffStatus::Renamed,
+            kind: DiffFileKind::Code,
             primary_scope: Some(DiffScope::Staged),
             scopes: vec![DiffScope::Staged],
             risks: Vec::new(),
@@ -2395,6 +2365,7 @@ mod tests {
                 deletions: 0,
                 binary: false,
                 status: DiffStatus::Modified,
+                kind: DiffFileKind::Config,
                 primary_scope: Some(DiffScope::Unstaged),
                 scopes: vec![DiffScope::Unstaged],
                 risks: vec![DiffRisk {
@@ -2411,6 +2382,7 @@ mod tests {
                 deletions: 0,
                 binary: false,
                 status: DiffStatus::Modified,
+                kind: DiffFileKind::Code,
                 primary_scope: Some(DiffScope::Unstaged),
                 scopes: vec![DiffScope::Unstaged],
                 risks: Vec::new(),
