@@ -9,6 +9,7 @@ pub mod r#gen;
 pub mod git;
 pub mod ide;
 pub mod port;
+pub mod render;
 pub mod run;
 pub mod style;
 pub mod tool;

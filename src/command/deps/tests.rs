@@ -1,8 +1,11 @@
+use super::latest::{
+    LatestQuerySource, LatestRecord, LatestStatus, LatestSuggestionKind, LatestSummary,
+};
+use super::render::{render_latest_lines, render_latest_toml, render_report_lines};
 use super::{
     AuditSummary, CargoDependency, CargoMetadata, CargoPackage, CargoResolve, CargoResolveDepKind,
-    CargoResolveNode, CargoResolveNodeDep, DepAuditRecord, LatestQuerySource, LatestRecord,
-    LatestStatus, LatestSummary, RiskLevel, collect_dependency_specs, derive_auto_jobs,
-    render_latest_lines, render_latest_toml, render_report_lines,
+    CargoResolveNode, CargoResolveNodeDep, DepAuditRecord, RiskLevel, collect_dependency_specs,
+    derive_auto_jobs,
 };
 use std::path::Path;
 
@@ -224,7 +227,7 @@ fn render_latest_lines_suggest_mode_surfaces_plan_and_suggestion() {
             source: LatestQuerySource::Manifest,
             status: LatestStatus::Resolved,
             latest_version: Some("1.0.228".to_string()),
-            suggestion_kind: Some(super::LatestSuggestionKind::Keep),
+            suggestion_kind: Some(LatestSuggestionKind::Keep),
             suggested_requirement: None,
             note: None,
             suggestion_note: Some("current requirement already accepts latest".to_string()),
@@ -236,7 +239,7 @@ fn render_latest_lines_suggest_mode_surfaces_plan_and_suggestion() {
             source: LatestQuerySource::Manifest,
             status: LatestStatus::Resolved,
             latest_version: Some("0.1.31".to_string()),
-            suggestion_kind: Some(super::LatestSuggestionKind::Bump),
+            suggestion_kind: Some(LatestSuggestionKind::Bump),
             suggested_requirement: Some("0.1.31".to_string()),
             note: None,
             suggestion_note: Some("same release line; refresh manifest requirement".to_string()),

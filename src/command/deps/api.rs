@@ -303,7 +303,7 @@ impl ApiClient {
             })?;
             let status = response.status();
             if !status.is_success() {
-                let body = truncate(&response.text_lossy(), 200);
+                let body = text_render::truncate_end(&response.text_lossy(), 200);
                 if is_retryable_status(status.as_u16()) {
                     return Err(AttemptError::Retryable(anyhow!(
                         "status {} body {}",
@@ -378,7 +378,7 @@ impl ApiClient {
             })?;
             let status = response.status();
             if !status.is_success() {
-                let body = truncate(&response.text_lossy(), 200);
+                let body = text_render::truncate_end(&response.text_lossy(), 200);
                 if status.as_u16() == 403 {
                     self.github_api_blocked.store(true, Ordering::Relaxed);
                     return Err(AttemptError::Fatal(anyhow!(
