@@ -1,4 +1,4 @@
-use crate::cli::PortCommands;
+use crate::cli::{PortCommands, PortSignal};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use std::{
@@ -6,7 +6,7 @@ use std::{
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
-    thread,
+    process, thread,
     time::{Duration, Instant},
 };
 
@@ -14,6 +14,8 @@ const PROC_ROOT: &str = "/proc";
 const PROC_NET_ROOT: &str = "/proc/net";
 const PORT_REPORT_SCHEMA_VERSION: u8 = 1;
 const PORT_WAIT_TIMEOUT_EXIT: i32 = 30;
+const PORT_OPEN_MISSING_EXIT: i32 = 31;
+const PORT_STOP_FAILED_EXIT: i32 = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PortTransport {
@@ -175,6 +177,65 @@ pub fn run(cmd: PortCommands) -> Result<i32> {
             include_tcp: tcp || !udp,
             include_udp: udp || !tcp,
         }),
+        PortCommands::Open {
+            port,
+            all,
+            tcp,
+            udp,
+        } => run_open(
+            port,
+            PortLsOptions {
+                json: false,
+                all,
+                ports: [port].into_iter().collect(),
+                pids: BTreeSet::new(),
+                protocol_filter_requested: tcp || udp,
+                include_tcp: tcp || !udp,
+                include_udp: udp || !tcp,
+            },
+        ),
+        PortCommands::Stop {
+            port,
+            signal,
+            dry_run,
+            all,
+            tcp,
+            udp,
+        } => run_stop(
+            port,
+            signal,
+            dry_run,
+            PortLsOptions {
+                json: false,
+                all,
+                ports: [port].into_iter().collect(),
+                pids: BTreeSet::new(),
+                protocol_filter_requested: tcp || udp,
+                include_tcp: tcp || !udp,
+                include_udp: udp || !tcp,
+            },
+        ),
+        PortCommands::Follow {
+            port,
+            timeout_secs,
+            interval_ms,
+            all,
+            tcp,
+            udp,
+        } => run_follow(
+            port,
+            timeout_secs,
+            interval_ms,
+            PortLsOptions {
+                json: false,
+                all,
+                ports: [port].into_iter().collect(),
+                pids: BTreeSet::new(),
+                protocol_filter_requested: tcp || udp,
+                include_tcp: tcp || !udp,
+                include_udp: udp || !tcp,
+            },
+        ),
         PortCommands::Wait {
             port,
             timeout_secs,
@@ -197,6 +258,27 @@ pub fn run(cmd: PortCommands) -> Result<i32> {
             },
         ),
     }
+}
+
+fn run_open(port: u16, options: PortLsOptions) -> Result<i32> {
+    let report = collect_port_report(&options)?;
+    if report.rows.is_empty() {
+        println!("CLOSED  local port {port} has no visible matching sockets.");
+        if let Some(filter_line) = render_filter_summary(&report) {
+            println!("{filter_line}");
+        }
+        if report.rows_hidden_by_pid_filter_due_to_owner_visibility > 0 {
+            println!("{}", render_pid_filter_visibility_hint(&report));
+        }
+        return Ok(PORT_OPEN_MISSING_EXIT);
+    }
+
+    println!(
+        "OPEN    local port {port} has {} visible matching row(s).",
+        report.rows.len()
+    );
+    print!("{}", render_port_report(&report));
+    Ok(0)
 }
 
 fn run_ls(options: PortLsOptions) -> Result<i32> {
@@ -240,6 +322,64 @@ fn run_who(options: PortLsOptions) -> Result<i32> {
     Ok(0)
 }
 
+fn run_stop(port: u16, signal: PortSignal, dry_run: bool, options: PortLsOptions) -> Result<i32> {
+    let report = collect_port_report(&options)?;
+    let targets = collect_stop_targets(&report);
+    if targets.is_empty() {
+        println!("No visible owning process found for local port {port}.");
+        if let Some(filter_line) = render_filter_summary(&report) {
+            println!("{filter_line}");
+        }
+        if report.rows_without_visible_owner > 0 {
+            println!(
+                "Owner visibility limited for {} row(s); no safe stop target could be derived.",
+                report.rows_without_visible_owner
+            );
+        }
+        return Ok(PORT_STOP_FAILED_EXIT);
+    }
+
+    println!(
+        "{} local port {port} with {} for {} visible process(es).",
+        if dry_run { "Previewing" } else { "Stopping" },
+        port_signal_label(signal),
+        targets.len()
+    );
+    for owner in &targets {
+        println!("- {} {}", owner.pid, owner.process);
+    }
+
+    if dry_run {
+        return Ok(0);
+    }
+
+    let mut failures = Vec::new();
+    for owner in &targets {
+        if let Err(err) = send_signal(owner.pid, signal) {
+            failures.push(format!("{} {}: {err}", owner.pid, owner.process));
+        }
+    }
+
+    if failures.is_empty() {
+        println!(
+            "Sent {} to {} process(es) owning local port {port}.",
+            port_signal_label(signal),
+            targets.len()
+        );
+        return Ok(0);
+    }
+
+    println!(
+        "Sent {} with {} failure(s):",
+        port_signal_label(signal),
+        failures.len()
+    );
+    for failure in &failures {
+        println!("- {failure}");
+    }
+    Ok(PORT_STOP_FAILED_EXIT)
+}
+
 fn run_wait(port: u16, timeout_secs: u64, interval_ms: u64, options: PortLsOptions) -> Result<i32> {
     let started = Instant::now();
     let interval = Duration::from_millis(interval_ms.max(100));
@@ -269,6 +409,44 @@ fn run_wait(port: u16, timeout_secs: u64, interval_ms: u64, options: PortLsOptio
                 format_duration_short(started.elapsed())
             );
             return Ok(PORT_WAIT_TIMEOUT_EXIT);
+        }
+
+        thread::sleep(interval);
+    }
+}
+
+fn run_follow(
+    port: u16,
+    timeout_secs: Option<u64>,
+    interval_ms: u64,
+    options: PortLsOptions,
+) -> Result<i32> {
+    let started = Instant::now();
+    let interval = Duration::from_millis(interval_ms.max(100));
+    let mut last_digest = None::<String>;
+    println!(
+        "Following local port {port}{}...",
+        timeout_secs
+            .map(|secs| format!(" for up to {secs}s"))
+            .unwrap_or_default()
+    );
+
+    loop {
+        let report = collect_port_report(&options)?;
+        let digest = port_report_digest(&report);
+        if last_digest.as_deref() != Some(digest.as_str()) {
+            print!("{}", render_follow_snapshot(started.elapsed(), &report));
+            last_digest = Some(digest);
+        }
+
+        if let Some(timeout_secs) = timeout_secs
+            && started.elapsed() >= Duration::from_secs(timeout_secs)
+        {
+            println!(
+                "Follow timed out after {} for local port {port}.",
+                format_duration_short(started.elapsed())
+            );
+            return Ok(0);
         }
 
         thread::sleep(interval);
@@ -622,6 +800,51 @@ fn format_duration_short(duration: Duration) -> String {
     format!("{}d", secs / 86_400)
 }
 
+fn render_follow_snapshot(elapsed: Duration, report: &PortReport) -> String {
+    let mut out = String::new();
+    if report.rows.is_empty() {
+        out.push_str(&format!(
+            "@ {}  no visible matching sockets\n",
+            format_duration_short(elapsed)
+        ));
+        if let Some(filter_line) = render_filter_summary(report) {
+            out.push_str(&filter_line);
+            out.push('\n');
+        }
+        return out;
+    }
+
+    out.push_str(&format!(
+        "@ {}  {} row(s)\n",
+        format_duration_short(elapsed),
+        report.rows.len()
+    ));
+    out.push_str(&render_port_report(report));
+    out
+}
+
+fn port_report_digest(report: &PortReport) -> String {
+    let mut digest = format!(
+        "{}:{}:{}",
+        report.rows.len(),
+        report.rows_without_visible_owner,
+        report.rows_hidden_by_pid_filter_due_to_owner_visibility
+    );
+    for row in &report.rows {
+        digest.push(':');
+        digest.push_str(&format!(
+            "{}:{}:{}:{}:{}:{}",
+            row.proto,
+            row.port,
+            row.state,
+            row.inode,
+            render_pids(&row.pids),
+            row.peer.as_deref().unwrap_or("-")
+        ));
+    }
+    digest
+}
+
 fn render_port_report(report: &PortReport) -> String {
     if report.rows.is_empty() {
         let mut out = String::new();
@@ -810,6 +1033,54 @@ impl PortRow {
     }
 }
 
+fn collect_stop_targets(report: &PortReport) -> Vec<PortOwner> {
+    let current_pid = process::id();
+    let mut owners = BTreeMap::<u32, String>::new();
+    for row in &report.rows {
+        for owner in &row.owners {
+            if owner.pid == current_pid {
+                continue;
+            }
+            owners
+                .entry(owner.pid)
+                .or_insert_with(|| owner.process.clone());
+        }
+    }
+    owners
+        .into_iter()
+        .map(|(pid, process)| PortOwner { pid, process })
+        .collect()
+}
+
+fn port_signal_label(signal: PortSignal) -> &'static str {
+    match signal {
+        PortSignal::Term => "SIGTERM",
+        PortSignal::Kill => "SIGKILL",
+        PortSignal::Int => "SIGINT",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn send_signal(pid: u32, signal: PortSignal) -> Result<()> {
+    let signal_num = match signal {
+        PortSignal::Term => libc::SIGTERM,
+        PortSignal::Kill => libc::SIGKILL,
+        PortSignal::Int => libc::SIGINT,
+    };
+    let rc = unsafe { libc::kill(pid as i32, signal_num) };
+    if rc == 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::last_os_error())
+        .with_context(|| format!("send {} to pid {}", port_signal_label(signal), pid))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn send_signal(pid: u32, signal: PortSignal) -> Result<()> {
+    let _ = (pid, signal);
+    bail!("`za port stop` is currently only supported on Linux");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,6 +1195,91 @@ mod tests {
 
         let row = build_port_row(&socket, Vec::new(), true);
         assert_eq!(row.peer, None);
+    }
+
+    #[test]
+    fn collect_stop_targets_deduplicates_and_skips_current_process() {
+        let current_pid = std::process::id();
+        let report = PortReport {
+            schema_version: PORT_REPORT_SCHEMA_VERSION,
+            platform: "linux",
+            listen_only: true,
+            filters: PortFilterSummary {
+                ports: vec![8080],
+                pids: Vec::new(),
+                protocols: vec!["tcp"],
+            },
+            rows: vec![
+                PortRow {
+                    proto: "tcp".to_string(),
+                    address: "*".to_string(),
+                    port: 8080,
+                    local: "*:8080".to_string(),
+                    peer: None,
+                    state: "LISTEN".to_string(),
+                    inode: 1,
+                    pids: vec![current_pid, 2000],
+                    processes: vec!["za".to_string(), "python".to_string()],
+                    owners: vec![
+                        PortOwner {
+                            pid: current_pid,
+                            process: "za".to_string(),
+                        },
+                        PortOwner {
+                            pid: 2000,
+                            process: "python".to_string(),
+                        },
+                    ],
+                },
+                PortRow {
+                    proto: "tcp".to_string(),
+                    address: "*".to_string(),
+                    port: 8080,
+                    local: "*:8080".to_string(),
+                    peer: None,
+                    state: "LISTEN".to_string(),
+                    inode: 2,
+                    pids: vec![2000],
+                    processes: vec!["python".to_string()],
+                    owners: vec![PortOwner {
+                        pid: 2000,
+                        process: "python".to_string(),
+                    }],
+                },
+            ],
+            rows_without_visible_owner: 0,
+            rows_hidden_by_pid_filter_due_to_owner_visibility: 0,
+        };
+
+        let targets = collect_stop_targets(&report);
+        assert_eq!(
+            targets,
+            vec![PortOwner {
+                pid: 2000,
+                process: "python".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn render_follow_snapshot_reports_empty_state() {
+        let report = PortReport {
+            schema_version: PORT_REPORT_SCHEMA_VERSION,
+            platform: "linux",
+            listen_only: true,
+            filters: PortFilterSummary {
+                ports: vec![8080],
+                pids: Vec::new(),
+                protocols: vec!["tcp"],
+            },
+            rows: Vec::new(),
+            rows_without_visible_owner: 0,
+            rows_hidden_by_pid_filter_due_to_owner_visibility: 0,
+        };
+
+        let rendered = render_follow_snapshot(Duration::from_secs(3), &report);
+        assert!(rendered.contains("@ 3s  no visible matching sockets"));
+        assert!(rendered.contains("Filters: proto=tcp  port=8080"));
     }
 
     #[cfg(target_os = "linux")]

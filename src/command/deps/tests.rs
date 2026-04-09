@@ -140,7 +140,10 @@ fn render_latest_lines_show_summary_and_failure_note() {
             source: LatestQuerySource::Manifest,
             status: LatestStatus::Resolved,
             latest_version: Some("1.0.228".to_string()),
+            suggestion_kind: None,
+            suggested_requirement: None,
             note: None,
+            suggestion_note: None,
         },
         LatestRecord {
             name: "mystery".to_string(),
@@ -149,11 +152,19 @@ fn render_latest_lines_show_summary_and_failure_note() {
             source: LatestQuerySource::Args,
             status: LatestStatus::Failed,
             latest_version: None,
+            suggestion_kind: None,
+            suggested_requirement: None,
             note: Some("crates.io query failed: timeout".to_string()),
+            suggestion_note: None,
         },
     ];
 
-    let lines = render_latest_lines(Some(Path::new("/tmp/work/Cargo.toml")), &summary, &records);
+    let lines = render_latest_lines(
+        Some(Path::new("/tmp/work/Cargo.toml")),
+        &summary,
+        &records,
+        false,
+    );
     let output = lines.join("\n");
     assert!(output.contains("latest"));
     assert!(output.contains("1 resolved"));
@@ -175,7 +186,10 @@ fn render_latest_toml_comments_failed_entries() {
             source: LatestQuerySource::Args,
             status: LatestStatus::Resolved,
             latest_version: Some("1.0.228".to_string()),
+            suggestion_kind: None,
+            suggested_requirement: None,
             note: None,
+            suggestion_note: None,
         },
         LatestRecord {
             name: "broken".to_string(),
@@ -184,12 +198,64 @@ fn render_latest_toml_comments_failed_entries() {
             source: LatestQuerySource::Args,
             status: LatestStatus::Failed,
             latest_version: None,
+            suggestion_kind: None,
+            suggested_requirement: None,
             note: Some("crates.io query failed: eof".to_string()),
+            suggestion_note: None,
         },
     ]);
 
     assert!(rendered.contains("serde = \"1.0.228\""));
     assert!(rendered.contains("# broken: crates.io query failed: eof"));
+}
+
+#[test]
+fn render_latest_lines_suggest_mode_surfaces_plan_and_suggestion() {
+    let summary = LatestSummary {
+        total: 2,
+        resolved: 2,
+        failed: 0,
+    };
+    let records = vec![
+        LatestRecord {
+            name: "serde".to_string(),
+            requirement: Some("^1".to_string()),
+            kinds: Some("normal".to_string()),
+            source: LatestQuerySource::Manifest,
+            status: LatestStatus::Resolved,
+            latest_version: Some("1.0.228".to_string()),
+            suggestion_kind: Some(super::LatestSuggestionKind::Keep),
+            suggested_requirement: None,
+            note: None,
+            suggestion_note: Some("current requirement already accepts latest".to_string()),
+        },
+        LatestRecord {
+            name: "reqx".to_string(),
+            requirement: Some("0.1.29".to_string()),
+            kinds: Some("normal".to_string()),
+            source: LatestQuerySource::Manifest,
+            status: LatestStatus::Resolved,
+            latest_version: Some("0.1.31".to_string()),
+            suggestion_kind: Some(super::LatestSuggestionKind::Bump),
+            suggested_requirement: Some("0.1.31".to_string()),
+            note: None,
+            suggestion_note: Some("same release line; refresh manifest requirement".to_string()),
+        },
+    ];
+
+    let lines = render_latest_lines(
+        Some(Path::new("/tmp/work/Cargo.toml")),
+        &summary,
+        &records,
+        true,
+    );
+    let output = lines.join("\n");
+    assert!(output.contains("plan"));
+    assert!(output.contains("suggest"));
+    assert!(output.contains("keep"));
+    assert!(output.contains("bump"));
+    assert!(output.contains("0.1.31"));
+    assert!(output.contains("current requirement already accepts latest"));
 }
 
 fn sample_record(name: &str, risk: RiskLevel, notes: &[&str]) -> DepAuditRecord {

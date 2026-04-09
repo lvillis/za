@@ -130,13 +130,17 @@ za deps --jobs 16
 za deps --fail-on-high
 za deps latest serde regex
 za deps latest --manifest Cargo.toml --toml
+za deps latest --manifest Cargo.toml --suggest
 ```
 
 ### 5) Inspect local ports
 
 ```bash
 za port ls
+za port open 3000
 za port who 8080
+za port follow 3000
+za port stop 3000 --dry-run
 za port wait 3000
 ```
 
@@ -162,6 +166,7 @@ za gh ci inspect
 za gh ci watch
 za gh ci list --repo lvillis/za --repo lvillis/reqx-rs
 za gh ci list --group work
+za gh ci list --group work --all
 ```
 
 `za gh ci` inspects the current repository `HEAD` commit. `za gh ci watch` follows that commit until GitHub Actions reaches a terminal state. `za gh ci inspect` drills into failing/cancelled workflows for the current commit. `za gh ci list` can read repo groups from `~/.config/za/ci.toml`.
@@ -172,11 +177,13 @@ za gh ci list --group work
 za gh auth enable
 za gh auth status
 za gh auth doctor
+za gh auth repair
 za gh auth test
 za gh auth test --repo https://github.com/org/repo.git
 ```
 
 `za gh auth enable` configures GitHub HTTPS auth through a credential helper (`za gh credential`) so remote URLs can stay clean (`https://github.com/org/repo.git`) without embedding token secrets.
+`za gh auth repair` makes the common fixes in one pass: it ensures the `za` credential helper is first for `github.com`, restores the expected username/`useHttpPath` settings, normalizes the current repo remote to clean GitHub HTTPS when possible, and then runs the same auth verification probe.
 `za gh auth test` uses an authenticated probe plus an anonymous comparison probe; it only reports verified auth when the anonymous probe is explicitly rejected, and treats network/transport failures as inconclusive. Use a private repo target for strict auth verification.
 
 ## Command Map
@@ -186,12 +193,12 @@ za gh auth test --repo https://github.com/org/repo.git
 | `za diff` | Summarize current Git workspace additions/deletions for review. |
 | `za completion` | Generate shell completion scripts. |
 | `za gen` | Generate project context snapshots (`CONTEXT.md`). |
-| `za port` | Inspect local TCP/UDP ownership and wait for ports to come up. |
+| `za port` | Inspect local TCP/UDP ownership, follow port changes, and act on visible owners. |
 | `za tool` | Tool management with `install`, `update`, `ls`, `doctor`, `show`, and `uninstall`. |
 | `za run` | Launch a tool directly with normalized proxy environment variables. |
 | `za codex` | Manage long-lived Codex tmux sessions for the current workspace. |
-| `za deps` | Audit Rust dependency governance and resolve latest crate versions. |
-| `za gh` | Unified GitHub shortcuts for auth and Actions status. |
+| `za deps` | Audit Rust dependency governance and resolve latest crate versions with upgrade guidance. |
+| `za gh` | Unified GitHub shortcuts for auth repair and Actions status. |
 | `za config` | Persist CLI config (`[auth]`, `[proxy]`, `[run]`, `[tool]`, `[update]`). |
 | `za ide` | Inspect and reconcile JetBrains remote IDE server processes. |
 
@@ -346,7 +353,7 @@ Multi-tool `za tool install`, `za tool update`, and `za tool sync` default to co
 `za tool install` and `za tool update` are interruption-safe: pressing `Ctrl+C` aborts cleanly and temporary download directories are removed automatically (stale leftovers are cleaned on next run). Output is stage-oriented (`resolve`, `source`, `install`, `activate`, `prune`) so it is obvious where a run is spending time.
 For large GitHub release assets, `za` will use parallel HTTP range downloads when the upstream supports it, emit explicit `download` / `verify` / `extract` stages, and automatically fall back to a single stream otherwise.
 
-`za deps` defaults to a compact audit view: one verdict line, an `attention` section for high/medium/unknown findings, and a low-risk summary hint. Use `za deps --verbose` to include the low-risk baseline inventory as well. `za deps latest` resolves the latest stable crates.io version for explicit crate names or a manifest's direct dependencies, and can emit copy-pastable TOML with `--toml`.
+`za deps` defaults to a compact audit view: one verdict line, an `attention` section for high/medium/unknown findings, and a low-risk summary hint. Use `za deps --verbose` to include the low-risk baseline inventory as well. `za deps latest` resolves the latest stable crates.io version for explicit crate names or a manifest's direct dependencies, can emit copy-pastable TOML with `--toml`, and can add upgrade guidance with `--suggest` so you can see whether the current manifest already covers the latest release, needs a same-line bump, or deserves manual review.
 
 Human-readable commands honor `--color auto|always|never` and `NO_COLOR`, so CI logs and redirected output can stay plain while interactive terminals keep semantic status colors.
 
@@ -377,14 +384,23 @@ Use `za port` to inspect local TCP/UDP ownership from `/proc` on Linux:
 # default listening/bound view
 za port ls
 
+# quick readiness check
+za port open 3000
+
 # who owns one port
 za port who 8080
+
+# stream changes only when something moves
+za port follow 3000
+
+# preview visible owners before stopping them
+za port stop 3000 --dry-run
 
 # wait for a service port to come up
 za port wait 3000
 ```
 
-`za port ls` keeps the broad table view. `za port who` narrows that same scan to one local port, and `za port wait` polls until a matching listener/bound socket appears, which is useful in scripts and local startup flows.
+`za port ls` keeps the broad table view. `za port open` is the quick readiness check with a clean exit code, `za port who` narrows that same scan to one local port, `za port follow` streams ownership/state changes only when something actually changes, `za port stop` targets the currently visible owners of a port (use `--dry-run` first), and `za port wait` polls until a matching listener/bound socket appears, which is useful in scripts and local startup flows.
 
 ### Managed Codex Sessions (`za codex`)
 
@@ -469,6 +485,7 @@ za deps --jobs 12
 # resolve latest stable versions from crates.io
 za deps latest serde regex
 za deps latest --manifest Cargo.toml --toml
+za deps latest --manifest Cargo.toml --suggest
 ```
 
 Token resolution priority:
@@ -479,7 +496,7 @@ Token resolution priority:
 
 ## GitHub CI (`za gh ci`)
 
-`za gh ci` reports GitHub Actions state for the current repository `HEAD` commit. It aggregates workflow runs for the same `head_sha`, so the first screen answers the question you usually care about after a push: did this commit pass yet? `za gh ci watch` also streams the currently active workflows while a commit is still pending or running. `za gh ci inspect` drills into failing/cancelled workflows and shows workflow URLs, job URLs, and attention steps for the current commit.
+`za gh ci` reports GitHub Actions state for the current repository `HEAD` commit. It aggregates workflow runs for the same `head_sha`, so the first screen answers the question you usually care about after a push: did this commit pass yet? `za gh ci watch` also streams the currently active workflows while a commit is still pending or running. `za gh ci inspect` drills into failing/cancelled workflows and shows workflow URLs, job URLs, and attention steps for the current commit. `za gh ci list` keeps a short local cache for recent GitHub API responses and hides clean green repos by default when the board has active or failing targets; pass `--all` when you want the full board.
 
 ```bash
 # current repo HEAD
@@ -496,6 +513,9 @@ za gh ci list --repo lvillis/za --repo /code/reqx-rs
 
 # read a named repo group
 za gh ci list --group work
+
+# include clean green repos too
+za gh ci list --group work --all
 ```
 
 Repo groups live in `~/.config/za/ci.toml` by default:

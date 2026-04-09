@@ -17,6 +17,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::Mutex,
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -32,6 +33,9 @@ const WATCH_DETAIL_LIMIT: usize = 3;
 const EXIT_RUNNING: i32 = 10;
 const EXIT_FAILED: i32 = 11;
 const EXIT_NO_RUNS: i32 = 12;
+const CI_CACHE_SCHEMA_VERSION: u8 = 1;
+const CI_CACHE_FILE_NAME: &str = "gh-ci-cache-v1.json";
+const CI_CACHE_TTL_SECS: u64 = 20;
 
 pub fn run(cmd: Option<CiCommands>, json: bool, github_token: Option<String>) -> Result<i32> {
     match cmd {
@@ -46,8 +50,9 @@ pub fn run(cmd: Option<CiCommands>, json: bool, github_token: Option<String>) ->
             repo,
             file,
             json,
+            all,
             github_token,
-        }) => run_list(group, repo, file, json, github_token),
+        }) => run_list(group, repo, file, json, all, github_token),
         Some(CiCommands::Inspect {
             all,
             json,
@@ -340,17 +345,57 @@ struct GitHubWorkflowJobStep {
     conclusion: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CiCacheMode {
+    ReadWrite,
+    Bypass,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct CiApiCacheFile {
+    schema_version: u8,
+    #[serde(default)]
+    entries: BTreeMap<String, CiApiCacheEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CiApiCacheEntry {
+    fetched_at_unix_secs: u64,
+    body: String,
+}
+
+#[derive(Debug, Default)]
+struct CiApiCacheState {
+    path: Option<PathBuf>,
+    data: CiApiCacheFile,
+    dirty: bool,
+}
+
 struct GitHubClient {
     http: Client,
     github_token: Option<String>,
+    cache: Option<Mutex<CiApiCacheState>>,
 }
 
 impl GitHubClient {
-    fn new(github_token_override: Option<String>) -> Result<Self> {
+    fn new(github_token_override: Option<String>, cache_mode: CiCacheMode) -> Result<Self> {
         Ok(Self {
             http: build_http_client(GITHUB_API_BASE)?,
             github_token: resolve_github_token(github_token_override)?,
+            cache: matches!(cache_mode, CiCacheMode::ReadWrite)
+                .then(|| Mutex::new(CiApiCacheState::load())),
         })
+    }
+
+    fn flush_cache(&self) -> Result<()> {
+        let Some(cache) = self.cache.as_ref() else {
+            return Ok(());
+        };
+        let mut cache = cache
+            .lock()
+            .map_err(|_| anyhow!("ci cache lock poisoned"))?;
+        let _ = cache.save_if_dirty();
+        Ok(())
     }
 
     fn fetch_commit_report_for_local_path(
@@ -462,6 +507,13 @@ impl GitHubClient {
     where
         T: DeserializeOwned,
     {
+        let cache_key = self.cache_key(path);
+        if let Some(body) = self.cache_get_fresh(&cache_key)
+            && let Ok(parsed) = serde_json::from_str::<T>(&body)
+        {
+            return Ok(parsed);
+        }
+
         let mut req = self.http.get(path);
         req = req
             .try_header("user-agent", HTTP_USER_AGENT)
@@ -501,16 +553,127 @@ impl GitHubClient {
                 body
             );
         }
-        response
-            .json::<T>()
-            .with_context(|| format!("parse GitHub API JSON from `{path}`"))
+        let body = response.text_lossy().to_string();
+        let parsed = serde_json::from_str::<T>(&body)
+            .with_context(|| format!("parse GitHub API JSON from `{path}`"))?;
+        self.cache_put(&cache_key, &body)?;
+        Ok(parsed)
+    }
+
+    fn cache_key(&self, path: &str) -> String {
+        format!(
+            "{}:{}",
+            if self.github_token.is_some() {
+                "token"
+            } else {
+                "anon"
+            },
+            path
+        )
+    }
+
+    fn cache_get_fresh(&self, key: &str) -> Option<String> {
+        let cache = self.cache.as_ref()?;
+        let mut cache = cache.lock().ok()?;
+        cache.get_fresh(key, now_unix_secs())
+    }
+
+    fn cache_put(&self, key: &str, body: &str) -> Result<()> {
+        let Some(cache) = self.cache.as_ref() else {
+            return Ok(());
+        };
+        let mut cache = cache
+            .lock()
+            .map_err(|_| anyhow!("ci cache lock poisoned"))?;
+        cache.put(key, body.to_string(), now_unix_secs());
+        Ok(())
     }
 }
 
+impl CiApiCacheState {
+    fn load() -> Self {
+        let Some(path) = ci_cache_path() else {
+            return Self::default();
+        };
+        let data = match fs::read(&path) {
+            Ok(raw) => match serde_json::from_slice::<CiApiCacheFile>(&raw) {
+                Ok(parsed) if parsed.schema_version == CI_CACHE_SCHEMA_VERSION => parsed,
+                _ => CiApiCacheFile::default(),
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => CiApiCacheFile::default(),
+            Err(_) => CiApiCacheFile::default(),
+        };
+        Self {
+            path: Some(path),
+            data,
+            dirty: false,
+        }
+    }
+
+    fn get_fresh(&mut self, key: &str, now_unix_secs: u64) -> Option<String> {
+        let entry = self.data.entries.get(key)?;
+        if now_unix_secs.saturating_sub(entry.fetched_at_unix_secs) <= CI_CACHE_TTL_SECS {
+            return Some(entry.body.clone());
+        }
+        self.data.entries.remove(key);
+        self.dirty = true;
+        None
+    }
+
+    fn put(&mut self, key: &str, body: String, now_unix_secs: u64) {
+        self.data.entries.insert(
+            key.to_string(),
+            CiApiCacheEntry {
+                fetched_at_unix_secs: now_unix_secs,
+                body,
+            },
+        );
+        self.dirty = true;
+    }
+
+    fn save_if_dirty(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create CI cache directory {}", parent.display()))?;
+        }
+        self.data.schema_version = CI_CACHE_SCHEMA_VERSION;
+        let raw = serde_json::to_vec_pretty(&self.data).context("serialize CI cache")?;
+        let tmp = path.with_extension(format!("tmp-ci-cache-{}", std::process::id()));
+        fs::write(&tmp, raw).with_context(|| format!("write {}", tmp.display()))?;
+        fs::rename(&tmp, &path)
+            .with_context(|| format!("replace ci cache {} -> {}", path.display(), tmp.display()))?;
+        self.dirty = false;
+        Ok(())
+    }
+}
+
+fn ci_cache_path() -> Option<PathBuf> {
+    if let Some(base) = env::var_os("XDG_CACHE_HOME") {
+        return Some(PathBuf::from(base).join("za").join(CI_CACHE_FILE_NAME));
+    }
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".cache").join("za").join(CI_CACHE_FILE_NAME))
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn run_status(json: bool, github_token: Option<String>) -> Result<i32> {
-    let client = GitHubClient::new(github_token)?;
+    let client = GitHubClient::new(github_token, CiCacheMode::ReadWrite)?;
     let report = client
         .fetch_commit_report_for_local_path(&env::current_dir()?, CiSourceKind::CurrentRepo)?;
+    client.flush_cache()?;
     if json {
         println!(
             "{}",
@@ -523,7 +686,7 @@ fn run_status(json: bool, github_token: Option<String>) -> Result<i32> {
 }
 
 fn run_watch(timeout_secs: Option<u64>, json: bool, github_token: Option<String>) -> Result<i32> {
-    let client = GitHubClient::new(github_token)?;
+    let client = GitHubClient::new(github_token, CiCacheMode::Bypass)?;
     let cwd = env::current_dir()?;
     let started = Instant::now();
     let mut last_digest = None::<String>;
@@ -579,9 +742,10 @@ fn run_list(
     repos: Vec<String>,
     file: Option<PathBuf>,
     json: bool,
+    show_all: bool,
     github_token: Option<String>,
 ) -> Result<i32> {
-    let client = GitHubClient::new(github_token)?;
+    let client = GitHubClient::new(github_token, CiCacheMode::ReadWrite)?;
     let targets = resolve_list_targets(group, repos, file)?;
     let mut entries = Vec::with_capacity(targets.len());
     let mut summary = CiBoardSummary::default();
@@ -623,6 +787,7 @@ fn run_list(
     });
 
     let out = CiBoardOutput { summary, entries };
+    client.flush_cache()?;
     if json {
         println!(
             "{}",
@@ -630,12 +795,12 @@ fn run_list(
         );
         return Ok(exit_code_for_board(&out));
     }
-    print_board_output(&out);
+    print_board_output(&out, show_all);
     Ok(exit_code_for_board(&out))
 }
 
 fn run_inspect(all: bool, json: bool, github_token: Option<String>) -> Result<i32> {
-    let client = GitHubClient::new(github_token)?;
+    let client = GitHubClient::new(github_token, CiCacheMode::ReadWrite)?;
     let cwd = env::current_dir()?;
     let ctx = resolve_local_repo_context(&cwd)?;
     let report = client.fetch_commit_report_for_sha(
@@ -646,6 +811,7 @@ fn run_inspect(all: bool, json: bool, github_token: Option<String>) -> Result<i3
         Some(ctx.repo_path.display().to_string()),
     )?;
     let inspect = build_inspect_report(&client, &ctx.slug, &report, all);
+    client.flush_cache()?;
 
     if json {
         println!(
@@ -964,6 +1130,44 @@ fn exit_code_for_board(board: &CiBoardOutput) -> i32 {
     0
 }
 
+fn board_entries_for_text(board: &CiBoardOutput, show_all: bool) -> (Vec<&CiBoardEntry>, usize) {
+    if show_all {
+        return (board.entries.iter().collect(), 0);
+    }
+
+    let has_attention = board.entries.iter().any(entry_needs_attention);
+    if !has_attention {
+        return (board.entries.iter().collect(), 0);
+    }
+
+    let mut visible = Vec::with_capacity(board.entries.len());
+    let mut hidden_success = 0usize;
+    for entry in &board.entries {
+        if is_clean_success_entry(entry) {
+            hidden_success += 1;
+            continue;
+        }
+        visible.push(entry);
+    }
+    (visible, hidden_success)
+}
+
+fn entry_needs_attention(entry: &CiBoardEntry) -> bool {
+    entry.query_error.is_some()
+        || entry
+            .report
+            .as_ref()
+            .is_some_and(|report| report.state != CiState::Success)
+}
+
+fn is_clean_success_entry(entry: &CiBoardEntry) -> bool {
+    entry.query_error.is_none()
+        && entry
+            .report
+            .as_ref()
+            .is_some_and(|report| report.state == CiState::Success)
+}
+
 fn watch_interval_for_state(state: CiState) -> Duration {
     match state {
         CiState::Pending | CiState::NoRuns => Duration::from_secs(WATCH_PENDING_INTERVAL_SECS),
@@ -1008,8 +1212,8 @@ fn print_commit_report(report: &CommitCiReport) {
     }
 }
 
-fn print_board_output(board: &CiBoardOutput) {
-    for line in render_board_output_lines(board) {
+fn print_board_output(board: &CiBoardOutput, show_all: bool) {
+    for line in render_board_output_lines(board, show_all) {
         println!("{line}");
     }
 }
@@ -1117,7 +1321,7 @@ fn render_commit_report_lines(report: &CommitCiReport) -> Vec<String> {
     lines
 }
 
-fn render_board_output_lines(board: &CiBoardOutput) -> Vec<String> {
+fn render_board_output_lines(board: &CiBoardOutput, show_all: bool) -> Vec<String> {
     let mut lines = vec![format!(
         "{}  {} {}  {}",
         tty_style::header("CI"),
@@ -1129,13 +1333,14 @@ fn render_board_output_lines(board: &CiBoardOutput) -> Vec<String> {
         lines.push(tty_style::dim("No CI targets found."));
         return lines;
     }
+    let (visible_entries, hidden_success) = board_entries_for_text(board, show_all);
 
     lines.push(tty_style::dim(format!(
         "{:<5} {:<28} {:<12} {:<7} {:<5} {:>3} {:>4} {:>2}  DETAIL",
         "ST", "REPO", "BRANCH", "SHA", "AGE", "RUN", "FAIL", "OK"
     )));
 
-    for entry in &board.entries {
+    for entry in visible_entries {
         match (&entry.report, &entry.query_error) {
             (_, Some(err)) => {
                 lines.push(format!(
@@ -1177,6 +1382,15 @@ fn render_board_output_lines(board: &CiBoardOutput) -> Vec<String> {
             }
             _ => {}
         }
+    }
+
+    if hidden_success > 0 {
+        lines.push(String::new());
+        lines.push(format!(
+            "{} {} clean green target(s) hidden; pass `--all` to show them",
+            tty_style::dim("..."),
+            hidden_success
+        ));
     }
 
     lines
@@ -2174,7 +2388,7 @@ repos = ["openai/codex", "/code/za"]
             ],
         };
 
-        let lines = render_board_output_lines(&board);
+        let lines = render_board_output_lines(&board, true);
         assert!(lines[0].contains("total 2"));
         assert!(lines[0].contains("1 fail"));
         assert!(lines[0].contains("1 ok"));
@@ -2183,6 +2397,65 @@ repos = ["openai/codex", "/code/za"]
         assert!(lines[1].contains("FAIL"));
         assert!(lines.iter().any(|line| line.contains("lvillis/za")));
         assert!(lines.iter().any(|line| line.contains("ERR")));
+    }
+
+    #[test]
+    fn render_board_output_lines_hide_clean_success_by_default() {
+        let board = super::CiBoardOutput {
+            summary: super::CiBoardSummary {
+                total: 2,
+                running: 1,
+                success: 1,
+                ..Default::default()
+            },
+            entries: vec![
+                super::CiBoardEntry {
+                    target: "lvillis/za".to_string(),
+                    report: Some(CommitCiReport {
+                        repo: "lvillis/za".to_string(),
+                        branch: Some("main".to_string()),
+                        sha: Some("15ff429123456789".to_string()),
+                        state: CiState::Running,
+                        summary: super::CiSummary {
+                            running: 1,
+                            ..Default::default()
+                        },
+                        latest_update_at: Some("2026-03-09T00:00:00Z".to_string()),
+                        source: CiSourceKind::Repo,
+                        source_path: None,
+                        runs: Vec::new(),
+                    }),
+                    query_error: None,
+                },
+                super::CiBoardEntry {
+                    target: "lvillis/green".to_string(),
+                    report: Some(CommitCiReport {
+                        repo: "lvillis/green".to_string(),
+                        branch: Some("main".to_string()),
+                        sha: Some("abcdef0123456789".to_string()),
+                        state: CiState::Success,
+                        summary: super::CiSummary {
+                            success: 3,
+                            ..Default::default()
+                        },
+                        latest_update_at: Some("2026-03-09T00:00:00Z".to_string()),
+                        source: CiSourceKind::Repo,
+                        source_path: None,
+                        runs: Vec::new(),
+                    }),
+                    query_error: None,
+                },
+            ],
+        };
+
+        let lines = render_board_output_lines(&board, false);
+        assert!(lines.iter().any(|line| line.contains("lvillis/za")));
+        assert!(!lines.iter().any(|line| line.contains("lvillis/green")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("1 clean green target(s) hidden"))
+        );
     }
 
     #[test]

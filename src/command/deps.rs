@@ -7,6 +7,7 @@ use crate::command::{style as tty_style, za_config};
 use anyhow::{Context, Result, anyhow, bail};
 use humantime::format_rfc3339_seconds;
 use indicatif::{ProgressBar, ProgressStyle};
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -62,6 +63,7 @@ pub struct DepsLatestOptions {
     pub include_optional: bool,
     pub json: bool,
     pub toml: bool,
+    pub suggest: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +88,15 @@ enum LatestStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LatestSuggestionKind {
+    Add,
+    Keep,
+    Bump,
+    Review,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct LatestRecord {
     name: String,
@@ -98,7 +109,13 @@ struct LatestRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     latest_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    suggestion_kind: Option<LatestSuggestionKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_requirement: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggestion_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -173,6 +190,7 @@ pub fn run_latest(opts: DepsLatestOptions) -> Result<()> {
         include_optional,
         json,
         toml,
+        suggest,
     } = opts;
 
     let (manifest_path, queries) = collect_latest_queries(
@@ -190,7 +208,8 @@ pub fn run_latest(opts: DepsLatestOptions) -> Result<()> {
     let worker_count = normalize_jobs(requested_jobs, queries.len());
     if !json && !toml {
         println!(
-            "Resolving latest stable versions for {} crate(s) with {} workers...",
+            "Resolving latest stable versions{} for {} crate(s) with {} workers...",
+            if suggest { " and upgrade guidance" } else { "" },
             queries.len(),
             worker_count
         );
@@ -216,7 +235,7 @@ pub fn run_latest(opts: DepsLatestOptions) -> Result<()> {
     } else if toml {
         print!("{}", render_latest_toml(&records));
     } else {
-        for line in render_latest_lines(manifest_path.as_deref(), &summary, &records) {
+        for line in render_latest_lines(manifest_path.as_deref(), &summary, &records, suggest) {
             println!("{line}");
         }
     }
@@ -370,6 +389,8 @@ fn resolve_latest_record(api: &ApiClient, query: LatestQuery) -> LatestRecord {
             if let Some(rust_version) = snapshot.latest_version_rust_version.as_deref() {
                 notes.push(format!("rust {rust_version}"));
             }
+            let (suggestion_kind, suggested_requirement, suggestion_note) =
+                build_latest_suggestion(&query, &snapshot.max_version);
             LatestRecord {
                 name: query.name,
                 requirement: query.requirement,
@@ -377,7 +398,10 @@ fn resolve_latest_record(api: &ApiClient, query: LatestQuery) -> LatestRecord {
                 source: query.source,
                 status: LatestStatus::Resolved,
                 latest_version: Some(snapshot.max_version),
+                suggestion_kind,
+                suggested_requirement,
                 note: (!notes.is_empty()).then(|| notes.join("; ")),
+                suggestion_note,
             }
         }
         Err(err) => LatestRecord {
@@ -387,7 +411,10 @@ fn resolve_latest_record(api: &ApiClient, query: LatestQuery) -> LatestRecord {
             source: query.source,
             status: LatestStatus::Failed,
             latest_version: None,
+            suggestion_kind: None,
+            suggested_requirement: None,
             note: Some(format!("crates.io query failed: {err}")),
+            suggestion_note: None,
         },
     }
 }
@@ -410,6 +437,7 @@ fn render_latest_lines(
     manifest_path: Option<&Path>,
     summary: &LatestSummary,
     records: &[LatestRecord],
+    suggest: bool,
 ) -> Vec<String> {
     let verdict = if summary.failed > 0 {
         tty_style::warning(format!("{:<5}", "WARN"))
@@ -460,38 +488,92 @@ fn render_latest_lines(
         .max()
         .unwrap_or(5)
         .clamp(5, 16);
+    let plan_width = records
+        .iter()
+        .map(|record| {
+            record
+                .suggestion_kind
+                .map(latest_suggestion_label)
+                .unwrap_or("-")
+                .chars()
+                .count()
+        })
+        .max()
+        .unwrap_or(6)
+        .clamp(4, 8);
+    let suggest_width = records
+        .iter()
+        .map(|record| {
+            record
+                .suggested_requirement
+                .as_deref()
+                .unwrap_or("-")
+                .chars()
+                .count()
+        })
+        .max()
+        .unwrap_or(7)
+        .clamp(7, 20);
 
     lines.push(String::new());
-    lines.push(tty_style::dim(format!(
-        "{:<5}  {:<name_width$}  {:<req_width$}  {:<latest_width$}  {:<kinds_width$}  note",
-        "st", "name", "req", "latest", "kinds"
-    )));
-    for record in records {
-        lines.push(format!(
-            "{}  {:<name_width$}  {:<req_width$}  {:<latest_width$}  {:<kinds_width$}  {}",
-            style_latest_status(record.status),
-            truncate(&record.name, name_width),
-            truncate(record.requirement.as_deref().unwrap_or("-"), req_width),
-            style_latest_version_cell(
-                &truncate(
-                    record.latest_version.as_deref().unwrap_or("-"),
-                    latest_width
+    if suggest {
+        lines.push(tty_style::dim(format!(
+            "{:<5}  {:<name_width$}  {:<req_width$}  {:<latest_width$}  {:<plan_width$}  {:<suggest_width$}  note",
+            "st", "name", "req", "latest", "plan", "suggest"
+        )));
+        for record in records {
+            lines.push(format!(
+                "{}  {:<name_width$}  {:<req_width$}  {:<latest_width$}  {}  {}  {}",
+                style_latest_status(record.status),
+                truncate(&record.name, name_width),
+                truncate(record.requirement.as_deref().unwrap_or("-"), req_width),
+                style_latest_version_cell(
+                    &truncate(
+                        record.latest_version.as_deref().unwrap_or("-"),
+                        latest_width
+                    ),
+                    latest_width,
+                    record.status,
                 ),
-                latest_width,
-                record.status,
-            ),
-            tty_style::dim(format!(
-                "{:<kinds_width$}",
-                truncate(record.kinds.as_deref().unwrap_or("-"), kinds_width)
-            )),
-            truncate(
-                record.note.as_deref().unwrap_or(match record.source {
-                    LatestQuerySource::Args => "explicit query",
-                    LatestQuerySource::Manifest => "manifest",
-                }),
-                96
-            )
-        ));
+                style_latest_plan_cell(record.suggestion_kind, plan_width),
+                style_latest_suggest_cell(
+                    truncate(
+                        record.suggested_requirement.as_deref().unwrap_or("-"),
+                        suggest_width
+                    )
+                    .as_str(),
+                    suggest_width,
+                    record.suggestion_kind,
+                ),
+                truncate(&render_latest_note(record, true), 96)
+            ));
+        }
+    } else {
+        lines.push(tty_style::dim(format!(
+            "{:<5}  {:<name_width$}  {:<req_width$}  {:<latest_width$}  {:<kinds_width$}  note",
+            "st", "name", "req", "latest", "kinds"
+        )));
+        for record in records {
+            lines.push(format!(
+                "{}  {:<name_width$}  {:<req_width$}  {:<latest_width$}  {:<kinds_width$}  {}",
+                style_latest_status(record.status),
+                truncate(&record.name, name_width),
+                truncate(record.requirement.as_deref().unwrap_or("-"), req_width),
+                style_latest_version_cell(
+                    &truncate(
+                        record.latest_version.as_deref().unwrap_or("-"),
+                        latest_width
+                    ),
+                    latest_width,
+                    record.status,
+                ),
+                tty_style::dim(format!(
+                    "{:<kinds_width$}",
+                    truncate(record.kinds.as_deref().unwrap_or("-"), kinds_width)
+                )),
+                truncate(&render_latest_note(record, false), 96)
+            ));
+        }
     }
 
     if let Some(path) = manifest_path {
@@ -530,6 +612,24 @@ fn render_latest_toml(records: &[LatestRecord]) -> String {
     out
 }
 
+fn render_latest_note(record: &LatestRecord, suggest: bool) -> String {
+    let mut parts = Vec::new();
+    if suggest && let Some(note) = record.suggestion_note.as_deref() {
+        parts.push(note.to_string());
+    }
+    if let Some(note) = record.note.as_deref() {
+        parts.push(note.to_string());
+    }
+    if parts.is_empty() {
+        match record.source {
+            LatestQuerySource::Args => "explicit query".to_string(),
+            LatestQuerySource::Manifest => "manifest".to_string(),
+        }
+    } else {
+        parts.join("; ")
+    }
+}
+
 fn render_latest_summary(summary: &LatestSummary) -> String {
     let mut parts = Vec::new();
     if summary.resolved > 0 {
@@ -558,6 +658,139 @@ fn style_latest_version_cell(value: &str, width: usize, status: LatestStatus) ->
         LatestStatus::Resolved => tty_style::active(padded),
         LatestStatus::Failed => tty_style::dim(padded),
     }
+}
+
+fn latest_suggestion_label(kind: LatestSuggestionKind) -> &'static str {
+    match kind {
+        LatestSuggestionKind::Add => "add",
+        LatestSuggestionKind::Keep => "keep",
+        LatestSuggestionKind::Bump => "bump",
+        LatestSuggestionKind::Review => "review",
+    }
+}
+
+fn style_latest_plan_cell(kind: Option<LatestSuggestionKind>, width: usize) -> String {
+    let padded = format!(
+        "{:<width$}",
+        kind.map(latest_suggestion_label).unwrap_or("-")
+    );
+    match kind {
+        Some(LatestSuggestionKind::Add | LatestSuggestionKind::Bump) => tty_style::active(padded),
+        Some(LatestSuggestionKind::Review) => tty_style::warning(padded),
+        Some(LatestSuggestionKind::Keep) => tty_style::dim(padded),
+        None => tty_style::dim(padded),
+    }
+}
+
+fn style_latest_suggest_cell(
+    value: &str,
+    width: usize,
+    kind: Option<LatestSuggestionKind>,
+) -> String {
+    let padded = format!("{value:<width$}");
+    match kind {
+        Some(LatestSuggestionKind::Add | LatestSuggestionKind::Bump) => tty_style::active(padded),
+        Some(LatestSuggestionKind::Review) => tty_style::warning(padded),
+        Some(LatestSuggestionKind::Keep) | None => tty_style::dim(padded),
+    }
+}
+
+fn build_latest_suggestion(
+    query: &LatestQuery,
+    latest_version: &str,
+) -> (Option<LatestSuggestionKind>, Option<String>, Option<String>) {
+    let latest = match Version::parse(latest_version) {
+        Ok(version) => version,
+        Err(_) => {
+            return (
+                Some(LatestSuggestionKind::Review),
+                Some(latest_version.to_string()),
+                Some("latest version format needs manual review".to_string()),
+            );
+        }
+    };
+
+    if matches!(query.source, LatestQuerySource::Args) {
+        return (
+            Some(LatestSuggestionKind::Add),
+            Some(latest_version.to_string()),
+            Some("explicit query; add this version if needed".to_string()),
+        );
+    }
+
+    let raw_requirement = query.requirement.as_deref().unwrap_or("-").trim();
+    if raw_requirement.is_empty() || raw_requirement == "-" {
+        return (
+            Some(LatestSuggestionKind::Add),
+            Some(latest_version.to_string()),
+            Some("dependency has no explicit manifest requirement".to_string()),
+        );
+    }
+    if raw_requirement.contains('|') || raw_requirement.contains("workspace") {
+        return (
+            Some(LatestSuggestionKind::Review),
+            Some(latest_version.to_string()),
+            Some("complex manifest requirement; review manually".to_string()),
+        );
+    }
+
+    let requirement = match VersionReq::parse(raw_requirement) {
+        Ok(requirement) => requirement,
+        Err(_) => {
+            return (
+                Some(LatestSuggestionKind::Review),
+                Some(latest_version.to_string()),
+                Some("manifest requirement is not a plain semver range".to_string()),
+            );
+        }
+    };
+
+    if requirement.matches(&latest) {
+        return (
+            Some(LatestSuggestionKind::Keep),
+            None,
+            Some("current requirement already accepts latest".to_string()),
+        );
+    }
+
+    if requirement_series(&requirement) == Some(version_series(&latest)) {
+        return (
+            Some(LatestSuggestionKind::Bump),
+            Some(latest_version.to_string()),
+            Some("same release line; refresh manifest requirement".to_string()),
+        );
+    }
+
+    (
+        Some(LatestSuggestionKind::Review),
+        Some(latest_version.to_string()),
+        Some("major or nontrivial upgrade; review compatibility".to_string()),
+    )
+}
+
+fn version_series(version: &Version) -> (u64, Option<u64>) {
+    if version.major == 0 {
+        (0, Some(version.minor))
+    } else {
+        (version.major, None)
+    }
+}
+
+fn requirement_series(requirement: &VersionReq) -> Option<(u64, Option<u64>)> {
+    let mut detected = None::<(u64, Option<u64>)>;
+    for comparator in &requirement.comparators {
+        let series = if comparator.major == 0 {
+            (0, comparator.minor)
+        } else {
+            (comparator.major, None)
+        };
+        match detected {
+            Some(existing) if existing != series => return None,
+            Some(_) => {}
+            None => detected = Some(series),
+        }
+    }
+    detected
 }
 
 fn default_deps_jobs() -> usize {

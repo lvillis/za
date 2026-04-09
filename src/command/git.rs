@@ -67,6 +67,24 @@ struct GitAuthTestReport {
     hint: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct GitAuthRepairReport {
+    ok: bool,
+    git_version: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    actions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<String>,
+    remote: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_after: Option<String>,
+    remote_updated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<GitAuthTestReport>,
+}
+
 #[derive(Debug, Clone)]
 struct GitProbeResult {
     success: bool,
@@ -91,6 +109,11 @@ pub fn run_auth(cmd: GitAuthCommands) -> Result<i32> {
         GitAuthCommands::Enable => run_auth_enable(),
         GitAuthCommands::Status { json } => run_auth_status(json),
         GitAuthCommands::Doctor { json } => run_auth_doctor(json),
+        GitAuthCommands::Repair {
+            remote,
+            timeout_secs,
+            json,
+        } => run_auth_repair(remote, timeout_secs, json),
         GitAuthCommands::Test {
             repo,
             remote,
@@ -404,96 +427,184 @@ fn run_auth_doctor(json: bool) -> Result<i32> {
     Ok(if ok { 0 } else { 1 })
 }
 
+fn run_auth_repair(remote: String, timeout_secs: u64, json: bool) -> Result<i32> {
+    let git_version = git_version()?;
+    let mut actions = Vec::new();
+    let mut notes = Vec::new();
+
+    let existing_helpers = git_config_get_all_global(GITHUB_HELPER_KEY)?;
+    let mut helpers = vec![ZA_HELPER_COMMAND.to_string()];
+    helpers.extend(
+        existing_helpers
+            .iter()
+            .filter(|helper| !helper.eq_ignore_ascii_case(ZA_HELPER_COMMAND))
+            .cloned(),
+    );
+    if existing_helpers != helpers {
+        rewrite_github_helper_list(&helpers)?;
+        actions.push(format!("set {GITHUB_HOST} helper order with za first"));
+    } else {
+        notes.push("GitHub helper order already preferred za first".to_string());
+    }
+
+    let username = git_config_get_global(GITHUB_USERNAME_KEY)?;
+    if username.as_deref() != Some(GITHUB_USERNAME_VALUE) {
+        git_config_set_global(GITHUB_USERNAME_KEY, GITHUB_USERNAME_VALUE)?;
+        actions.push(format!(
+            "set {GITHUB_USERNAME_KEY} = {GITHUB_USERNAME_VALUE}"
+        ));
+    } else {
+        notes.push(format!("{GITHUB_USERNAME_KEY} already set correctly"));
+    }
+
+    let use_http_path = git_config_get_global(CREDENTIAL_USE_HTTP_PATH_KEY)?
+        .as_deref()
+        .and_then(parse_bool_value);
+    if use_http_path != Some(true) {
+        git_config_set_global(CREDENTIAL_USE_HTTP_PATH_KEY, "true")?;
+        actions.push(format!("set {CREDENTIAL_USE_HTTP_PATH_KEY} = true"));
+    } else {
+        notes.push(format!("{CREDENTIAL_USE_HTTP_PATH_KEY} already true"));
+    }
+
+    let remote_before = match git_remote_get_url(&remote) {
+        Ok(url) => Some(url),
+        Err(err) => {
+            notes.push(format!("remote `{remote}` not repaired: {err}"));
+            None
+        }
+    };
+    let mut remote_after = remote_before.clone();
+    let mut remote_updated = false;
+    if let Some(before) = remote_before.as_deref() {
+        if let Some(normalized) = normalize_github_remote_url(before) {
+            if normalized != before {
+                git_remote_set_url(&remote, &normalized)?;
+                actions.push(format!("rewrote `{remote}` remote to {normalized}"));
+                remote_after = Some(normalized);
+                remote_updated = true;
+            } else {
+                notes.push(format!(
+                    "remote `{remote}` already uses clean HTTPS GitHub URL"
+                ));
+            }
+        } else {
+            notes.push(format!(
+                "remote `{remote}` is not a GitHub URL; left unchanged"
+            ));
+        }
+    }
+
+    let verification_target = remote_after.clone().filter(|target_url| {
+        request_targets_github_https(&CredentialRequest {
+            protocol: None,
+            host: None,
+            path: None,
+            url: Some(target_url.clone()),
+        })
+    });
+    if remote_after.is_some() && verification_target.is_none() {
+        notes.push(
+            "verification skipped because the selected remote is not an HTTPS GitHub repo"
+                .to_string(),
+        );
+    }
+    let verification = if let Some(target_url) = verification_target {
+        match build_auth_test_report(Some(target_url), remote.clone(), timeout_secs) {
+            Ok((_git_version, report)) => Some(report),
+            Err(err) => {
+                notes.push(format!("verification probe failed: {err}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let ok = verification
+        .as_ref()
+        .is_none_or(|report| report.ok || report.anonymous_readable);
+    let report = GitAuthRepairReport {
+        ok,
+        git_version,
+        actions,
+        notes,
+        remote,
+        remote_before,
+        remote_after,
+        remote_updated,
+        verification,
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("serialize git auth repair report")?
+        );
+    } else {
+        println!(
+            "Git auth repair: {}",
+            if report.ok { "ok" } else { "issues remain" }
+        );
+        println!("Git: {}", report.git_version);
+        for action in &report.actions {
+            println!("- {action}");
+        }
+        if report.actions.is_empty() {
+            println!("- no config changes were required");
+        }
+        if let Some(before) = report.remote_before.as_deref() {
+            println!(
+                "remote {} before: {}",
+                report.remote,
+                sanitize_url_for_log(before)
+            );
+        }
+        if let Some(after) = report.remote_after.as_deref() {
+            println!(
+                "remote {} after:  {}",
+                report.remote,
+                sanitize_url_for_log(after)
+            );
+        }
+        if let Some(verification) = report.verification.as_ref() {
+            println!(
+                "verification: {}",
+                if verification.ok {
+                    format!("passed for {}", verification.target_url)
+                } else if verification.anonymous_readable {
+                    format!(
+                        "inconclusive for {} (repository is anonymously readable)",
+                        verification.target_url
+                    )
+                } else {
+                    format!(
+                        "failed for {} ({})",
+                        verification.target_url, verification.reason
+                    )
+                }
+            );
+            if let Some(hint) = verification.hint.as_deref() {
+                println!("hint: {hint}");
+            }
+        } else {
+            println!("verification: skipped");
+        }
+        for note in &report.notes {
+            println!("note: {note}");
+        }
+    }
+
+    Ok(if report.ok { 0 } else { 1 })
+}
+
 fn run_auth_test(
     repo: Option<String>,
     remote: String,
     timeout_secs: u64,
     json: bool,
 ) -> Result<i32> {
-    let git_version = git_version()?;
-    let timeout_secs = timeout_secs.max(1);
-    let timeout = Duration::from_secs(timeout_secs);
-
-    let (target_url, remote_used) = if let Some(url) = repo {
-        (url, None)
-    } else {
-        let url = git_remote_get_url(&remote)?;
-        (url, Some(remote))
-    };
-    let target_display = sanitize_url_for_log(&target_url);
-    let anonymous_target_url = strip_url_userinfo(&target_url);
-
-    let is_github_https = request_targets_github_https(&CredentialRequest {
-        protocol: None,
-        host: None,
-        path: None,
-        url: Some(target_url.clone()),
-    });
-    if !is_github_https {
-        let report = GitAuthTestReport {
-            ok: false,
-            auth_verified: false,
-            anonymous_readable: false,
-            target_url: target_display.clone(),
-            remote: remote_used,
-            timeout_secs,
-            elapsed_ms: 0,
-            timed_out: false,
-            exit_code: None,
-            reason: "target URL is not an HTTPS GitHub repository".to_string(),
-            hint: Some(
-                "Use an HTTPS GitHub remote, for example `https://github.com/org/repo.git`."
-                    .to_string(),
-            ),
-        };
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report).context("serialize git auth test report")?
-            );
-        } else {
-            println!("Git auth test failed for {target_display}");
-            println!("reason: {}", report.reason);
-            if let Some(hint) = report.hint {
-                println!("hint: {hint}");
-            }
-        }
-        return Ok(1);
-    }
-
-    let auth_probe = run_git_ls_remote_probe(&target_url, timeout, false)?;
-    if auth_probe.timed_out || !auth_probe.success {
-        let report = build_auth_probe_failure_report(
-            &target_display,
-            remote_used.clone(),
-            timeout_secs,
-            &auth_probe,
-        );
-
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report).context("serialize git auth test report")?
-            );
-        } else {
-            println!("Git auth test failed for {}.", report.target_url);
-            println!("Git: {git_version}");
-            println!("reason: {}", report.reason);
-            if let Some(hint) = report.hint {
-                println!("hint: {hint}");
-            }
-        }
-        return Ok(1);
-    }
-
-    let anon_probe = run_git_ls_remote_probe(&anonymous_target_url, timeout, true)?;
-    let report = build_auth_verification_report(
-        &target_display,
-        remote_used,
-        timeout_secs,
-        &auth_probe,
-        &anon_probe,
-    );
+    let (git_version, report) = build_auth_test_report(repo, remote, timeout_secs)?;
 
     if json {
         println!(
@@ -518,6 +629,76 @@ fn run_auth_test(
     Ok(if report.ok { 0 } else { 1 })
 }
 
+fn build_auth_test_report(
+    repo: Option<String>,
+    remote: String,
+    timeout_secs: u64,
+) -> Result<(String, GitAuthTestReport)> {
+    let git_version = git_version()?;
+    let timeout_secs = timeout_secs.max(1);
+    let timeout = Duration::from_secs(timeout_secs);
+
+    let (target_url, remote_used) = if let Some(url) = repo {
+        (url, None)
+    } else {
+        let url = git_remote_get_url(&remote)?;
+        (url, Some(remote))
+    };
+    let target_display = sanitize_url_for_log(&target_url);
+    let anonymous_target_url = strip_url_userinfo(&target_url);
+
+    let is_github_https = request_targets_github_https(&CredentialRequest {
+        protocol: None,
+        host: None,
+        path: None,
+        url: Some(target_url.clone()),
+    });
+    if !is_github_https {
+        return Ok((
+            git_version,
+            GitAuthTestReport {
+                ok: false,
+                auth_verified: false,
+                anonymous_readable: false,
+                target_url: target_display,
+                remote: remote_used,
+                timeout_secs,
+                elapsed_ms: 0,
+                timed_out: false,
+                exit_code: None,
+                reason: "target URL is not an HTTPS GitHub repository".to_string(),
+                hint: Some(
+                    "Use an HTTPS GitHub remote, for example `https://github.com/org/repo.git`."
+                        .to_string(),
+                ),
+            },
+        ));
+    }
+
+    let auth_probe = run_git_ls_remote_probe(&target_url, timeout, false)?;
+    if auth_probe.timed_out || !auth_probe.success {
+        return Ok((
+            git_version,
+            build_auth_probe_failure_report(
+                &target_display,
+                remote_used,
+                timeout_secs,
+                &auth_probe,
+            ),
+        ));
+    }
+
+    let anon_probe = run_git_ls_remote_probe(&anonymous_target_url, timeout, true)?;
+    let report = build_auth_verification_report(
+        &target_display,
+        remote_used,
+        timeout_secs,
+        &auth_probe,
+        &anon_probe,
+    );
+    Ok((git_version, report))
+}
+
 fn git_remote_get_url(remote: &str) -> Result<String> {
     let output = run_git_args(&["remote", "get-url", remote])?;
     if !output.status.success() {
@@ -528,6 +709,17 @@ fn git_remote_get_url(remote: &str) -> Result<String> {
     }
     normalize_non_empty(String::from_utf8_lossy(&output.stdout).as_ref())
         .ok_or_else(|| anyhow::anyhow!("remote `{remote}` URL is empty"))
+}
+
+fn git_remote_set_url(remote: &str, url: &str) -> Result<()> {
+    let output = run_git(["remote", "set-url", remote, url])?;
+    if !output.status.success() {
+        bail!(
+            "update remote `{remote}` URL failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 fn run_git_ls_remote_probe(
@@ -883,6 +1075,30 @@ fn sanitize_url_for_log(input: &str) -> String {
     strip_url_userinfo(input)
 }
 
+fn normalize_github_remote_url(input: &str) -> Option<String> {
+    let trimmed = strip_url_userinfo(input).trim().to_string();
+    let path = trimmed
+        .strip_prefix("git@github.com:")
+        .or_else(|| trimmed.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| trimmed.strip_prefix("ssh://github.com/"))
+        .or_else(|| trimmed.strip_prefix("git://github.com/"))
+        .or_else(|| trimmed.strip_prefix("https://github.com/"))?;
+
+    let repo_path = path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .split('#')
+        .next()
+        .unwrap_or(path)
+        .trim_start_matches('/')
+        .trim();
+    if repo_path.is_empty() {
+        return None;
+    }
+    Some(format!("https://github.com/{repo_path}"))
+}
+
 pub fn run_credential(operation: Option<String>) -> Result<i32> {
     let op = operation.unwrap_or_else(|| "get".to_string());
     match op.as_str() {
@@ -1138,8 +1354,8 @@ mod tests {
     use super::{
         CredentialRequest, GitProbeResult, ProbeFailureKind, build_auth_probe_failure_report,
         build_auth_verification_report, classify_probe_failure, extract_url_host,
-        extract_url_scheme, normalize_host, request_targets_github_https, sanitize_url_for_log,
-        strip_url_userinfo,
+        extract_url_scheme, normalize_github_remote_url, normalize_host,
+        request_targets_github_https, sanitize_url_for_log, strip_url_userinfo,
     };
 
     fn probe(
@@ -1224,6 +1440,23 @@ mod tests {
             strip_url_userinfo("https://github.com/org/repo.git"),
             "https://github.com/org/repo.git"
         );
+    }
+
+    #[test]
+    fn normalize_github_remote_url_converts_ssh_and_strips_userinfo() {
+        assert_eq!(
+            normalize_github_remote_url("git@github.com:lvillis/za.git").as_deref(),
+            Some("https://github.com/lvillis/za.git")
+        );
+        assert_eq!(
+            normalize_github_remote_url("ssh://git@github.com/lvillis/za.git").as_deref(),
+            Some("https://github.com/lvillis/za.git")
+        );
+        assert_eq!(
+            normalize_github_remote_url("https://token@github.com/lvillis/za.git").as_deref(),
+            Some("https://github.com/lvillis/za.git")
+        );
+        assert!(normalize_github_remote_url("https://gitlab.com/lvillis/za.git").is_none());
     }
 
     #[test]

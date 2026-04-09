@@ -84,6 +84,7 @@ fn main() -> Result<()> {
                 include_optional,
                 json,
                 toml,
+                suggest,
             }) => command::deps::run_latest(command::deps::DepsLatestOptions {
                 crates,
                 manifest_path,
@@ -93,6 +94,7 @@ fn main() -> Result<()> {
                 include_optional,
                 json,
                 toml,
+                suggest,
             }),
         },
         cli::Commands::Port { cmd } => {

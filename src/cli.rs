@@ -310,6 +310,60 @@ pub enum PortCommands {
         #[arg(long)]
         udp: bool,
     },
+    /// Exit zero when a local port currently has at least one visible socket
+    Open {
+        /// Local port to inspect.
+        port: u16,
+        /// Include connected and non-listening sockets, not just listening/bound ports.
+        #[arg(long)]
+        all: bool,
+        /// Only include TCP sockets.
+        #[arg(long)]
+        tcp: bool,
+        /// Only include UDP sockets.
+        #[arg(long)]
+        udp: bool,
+    },
+    /// Send a signal to processes currently owning a local port
+    Stop {
+        /// Local port to inspect.
+        port: u16,
+        /// Signal to send to visible owning processes.
+        #[arg(long, value_enum, default_value_t = PortSignal::Term)]
+        signal: PortSignal,
+        /// Preview target processes without sending a signal.
+        #[arg(long)]
+        dry_run: bool,
+        /// Include connected and non-listening sockets, not just listening/bound ports.
+        #[arg(long)]
+        all: bool,
+        /// Only include TCP sockets.
+        #[arg(long)]
+        tcp: bool,
+        /// Only include UDP sockets.
+        #[arg(long)]
+        udp: bool,
+    },
+    /// Follow local port ownership/state changes
+    Follow {
+        /// Local port to inspect.
+        port: u16,
+        /// Stop following after this many seconds.
+        #[arg(long, value_name = "SECS")]
+        timeout_secs: Option<u64>,
+        /// Poll interval in milliseconds.
+        #[arg(long, default_value_t = 1000)]
+        interval_ms: u64,
+        /// Include connected and non-listening sockets, not just listening/bound ports.
+        #[arg(long)]
+        all: bool,
+        /// Only include TCP sockets.
+        #[arg(long)]
+        tcp: bool,
+        /// Only include UDP sockets.
+        #[arg(long)]
+        udp: bool,
+    },
     /// Wait until a local port becomes available
     Wait {
         /// Local port to wait for.
@@ -438,6 +492,9 @@ pub enum DepsCommands {
         /// Print copy-pastable TOML dependency entries.
         #[arg(long, conflicts_with = "json")]
         toml: bool,
+        /// Add upgrade guidance based on current manifest requirements.
+        #[arg(long, conflicts_with = "toml")]
+        suggest: bool,
     },
 }
 
@@ -455,6 +512,13 @@ pub enum CompletionShell {
     Fish,
     Elvish,
     Powershell,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum PortSignal {
+    Term,
+    Kill,
+    Int,
 }
 
 /// `za config` sub-commands
@@ -604,6 +668,9 @@ pub enum CiCommands {
         /// Print JSON output for scripting.
         #[arg(long)]
         json: bool,
+        /// Show all targets, including clean green repos.
+        #[arg(long)]
+        all: bool,
         /// Optional GitHub token override for this run.
         #[arg(long, value_name = "TOKEN")]
         github_token: Option<String>,
@@ -661,6 +728,18 @@ pub enum GitAuthCommands {
     },
     /// Diagnose common GitHub auth wiring issues
     Doctor {
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Repair GitHub credential-helper wiring and normalize the current repo remote URL
+    Repair {
+        /// Remote name used when repairing the current repo remote URL.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Timeout for the verification probe.
+        #[arg(long, default_value_t = 15)]
+        timeout_secs: u64,
         /// Print JSON output for scripting.
         #[arg(long)]
         json: bool,
@@ -740,7 +819,8 @@ pub enum DiffRiskFilter {
 mod tests {
     use super::{
         CiCommands, Cli, CodexCommands, ColorWhen, Commands, CompletionCommands, CompletionShell,
-        DepsCommands, DiffRiskFilter, GhCommands, GitAuthCommands, PortCommands, ToolCommands,
+        DepsCommands, DiffRiskFilter, GhCommands, GitAuthCommands, PortCommands, PortSignal,
+        ToolCommands,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -1097,6 +1177,7 @@ mod tests {
                     include_optional,
                     json,
                     toml,
+                    suggest,
                 }) => {
                     assert_eq!(crates, vec!["serde"]);
                     assert_eq!(manifest_path, Some(PathBuf::from("Cargo.toml")));
@@ -1106,6 +1187,31 @@ mod tests {
                     assert!(!include_optional);
                     assert!(!json);
                     assert!(toml);
+                    assert!(!suggest);
+                }
+                _ => panic!("unexpected deps command"),
+            },
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn deps_latest_parses_suggest_flag() {
+        let cli =
+            Cli::try_parse_from(["za", "deps", "latest", "reqx", "--suggest"]).expect("must parse");
+        match cli.cmd {
+            Commands::Deps { cmd, .. } => match cmd {
+                Some(DepsCommands::Latest {
+                    crates,
+                    json,
+                    toml,
+                    suggest,
+                    ..
+                }) => {
+                    assert_eq!(crates, vec!["reqx"]);
+                    assert!(!json);
+                    assert!(!toml);
+                    assert!(suggest);
                 }
                 _ => panic!("unexpected deps command"),
             },
@@ -1184,6 +1290,87 @@ mod tests {
     }
 
     #[test]
+    fn port_open_parses_protocol_filters() {
+        let cli = Cli::try_parse_from(["za", "port", "open", "8080", "--udp"]).expect("must parse");
+        match cli.cmd {
+            Commands::Port { cmd } => {
+                assert!(matches!(
+                    cmd,
+                    PortCommands::Open {
+                        port: 8080,
+                        all: false,
+                        tcp: false,
+                        udp: true,
+                    }
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn port_stop_parses_signal_and_dry_run() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "port",
+            "stop",
+            "3000",
+            "--signal",
+            "kill",
+            "--dry-run",
+        ])
+        .expect("must parse");
+        match cli.cmd {
+            Commands::Port { cmd } => {
+                assert!(matches!(
+                    cmd,
+                    PortCommands::Stop {
+                        port: 3000,
+                        signal: PortSignal::Kill,
+                        dry_run: true,
+                        all: false,
+                        tcp: false,
+                        udp: false,
+                    }
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn port_follow_parses_timeout_and_interval() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "port",
+            "follow",
+            "3000",
+            "--timeout-secs",
+            "20",
+            "--interval-ms",
+            "750",
+            "--tcp",
+        ])
+        .expect("must parse");
+        match cli.cmd {
+            Commands::Port { cmd } => {
+                assert!(matches!(
+                    cmd,
+                    PortCommands::Follow {
+                        port: 3000,
+                        timeout_secs: Some(20),
+                        interval_ms: 750,
+                        all: false,
+                        tcp: true,
+                        udp: false,
+                    }
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
     fn gh_ci_inspect_parses_all_and_json_flags() {
         let cli = Cli::try_parse_from(["za", "gh", "ci", "inspect", "--all", "--json"])
             .expect("must parse");
@@ -1200,6 +1387,34 @@ mod tests {
                         ..
                     },
             } => {}
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn gh_ci_list_parses_all_flag() {
+        let cli = Cli::try_parse_from(["za", "gh", "ci", "list", "--group", "work", "--all"])
+            .expect("must parse");
+        match cli.cmd {
+            Commands::Gh {
+                cmd:
+                    GhCommands::Ci {
+                        cmd:
+                            Some(CiCommands::List {
+                                group,
+                                repo,
+                                file,
+                                json: false,
+                                all: true,
+                                github_token: None,
+                            }),
+                        ..
+                    },
+            } => {
+                assert_eq!(group.as_deref(), Some("work"));
+                assert!(repo.is_empty());
+                assert!(file.is_none());
+            }
             _ => panic!("unexpected command"),
         }
     }
@@ -1373,6 +1588,38 @@ mod tests {
             Commands::Gh { cmd } => match cmd {
                 GhCommands::Auth { cmd } => {
                     assert!(matches!(cmd, GitAuthCommands::Status { json: false }));
+                }
+                _ => panic!("unexpected gh command"),
+            },
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn gh_auth_repair_parses_timeout_and_json() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "gh",
+            "auth",
+            "repair",
+            "--remote",
+            "upstream",
+            "--timeout-secs",
+            "30",
+            "--json",
+        ])
+        .expect("must parse");
+        match cli.cmd {
+            Commands::Gh { cmd } => match cmd {
+                GhCommands::Auth { cmd } => {
+                    assert!(matches!(
+                        cmd,
+                        GitAuthCommands::Repair {
+                            remote,
+                            timeout_secs: 30,
+                            json: true,
+                        } if remote == "upstream"
+                    ));
                 }
                 _ => panic!("unexpected gh command"),
             },
