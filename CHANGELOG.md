@@ -1,8 +1,23 @@
+## [0.1.51] - 2026-04-09
+
+### 🚀 Features
+
+- *(cli)* Add completion, deps, tool, port, and ci diagnostics
+- Add dependency, CI, port, and auth diagnostics
+- *(diff)* Add change-kind summaries and kind filters
+
+### 🚜 Refactor
+
+- *(command)* Split ci, deps, and tool into submodules
 ## [0.1.50] - 2026-04-08
 
 ### 🚀 Features
 
 - *(tool)* Add bpftop release policy
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.50
 ## [0.1.49] - 2026-04-03
 
 ### 🚜 Refactor
