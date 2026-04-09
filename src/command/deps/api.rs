@@ -288,7 +288,7 @@ impl ApiClient {
         entry.into_result()
     }
 
-    fn fetch_crate(&self, name: &str) -> Result<CrateSnapshot> {
+    pub(super) fn fetch_crate(&self, name: &str) -> Result<CrateSnapshot> {
         if let Some(snapshot) = self.cache_get_crate(name)? {
             return Ok(snapshot);
         }

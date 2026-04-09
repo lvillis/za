@@ -1,5 +1,6 @@
 //! Tool manager for versioned executables.
 
+mod doctor;
 mod listing;
 mod policy;
 mod source;
@@ -34,6 +35,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use self::doctor::run_doctor;
 use self::listing::{
     LatestCheck, UnmanagedBinary, list_installed, list_outdated, resolve_latest_checks_for_names,
     show_catalog, show_tool,
@@ -445,6 +447,7 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
                 })
             }
         }
+        ToolCommands::Doctor { tools, json } => run_doctor(&home, &tools, json),
         ToolCommands::Uninstall { tool, version } => {
             let home_for_action = home.clone();
             run_mutating_tool_command(&home, scope, move || {

@@ -101,6 +101,7 @@ za tool install cross
 
 za tool ls
 za tool ls --outdated
+za tool doctor
 za tool update codex
 za tool show codex
 za run codex
@@ -127,9 +128,19 @@ za codex stop
 za deps
 za deps --jobs 16
 za deps --fail-on-high
+za deps latest serde regex
+za deps latest --manifest Cargo.toml --toml
 ```
 
-### 5) Manage JetBrains remote IDE sessions
+### 5) Inspect local ports
+
+```bash
+za port ls
+za port who 8080
+za port wait 3000
+```
+
+### 6) Manage JetBrains remote IDE sessions
 
 ```bash
 za ide ps
@@ -143,18 +154,19 @@ za ide stop 42589
 - `ide-max-per-project` (default `1`)
 - `ide-orphan-ttl-minutes` (default `30`)
 
-### 6) Track GitHub Actions
+### 7) Track GitHub Actions
 
 ```bash
 za gh ci
+za gh ci inspect
 za gh ci watch
 za gh ci list --repo lvillis/za --repo lvillis/reqx-rs
 za gh ci list --group work
 ```
 
-`za gh ci` inspects the current repository `HEAD` commit. `za gh ci watch` follows that commit until GitHub Actions reaches a terminal state. `za gh ci list` can read repo groups from `~/.config/za/ci.toml`.
+`za gh ci` inspects the current repository `HEAD` commit. `za gh ci watch` follows that commit until GitHub Actions reaches a terminal state. `za gh ci inspect` drills into failing/cancelled workflows for the current commit. `za gh ci list` can read repo groups from `~/.config/za/ci.toml`.
 
-### 7) Enable GitHub auth for IDE/CLI Git operations
+### 8) Enable GitHub auth for IDE/CLI Git operations
 
 ```bash
 za gh auth enable
@@ -174,10 +186,11 @@ za gh auth test --repo https://github.com/org/repo.git
 | `za diff` | Summarize current Git workspace additions/deletions for review. |
 | `za completion` | Generate shell completion scripts. |
 | `za gen` | Generate project context snapshots (`CONTEXT.md`). |
-| `za tool` | Tool management with `install`, `update`, `ls`, `show`, and `uninstall`. |
+| `za port` | Inspect local TCP/UDP ownership and wait for ports to come up. |
+| `za tool` | Tool management with `install`, `update`, `ls`, `doctor`, `show`, and `uninstall`. |
 | `za run` | Launch a tool directly with normalized proxy environment variables. |
 | `za codex` | Manage long-lived Codex tmux sessions for the current workspace. |
-| `za deps` | Audit Rust dependency governance and maintenance risk. |
+| `za deps` | Audit Rust dependency governance and resolve latest crate versions. |
 | `za gh` | Unified GitHub shortcuts for auth and Actions status. |
 | `za config` | Persist CLI config (`[auth]`, `[proxy]`, `[run]`, `[tool]`, `[update]`). |
 | `za ide` | Inspect and reconcile JetBrains remote IDE server processes. |
@@ -215,6 +228,9 @@ za completion install zsh
 za completion install fish
 za completion install elvish
 za completion install powershell
+za completion status bash
+za completion doctor zsh
+za completion uninstall fish
 ```
 
 `za completion install` now uses `shellcomp` for install and activation management, while preserving `za`'s legacy marker migration for existing users. Bash prefers the system `bash-completion` loader when a loader is detected and falls back to a managed `~/.bashrc` block otherwise; zsh uses a managed `~/.zshrc` block so `fpath` and `compinit` are wired consistently; PowerShell and Elvish now also have managed profile wiring by default.
@@ -224,6 +240,8 @@ Use `--path` when you want a non-default target:
 ```bash
 za completion install powershell --path ~/.config/powershell/completions/za.ps1
 ```
+
+`za completion status` is the quick activation view. `za completion doctor` expands the same state into target path, availability, location/reason/next-step guidance, and any remaining legacy `za` marker. `za completion uninstall` removes the managed script, managed shell wiring, and any legacy `za completion` block that still exists.
 
 ## Tool Management
 
@@ -284,6 +302,7 @@ za tool update codex --dry-run
 
 # inspect the current managed state
 za tool ls
+za tool doctor
 za tool show codex
 za tool show codex --path
 
@@ -322,11 +341,12 @@ za tool uninstall codex
 `za tool install --dry-run` and `za tool update --dry-run` resolve the target version and source policy, preview activation/shell-init changes, and make no filesystem changes.
 
 Multi-tool `za tool install`, `za tool update`, and `za tool sync` default to compact batch output: they show the plan summary plus changed/repaired/failed entries only. Use `--verbose` to expand per-tool `resolve` / `source` / `install` / `activate` / `prune` stages.
+`za tool doctor` is the read-only health check for managed state: it verifies active version pointers, payload presence, manifests, and active paths across all managed tools in the current scope, then highlights anything that needs repair.
 
 `za tool install` and `za tool update` are interruption-safe: pressing `Ctrl+C` aborts cleanly and temporary download directories are removed automatically (stale leftovers are cleaned on next run). Output is stage-oriented (`resolve`, `source`, `install`, `activate`, `prune`) so it is obvious where a run is spending time.
 For large GitHub release assets, `za` will use parallel HTTP range downloads when the upstream supports it, emit explicit `download` / `verify` / `extract` stages, and automatically fall back to a single stream otherwise.
 
-`za deps` defaults to a compact audit view: one verdict line, an `attention` section for high/medium/unknown findings, and a low-risk summary hint. Use `za deps --verbose` to include the low-risk baseline inventory as well.
+`za deps` defaults to a compact audit view: one verdict line, an `attention` section for high/medium/unknown findings, and a low-risk summary hint. Use `za deps --verbose` to include the low-risk baseline inventory as well. `za deps latest` resolves the latest stable crates.io version for explicit crate names or a manifest's direct dependencies, and can emit copy-pastable TOML with `--toml`.
 
 Human-readable commands honor `--color auto|always|never` and `NO_COLOR`, so CI logs and redirected output can stay plain while interactive terminals keep semantic status colors.
 
@@ -348,6 +368,23 @@ Resolution order:
 1. User-scope active managed tool
 2. Global-scope active managed tool
 3. `PATH`
+
+## Local Ports (`za port`)
+
+Use `za port` to inspect local TCP/UDP ownership from `/proc` on Linux:
+
+```bash
+# default listening/bound view
+za port ls
+
+# who owns one port
+za port who 8080
+
+# wait for a service port to come up
+za port wait 3000
+```
+
+`za port ls` keeps the broad table view. `za port who` narrows that same scan to one local port, and `za port wait` polls until a matching listener/bound socket appears, which is useful in scripts and local startup flows.
 
 ### Managed Codex Sessions (`za codex`)
 
@@ -428,6 +465,10 @@ za deps --include-dev --include-build --include-optional
 
 # override workers
 za deps --jobs 12
+
+# resolve latest stable versions from crates.io
+za deps latest serde regex
+za deps latest --manifest Cargo.toml --toml
 ```
 
 Token resolution priority:
@@ -438,11 +479,14 @@ Token resolution priority:
 
 ## GitHub CI (`za gh ci`)
 
-`za gh ci` reports GitHub Actions state for the current repository `HEAD` commit. It aggregates workflow runs for the same `head_sha`, so the first screen answers the question you usually care about after a push: did this commit pass yet? `za gh ci watch` also streams the currently active workflows while a commit is still pending or running.
+`za gh ci` reports GitHub Actions state for the current repository `HEAD` commit. It aggregates workflow runs for the same `head_sha`, so the first screen answers the question you usually care about after a push: did this commit pass yet? `za gh ci watch` also streams the currently active workflows while a commit is still pending or running. `za gh ci inspect` drills into failing/cancelled workflows and shows workflow URLs, job URLs, and attention steps for the current commit.
 
 ```bash
 # current repo HEAD
 za gh ci
+
+# inspect failing/cancelled workflows, jobs, and steps
+za gh ci inspect
 
 # wait until terminal state
 za gh ci watch --timeout-secs 900

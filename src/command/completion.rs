@@ -1,8 +1,10 @@
 use crate::cli::{CompletionCommands, CompletionShell};
+use crate::command::style as tty_style;
 use anyhow::{Context, Result, anyhow};
 use shellcomp::{
-    ActivationMode, ActivationPolicy, Availability, FileChange, InstallReport, InstallRequest,
-    LegacyManagedBlock, MigrateManagedBlocksRequest, Shell as ShellcompShell,
+    ActivationMode, ActivationPolicy, Availability, Error as ShellcompError, FailureReport,
+    FileChange, InstallReport, InstallRequest, LegacyManagedBlock, MigrateManagedBlocksRequest,
+    RemoveReport, Shell as ShellcompShell, UninstallRequest,
 };
 use std::{
     env, fs,
@@ -23,6 +25,9 @@ pub fn run(cmd: CompletionCommands) -> Result<i32> {
         CompletionCommands::Elvish => print_completion(CompletionShell::Elvish),
         CompletionCommands::Powershell => print_completion(CompletionShell::Powershell),
         CompletionCommands::Install { shell, path } => install_completion(shell, path),
+        CompletionCommands::Status { shell, path } => status_completion(shell, path),
+        CompletionCommands::Doctor { shell, path } => doctor_completion(shell, path),
+        CompletionCommands::Uninstall { shell, path } => uninstall_completion(shell, path),
     }
 }
 
@@ -83,10 +88,150 @@ fn install_completion(shell: CompletionShell, path_override: Option<PathBuf>) ->
     Ok(0)
 }
 
+fn status_completion(shell: CompletionShell, path_override: Option<PathBuf>) -> Result<i32> {
+    let report = collect_completion_status(shell, path_override)?;
+    println!(
+        "{} {} completion  {}",
+        completion_badge(report.status_kind),
+        tty_style::header(shell.label()),
+        completion_status_summary(&report)
+    );
+    println!(
+        "{}  {}",
+        tty_style::dim("target"),
+        report.target_path.display()
+    );
+    println!(
+        "{}  {}",
+        tty_style::dim("activation"),
+        activation_mode_label(shell, report.activation.mode)
+    );
+    if let Some(next_step) = &report.activation.next_step {
+        println!("{}  {}", tty_style::dim("next"), next_step);
+    }
+    Ok(0)
+}
+
+fn doctor_completion(shell: CompletionShell, path_override: Option<PathBuf>) -> Result<i32> {
+    let target_path = completion_target_path(shell, path_override.as_deref())?;
+    let legacy = detect_legacy_marker(shell)?;
+    match detect_completion_activation(shell, &target_path, path_override.as_deref()) {
+        Ok(activation) => {
+            let report = build_completion_status_report(shell, target_path, activation, legacy);
+            println!(
+                "{} {} completion doctor  {}",
+                completion_badge(report.status_kind),
+                tty_style::header(shell.label()),
+                completion_status_summary(&report)
+            );
+            println!(
+                "{}  {}",
+                tty_style::dim("target"),
+                report.target_path.display()
+            );
+            println!(
+                "{}  {}",
+                tty_style::dim("file"),
+                if report.target_exists {
+                    "present"
+                } else {
+                    "missing"
+                }
+            );
+            println!(
+                "{}  {}",
+                tty_style::dim("activation"),
+                activation_mode_label(shell, report.activation.mode)
+            );
+            println!(
+                "{}  {}",
+                tty_style::dim("availability"),
+                availability_label(&report.activation, shell)
+            );
+            if let Some(location) = &report.activation.location {
+                println!("{}  {}", tty_style::dim("location"), location.display());
+            }
+            if let Some(reason) = &report.activation.reason {
+                println!("{}  {}", tty_style::dim("reason"), reason);
+            }
+            if let Some(next_step) = &report.activation.next_step {
+                println!("{}  {}", tty_style::dim("next"), next_step);
+            }
+            if let LegacyMarkerPresence::Present(path) = report.legacy {
+                println!(
+                    "{}  previous za-managed {} block still present in {}",
+                    tty_style::warning("legacy"),
+                    shell.label(),
+                    path.display()
+                );
+            }
+        }
+        Err(ShellcompError::Failure(failure)) => {
+            print_completion_failure(shell, &target_path, legacy, &failure);
+        }
+        Err(err) => return Err(err).context("detect completion status"),
+    }
+    Ok(0)
+}
+
+fn uninstall_completion(shell: CompletionShell, path_override: Option<PathBuf>) -> Result<i32> {
+    let custom_path = path_override.is_some();
+    let request = UninstallRequest {
+        shell: shell.into(),
+        program_name: PROGRAM_NAME,
+        path_override,
+    };
+    let report = if custom_path {
+        shellcomp::uninstall_with_policy(request, ActivationPolicy::AutoManaged)
+    } else {
+        shellcomp::uninstall(request)
+    }
+    .context("uninstall completion")?;
+    let legacy_cleanup =
+        cleanup_legacy_markers(shell).context("remove legacy za completion markers")?;
+    print_completion_uninstall_report(shell, &report, legacy_cleanup);
+    Ok(0)
+}
+
 fn render_completion(shell: CompletionShell) -> Result<Vec<u8>> {
     let generator_shell: shellcomp::clap_complete::Shell = shell.into();
     shellcomp::render_clap_completion::<crate::cli::Cli>(generator_shell, PROGRAM_NAME)
         .context("render clap completion")
+}
+
+fn collect_completion_status(
+    shell: CompletionShell,
+    path_override: Option<PathBuf>,
+) -> Result<CompletionStatusReport> {
+    let legacy = detect_legacy_marker(shell)?;
+    let target_path = completion_target_path(shell, path_override.as_deref())?;
+    let activation = detect_completion_activation(shell, &target_path, path_override.as_deref())
+        .context(format!("detect {} completion activation", shell.label()))?;
+    Ok(build_completion_status_report(
+        shell,
+        target_path,
+        activation,
+        legacy,
+    ))
+}
+
+fn completion_target_path(shell: CompletionShell, path_override: Option<&Path>) -> Result<PathBuf> {
+    match path_override {
+        Some(path) => Ok(path.to_path_buf()),
+        None => shellcomp::default_install_path(shell.into(), PROGRAM_NAME)
+            .context("resolve managed completion path"),
+    }
+}
+
+fn detect_completion_activation(
+    shell: CompletionShell,
+    target_path: &Path,
+    path_override: Option<&Path>,
+) -> std::result::Result<shellcomp::ActivationReport, ShellcompError> {
+    match path_override {
+        Some(_) => shellcomp::detect_activation_at_path(shell.into(), PROGRAM_NAME, target_path),
+        None => shellcomp::detect_activation(shell.into(), PROGRAM_NAME),
+    }
 }
 
 fn reconcile_legacy_markers(
@@ -153,6 +298,74 @@ fn reconcile_migrated_legacy_markers(
             ));
         }
     })
+}
+
+fn cleanup_legacy_markers(shell: CompletionShell) -> Result<LegacyCleanupStatus> {
+    let status = match shell {
+        CompletionShell::Bash => {
+            let rc_path = resolve_home()?.join(".bashrc");
+            match remove_managed_block(
+                &rc_path,
+                BASH_COMPLETION_START_MARKER,
+                BASH_COMPLETION_END_MARKER,
+            )? {
+                FileChange::Removed => LegacyCleanupStatus::Removed(shell, rc_path),
+                FileChange::Absent => LegacyCleanupStatus::None,
+                other => {
+                    return Err(anyhow!(
+                        "unexpected bash legacy cleanup result: {}",
+                        file_change_label(other)
+                    ));
+                }
+            }
+        }
+        CompletionShell::Zsh => {
+            let rc_path = resolve_home()?.join(".zshrc");
+            match remove_managed_block(
+                &rc_path,
+                ZSH_COMPLETION_START_MARKER,
+                ZSH_COMPLETION_END_MARKER,
+            )? {
+                FileChange::Removed => LegacyCleanupStatus::Removed(shell, rc_path),
+                FileChange::Absent => LegacyCleanupStatus::None,
+                other => {
+                    return Err(anyhow!(
+                        "unexpected zsh legacy cleanup result: {}",
+                        file_change_label(other)
+                    ));
+                }
+            }
+        }
+        CompletionShell::Fish | CompletionShell::Elvish | CompletionShell::Powershell => {
+            LegacyCleanupStatus::None
+        }
+    };
+    Ok(status)
+}
+
+fn detect_legacy_marker(shell: CompletionShell) -> Result<LegacyMarkerPresence> {
+    let (path, start_marker) = match shell {
+        CompletionShell::Bash => (
+            resolve_home()?.join(".bashrc"),
+            BASH_COMPLETION_START_MARKER,
+        ),
+        CompletionShell::Zsh => (resolve_home()?.join(".zshrc"), ZSH_COMPLETION_START_MARKER),
+        CompletionShell::Fish | CompletionShell::Elvish | CompletionShell::Powershell => {
+            return Ok(LegacyMarkerPresence::NotApplicable);
+        }
+    };
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LegacyMarkerPresence::Absent);
+        }
+        Err(err) => return Err(err).with_context(|| format!("read `{}`", path.display())),
+    };
+    if raw.contains(start_marker) {
+        Ok(LegacyMarkerPresence::Present(path))
+    } else {
+        Ok(LegacyMarkerPresence::Absent)
+    }
 }
 
 fn legacy_managed_blocks(shell: CompletionShell) -> Vec<LegacyManagedBlock> {
@@ -256,6 +469,161 @@ fn file_change_label(change: FileChange) -> &'static str {
     }
 }
 
+fn completion_status_summary(report: &CompletionStatusReport) -> String {
+    if !report.target_exists {
+        return "managed script missing".to_string();
+    }
+    availability_label(&report.activation, report.shell)
+}
+
+fn completion_badge(kind: CompletionStatusKind) -> String {
+    let label = format!("{:<5}", kind.label());
+    match kind {
+        CompletionStatusKind::Healthy => tty_style::success(label),
+        CompletionStatusKind::Attention => tty_style::warning(label),
+        CompletionStatusKind::Broken => tty_style::error(label),
+    }
+}
+
+fn build_completion_status_report(
+    shell: CompletionShell,
+    target_path: PathBuf,
+    activation: shellcomp::ActivationReport,
+    legacy: LegacyMarkerPresence,
+) -> CompletionStatusReport {
+    let target_exists = target_path.exists();
+    let status_kind = if !target_exists {
+        CompletionStatusKind::Broken
+    } else if matches!(
+        activation.availability,
+        Availability::ManualActionRequired
+            | Availability::Unknown
+            | Availability::AvailableAfterSource
+    ) || matches!(legacy, LegacyMarkerPresence::Present(_))
+    {
+        CompletionStatusKind::Attention
+    } else {
+        CompletionStatusKind::Healthy
+    };
+    CompletionStatusReport {
+        shell,
+        target_path,
+        target_exists,
+        activation,
+        legacy,
+        status_kind,
+    }
+}
+
+fn print_completion_failure(
+    shell: CompletionShell,
+    target_path: &Path,
+    legacy: LegacyMarkerPresence,
+    failure: &FailureReport,
+) {
+    println!(
+        "{} {} completion doctor  {}",
+        tty_style::error(format!("{:<5}", "FAIL")),
+        tty_style::header(shell.label()),
+        failure_kind_label(failure.kind)
+    );
+    println!("{}  {}", tty_style::dim("target"), target_path.display());
+    println!("{}  {}", tty_style::dim("reason"), failure.reason);
+    if let Some(next_step) = &failure.next_step {
+        println!("{}  {}", tty_style::dim("next"), next_step);
+    }
+    if let Some(location) = &failure.target_path {
+        println!("{}  {}", tty_style::dim("failure-path"), location.display());
+    }
+    if let Some(activation) = &failure.activation {
+        println!(
+            "{}  {}",
+            tty_style::dim("fallback"),
+            availability_label(activation, shell)
+        );
+    }
+    if let LegacyMarkerPresence::Present(path) = legacy {
+        println!(
+            "{}  previous za-managed {} block still present in {}",
+            tty_style::warning("legacy"),
+            shell.label(),
+            path.display()
+        );
+    }
+}
+
+fn print_completion_uninstall_report(
+    shell: CompletionShell,
+    report: &RemoveReport,
+    legacy_cleanup: LegacyCleanupStatus,
+) {
+    println!(
+        "{} removed {} completion: {}",
+        tty_style::success(format!("{:<5}", "DONE")),
+        shell.label(),
+        report.target_path.display()
+    );
+    println!(
+        "{}  completion file {}",
+        tty_style::dim("status"),
+        file_change_label(report.file_change)
+    );
+    println!(
+        "{}  {} {}",
+        tty_style::dim("cleanup"),
+        file_change_label(report.cleanup.change),
+        cleanup_mode_label(shell, report.cleanup.mode)
+    );
+    if let Some(location) = &report.cleanup.location {
+        println!("{}  {}", tty_style::dim("location"), location.display());
+    }
+    if let Some(reason) = &report.cleanup.reason {
+        println!("{}  {}", tty_style::dim("reason"), reason);
+    }
+    if let Some(next_step) = &report.cleanup.next_step {
+        println!("{}  {}", tty_style::dim("next"), next_step);
+    }
+    if let LegacyCleanupStatus::Removed(legacy_shell, location) = legacy_cleanup {
+        println!(
+            "{}  removed previous za-managed {} block from {}",
+            tty_style::warning("legacy"),
+            legacy_shell.label(),
+            location.display()
+        );
+    }
+}
+
+fn cleanup_mode_label(shell: CompletionShell, mode: ActivationMode) -> &'static str {
+    match mode {
+        ActivationMode::SystemLoader => match shell {
+            CompletionShell::Bash => "system bash-completion wiring",
+            _ => "system shell completion wiring",
+        },
+        ActivationMode::ManagedRcBlock => match shell {
+            CompletionShell::Bash => "managed bash rc block",
+            CompletionShell::Zsh => "managed zsh rc block",
+            CompletionShell::Elvish => "managed elvish rc block",
+            CompletionShell::Powershell => "managed powershell profile block",
+            CompletionShell::Fish => "managed shell startup block",
+        },
+        ActivationMode::NativeDirectory => "native completion directory",
+        ActivationMode::Manual => "manual activation state",
+    }
+}
+
+fn failure_kind_label(kind: shellcomp::FailureKind) -> &'static str {
+    match kind {
+        shellcomp::FailureKind::MissingHome => "home directory unavailable",
+        shellcomp::FailureKind::UnsupportedShell => "unsupported shell",
+        shellcomp::FailureKind::InvalidTargetPath => "invalid completion path",
+        shellcomp::FailureKind::DefaultPathUnavailable => "managed path unavailable",
+        shellcomp::FailureKind::CompletionTargetUnavailable => "completion target unavailable",
+        shellcomp::FailureKind::CompletionFileUnreadable => "completion file unreadable",
+        shellcomp::FailureKind::ProfileUnavailable => "shell profile unavailable",
+        shellcomp::FailureKind::ProfileCorrupted => "managed shell profile is corrupted",
+    }
+}
+
 fn legacy_status_suffix(status: LegacyMarkerStatus) -> String {
     match status {
         LegacyMarkerStatus::None => String::new(),
@@ -309,6 +677,45 @@ enum LegacyMarkerStatus {
     None,
     CleanedPreviousBashBlock,
     MigratedLegacyBlock(CompletionShell),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LegacyMarkerPresence {
+    Present(PathBuf),
+    Absent,
+    NotApplicable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LegacyCleanupStatus {
+    None,
+    Removed(CompletionShell, PathBuf),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionStatusKind {
+    Healthy,
+    Attention,
+    Broken,
+}
+
+impl CompletionStatusKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Healthy => "OK",
+            Self::Attention => "WARN",
+            Self::Broken => "FAIL",
+        }
+    }
+}
+
+struct CompletionStatusReport {
+    shell: CompletionShell,
+    target_path: PathBuf,
+    target_exists: bool,
+    activation: shellcomp::ActivationReport,
+    legacy: LegacyMarkerPresence,
+    status_kind: CompletionStatusKind,
 }
 
 #[cfg(test)]

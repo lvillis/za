@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 /// Top-level CLI parser
@@ -67,33 +67,10 @@ pub enum Commands {
     },
     /// Audit Rust dependency risk and maintenance signals
     Deps {
-        /// Optional path to Cargo.toml (defaults to current workspace root).
-        #[arg(long, value_name = "PATH")]
-        manifest_path: Option<PathBuf>,
-        /// Optional GitHub token override for this run.
-        #[arg(long, value_name = "TOKEN")]
-        github_token: Option<String>,
-        /// Number of concurrent workers for API queries (default: auto, based on CPU count).
-        #[arg(long, value_name = "JOBS")]
-        jobs: Option<usize>,
-        /// Include dev-dependencies in audit.
-        #[arg(long)]
-        include_dev: bool,
-        /// Include build-dependencies in audit.
-        #[arg(long)]
-        include_build: bool,
-        /// Also include optional dependencies that are not active in the current resolved feature set.
-        #[arg(long)]
-        include_optional: bool,
-        /// Write full audit report to JSON.
-        #[arg(long, value_name = "PATH")]
-        json: Option<PathBuf>,
-        /// Exit with non-zero status when any high-risk dependency is found.
-        #[arg(long)]
-        fail_on_high: bool,
-        /// Print low-risk entries in addition to attention items.
-        #[arg(long)]
-        verbose: bool,
+        #[command(flatten)]
+        audit: DepsAuditArgs,
+        #[command(subcommand)]
+        cmd: Option<DepsCommands>,
     },
     /// Inspect local TCP/UDP port bindings
     Port {
@@ -175,6 +152,14 @@ pub enum ToolCommands {
         /// Print per-tool resolution and stage details.
         #[arg(long)]
         verbose: bool,
+    },
+    /// Diagnose managed tool state and repair hints
+    Doctor {
+        /// Tool names. Omit to inspect all managed tools in this scope.
+        tools: Vec<String>,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
     },
     /// List managed tools and availability in this scope
     #[command(name = "ls", alias = "list")]
@@ -308,6 +293,43 @@ pub enum PortCommands {
         #[arg(long)]
         udp: bool,
     },
+    /// Show who currently owns a local port
+    Who {
+        /// Local port to inspect.
+        port: u16,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+        /// Include connected and non-listening sockets, not just listening/bound ports.
+        #[arg(long)]
+        all: bool,
+        /// Only include TCP sockets.
+        #[arg(long)]
+        tcp: bool,
+        /// Only include UDP sockets.
+        #[arg(long)]
+        udp: bool,
+    },
+    /// Wait until a local port becomes available
+    Wait {
+        /// Local port to wait for.
+        port: u16,
+        /// Stop waiting after this many seconds.
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+        /// Poll interval in milliseconds.
+        #[arg(long, default_value_t = 500)]
+        interval_ms: u64,
+        /// Include connected and non-listening sockets, not just listening/bound ports.
+        #[arg(long)]
+        all: bool,
+        /// Only include TCP sockets.
+        #[arg(long)]
+        tcp: bool,
+        /// Only include UDP sockets.
+        #[arg(long)]
+        udp: bool,
+    },
 }
 
 /// `za completion` sub-commands
@@ -330,6 +352,92 @@ pub enum CompletionCommands {
         /// Override the install path instead of using the default shell-specific location.
         #[arg(long, value_name = "PATH")]
         path: Option<PathBuf>,
+    },
+    /// Show current completion activation status
+    Status {
+        #[arg(value_enum)]
+        shell: CompletionShell,
+        /// Inspect an explicit completion path instead of the shell-managed default path.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+    /// Diagnose completion wiring and next steps
+    Doctor {
+        #[arg(value_enum)]
+        shell: CompletionShell,
+        /// Inspect an explicit completion path instead of the shell-managed default path.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+    /// Remove a previously installed completion script and managed wiring
+    Uninstall {
+        #[arg(value_enum)]
+        shell: CompletionShell,
+        /// Remove an explicit completion path instead of the shell-managed default path.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Args, Clone, Debug, Default)]
+pub struct DepsAuditArgs {
+    /// Optional path to Cargo.toml (defaults to current workspace root).
+    #[arg(long, value_name = "PATH")]
+    pub manifest_path: Option<PathBuf>,
+    /// Optional GitHub token override for this run.
+    #[arg(long, value_name = "TOKEN")]
+    pub github_token: Option<String>,
+    /// Number of concurrent workers for API queries (default: auto, based on CPU count).
+    #[arg(long, value_name = "JOBS")]
+    pub jobs: Option<usize>,
+    /// Include dev-dependencies in audit.
+    #[arg(long)]
+    pub include_dev: bool,
+    /// Include build-dependencies in audit.
+    #[arg(long)]
+    pub include_build: bool,
+    /// Also include optional dependencies that are not active in the current resolved feature set.
+    #[arg(long)]
+    pub include_optional: bool,
+    /// Write full audit report to JSON.
+    #[arg(long, value_name = "PATH")]
+    pub json: Option<PathBuf>,
+    /// Exit with non-zero status when any high-risk dependency is found.
+    #[arg(long)]
+    pub fail_on_high: bool,
+    /// Print low-risk entries in addition to attention items.
+    #[arg(long)]
+    pub verbose: bool,
+}
+
+#[derive(Subcommand)]
+pub enum DepsCommands {
+    /// Resolve latest stable versions for one or more crates
+    Latest {
+        /// Crate names to resolve. Omit only when `--manifest-path` is used.
+        #[arg(value_name = "CRATE")]
+        crates: Vec<String>,
+        /// Optional path to Cargo.toml used to source crate names.
+        #[arg(long, alias = "manifest", value_name = "PATH")]
+        manifest_path: Option<PathBuf>,
+        /// Number of concurrent workers for API queries (default: auto, based on CPU count).
+        #[arg(long, value_name = "JOBS")]
+        jobs: Option<usize>,
+        /// Include dev-dependencies when `--manifest-path` is used.
+        #[arg(long)]
+        include_dev: bool,
+        /// Include build-dependencies when `--manifest-path` is used.
+        #[arg(long)]
+        include_build: bool,
+        /// Also include optional dependencies when `--manifest-path` is used.
+        #[arg(long)]
+        include_optional: bool,
+        /// Print JSON output for scripting.
+        #[arg(long, conflicts_with = "toml")]
+        json: bool,
+        /// Print copy-pastable TOML dependency entries.
+        #[arg(long, conflicts_with = "json")]
+        toml: bool,
     },
 }
 
@@ -500,6 +608,18 @@ pub enum CiCommands {
         #[arg(long, value_name = "TOKEN")]
         github_token: Option<String>,
     },
+    /// Drill into failing workflows, jobs, and steps for the current commit
+    Inspect {
+        /// Include successful and skipped workflows instead of only failed/cancelled ones.
+        #[arg(long)]
+        all: bool,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+        /// Optional GitHub token override for this run.
+        #[arg(long, value_name = "TOKEN")]
+        github_token: Option<String>,
+    },
 }
 
 /// `za gh` sub-commands
@@ -620,7 +740,7 @@ pub enum DiffRiskFilter {
 mod tests {
     use super::{
         CiCommands, Cli, CodexCommands, ColorWhen, Commands, CompletionCommands, CompletionShell,
-        DiffRiskFilter, GhCommands, GitAuthCommands, PortCommands, ToolCommands,
+        DepsCommands, DiffRiskFilter, GhCommands, GitAuthCommands, PortCommands, ToolCommands,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -938,27 +1058,148 @@ mod tests {
     fn deps_parses_verbose_flag() {
         let cli = Cli::try_parse_from(["za", "deps", "--verbose"]).expect("must parse");
         match cli.cmd {
-            Commands::Deps {
-                manifest_path,
-                github_token,
-                jobs,
-                include_dev,
-                include_build,
-                include_optional,
-                json,
-                fail_on_high,
-                verbose,
-            } => {
-                assert!(manifest_path.is_none());
-                assert!(github_token.is_none());
-                assert!(jobs.is_none());
-                assert!(!include_dev);
-                assert!(!include_build);
-                assert!(!include_optional);
-                assert!(json.is_none());
-                assert!(!fail_on_high);
-                assert!(verbose);
+            Commands::Deps { audit, cmd } => {
+                assert!(cmd.is_none());
+                assert!(audit.manifest_path.is_none());
+                assert!(audit.github_token.is_none());
+                assert!(audit.jobs.is_none());
+                assert!(!audit.include_dev);
+                assert!(!audit.include_build);
+                assert!(!audit.include_optional);
+                assert!(audit.json.is_none());
+                assert!(!audit.fail_on_high);
+                assert!(audit.verbose);
             }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn deps_latest_parses_manifest_and_toml_flags() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "deps",
+            "latest",
+            "serde",
+            "--manifest",
+            "Cargo.toml",
+            "--toml",
+        ])
+        .expect("must parse");
+        match cli.cmd {
+            Commands::Deps { cmd, .. } => match cmd {
+                Some(DepsCommands::Latest {
+                    crates,
+                    manifest_path,
+                    jobs,
+                    include_dev,
+                    include_build,
+                    include_optional,
+                    json,
+                    toml,
+                }) => {
+                    assert_eq!(crates, vec!["serde"]);
+                    assert_eq!(manifest_path, Some(PathBuf::from("Cargo.toml")));
+                    assert!(jobs.is_none());
+                    assert!(!include_dev);
+                    assert!(!include_build);
+                    assert!(!include_optional);
+                    assert!(!json);
+                    assert!(toml);
+                }
+                _ => panic!("unexpected deps command"),
+            },
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn completion_status_parses_shell_and_path() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "completion",
+            "status",
+            "bash",
+            "--path",
+            "/tmp/za.bash",
+        ])
+        .expect("must parse");
+        match cli.cmd {
+            Commands::Completion { cmd } => match cmd {
+                CompletionCommands::Status { shell, path } => {
+                    assert_eq!(shell, CompletionShell::Bash);
+                    assert_eq!(path, Some(PathBuf::from("/tmp/za.bash")));
+                }
+                _ => panic!("unexpected completion command"),
+            },
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn tool_doctor_parses_json_flag() {
+        let cli =
+            Cli::try_parse_from(["za", "tool", "doctor", "codex", "--json"]).expect("must parse");
+        match cli.cmd {
+            Commands::Tool { cmd, .. } => {
+                assert!(matches!(
+                    cmd,
+                    ToolCommands::Doctor { tools, json: true } if tools == vec!["codex"]
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn port_wait_parses_timeout_and_interval() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "port",
+            "wait",
+            "3000",
+            "--timeout-secs",
+            "12",
+            "--interval-ms",
+            "250",
+            "--tcp",
+        ])
+        .expect("must parse");
+        match cli.cmd {
+            Commands::Port { cmd } => {
+                assert!(matches!(
+                    cmd,
+                    PortCommands::Wait {
+                        port: 3000,
+                        timeout_secs: 12,
+                        interval_ms: 250,
+                        all: false,
+                        tcp: true,
+                        udp: false,
+                    }
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn gh_ci_inspect_parses_all_and_json_flags() {
+        let cli = Cli::try_parse_from(["za", "gh", "ci", "inspect", "--all", "--json"])
+            .expect("must parse");
+        match cli.cmd {
+            Commands::Gh {
+                cmd:
+                    GhCommands::Ci {
+                        cmd:
+                            Some(CiCommands::Inspect {
+                                all: true,
+                                json: true,
+                                github_token: None,
+                            }),
+                        ..
+                    },
+            } => {}
             _ => panic!("unexpected command"),
         }
     }

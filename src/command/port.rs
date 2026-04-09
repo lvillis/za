@@ -6,11 +6,14 @@ use std::{
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
+    thread,
+    time::{Duration, Instant},
 };
 
 const PROC_ROOT: &str = "/proc";
 const PROC_NET_ROOT: &str = "/proc/net";
 const PORT_REPORT_SCHEMA_VERSION: u8 = 1;
+const PORT_WAIT_TIMEOUT_EXIT: i32 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PortTransport {
@@ -157,6 +160,42 @@ pub fn run(cmd: PortCommands) -> Result<i32> {
             include_tcp: tcp || !udp,
             include_udp: udp || !tcp,
         }),
+        PortCommands::Who {
+            port,
+            json,
+            all,
+            tcp,
+            udp,
+        } => run_who(PortLsOptions {
+            json,
+            all,
+            ports: [port].into_iter().collect(),
+            pids: BTreeSet::new(),
+            protocol_filter_requested: tcp || udp,
+            include_tcp: tcp || !udp,
+            include_udp: udp || !tcp,
+        }),
+        PortCommands::Wait {
+            port,
+            timeout_secs,
+            interval_ms,
+            all,
+            tcp,
+            udp,
+        } => run_wait(
+            port,
+            timeout_secs,
+            interval_ms,
+            PortLsOptions {
+                json: false,
+                all,
+                ports: [port].into_iter().collect(),
+                pids: BTreeSet::new(),
+                protocol_filter_requested: tcp || udp,
+                include_tcp: tcp || !udp,
+                include_udp: udp || !tcp,
+            },
+        ),
     }
 }
 
@@ -171,6 +210,69 @@ fn run_ls(options: PortLsOptions) -> Result<i32> {
         print!("{}", render_port_report(&report));
     }
     Ok(0)
+}
+
+fn run_who(options: PortLsOptions) -> Result<i32> {
+    let report = collect_port_report(&options)?;
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("serialize port who output")?
+        );
+    } else if report.rows.is_empty() {
+        let port = options
+            .ports
+            .iter()
+            .next()
+            .copied()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!("No owning process found for local port {port}.");
+        if let Some(filter_line) = render_filter_summary(&report) {
+            println!("{filter_line}");
+        }
+        if report.rows_hidden_by_pid_filter_due_to_owner_visibility > 0 {
+            println!("{}", render_pid_filter_visibility_hint(&report));
+        }
+    } else {
+        print!("{}", render_port_report(&report));
+    }
+    Ok(0)
+}
+
+fn run_wait(port: u16, timeout_secs: u64, interval_ms: u64, options: PortLsOptions) -> Result<i32> {
+    let started = Instant::now();
+    let interval = Duration::from_millis(interval_ms.max(100));
+    println!(
+        "Waiting for local port {port}{}...",
+        if options.all {
+            " (including connected sockets)"
+        } else {
+            ""
+        }
+    );
+
+    loop {
+        let report = collect_port_report(&options)?;
+        if !report.rows.is_empty() {
+            println!(
+                "Port {port} became available after {}.",
+                format_duration_short(started.elapsed())
+            );
+            print!("{}", render_port_report(&report));
+            return Ok(0);
+        }
+
+        if started.elapsed() >= Duration::from_secs(timeout_secs) {
+            println!(
+                "Timed out after {} waiting for local port {port}.",
+                format_duration_short(started.elapsed())
+            );
+            return Ok(PORT_WAIT_TIMEOUT_EXIT);
+        }
+
+        thread::sleep(interval);
+    }
 }
 
 fn collect_port_report(options: &PortLsOptions) -> Result<PortReport> {
@@ -504,6 +606,20 @@ fn format_socket_endpoint(endpoint: &SocketEndpoint) -> String {
         IpAddr::V6(_) if host == "*" => format!("*:{}", endpoint.port),
         IpAddr::V6(_) => format!("[{host}]:{}", endpoint.port),
     }
+}
+
+fn format_duration_short(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    if secs < 3_600 {
+        return format!("{}m", secs / 60);
+    }
+    if secs < 86_400 {
+        return format!("{}h", secs / 3_600);
+    }
+    format!("{}d", secs / 86_400)
 }
 
 fn render_port_report(report: &PortReport) -> String {

@@ -48,6 +48,11 @@ pub fn run(cmd: Option<CiCommands>, json: bool, github_token: Option<String>) ->
             json,
             github_token,
         }) => run_list(group, repo, file, json, github_token),
+        Some(CiCommands::Inspect {
+            all,
+            json,
+            github_token,
+        }) => run_inspect(all, json, github_token),
     }
 }
 
@@ -148,6 +153,37 @@ struct WorkflowRunReport {
     run_attempt: Option<u64>,
     updated_at: Option<String>,
     html_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkflowJobReport {
+    id: u64,
+    name: String,
+    state: CiState,
+    status: Option<String>,
+    conclusion: Option<String>,
+    html_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attention_steps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkflowInspectReport {
+    run: WorkflowRunReport,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    jobs: Vec<WorkflowJobReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_query_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CommitCiInspectReport {
+    repo: String,
+    sha: Option<String>,
+    selected_all_runs: bool,
+    state: CiState,
+    summary: CiSummary,
+    workflows: Vec<WorkflowInspectReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -264,6 +300,12 @@ struct WorkflowRunsResponse {
     workflow_runs: Vec<GitHubWorkflowRun>,
 }
 
+#[derive(Deserialize)]
+struct WorkflowJobsResponse {
+    #[serde(default)]
+    jobs: Vec<GitHubWorkflowJob>,
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubWorkflowRun {
     id: u64,
@@ -278,6 +320,24 @@ struct GitHubWorkflowRun {
     run_attempt: Option<u64>,
     updated_at: Option<String>,
     html_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubWorkflowJob {
+    id: u64,
+    name: Option<String>,
+    status: Option<String>,
+    conclusion: Option<String>,
+    html_url: Option<String>,
+    #[serde(default)]
+    steps: Vec<GitHubWorkflowJobStep>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubWorkflowJobStep {
+    name: Option<String>,
+    status: Option<String>,
+    conclusion: Option<String>,
 }
 
 struct GitHubClient {
@@ -380,6 +440,22 @@ impl GitHubClient {
                 )
             })
             .map(|resp: WorkflowRunsResponse| resp.workflow_runs)
+    }
+
+    fn fetch_workflow_jobs(&self, slug: &RepoSlug, run_id: u64) -> Result<Vec<GitHubWorkflowJob>> {
+        let path = format!(
+            "/repos/{}/{}/actions/runs/{run_id}/jobs?per_page=100",
+            slug.owner, slug.repo
+        );
+        self.api_get_json(&path)
+            .with_context(|| {
+                format!(
+                    "query GitHub Actions jobs for {} run {}",
+                    slug.as_str(),
+                    run_id
+                )
+            })
+            .map(|resp: WorkflowJobsResponse| resp.jobs)
     }
 
     fn api_get_json<T>(&self, path: &str) -> Result<T>
@@ -558,6 +634,33 @@ fn run_list(
     Ok(exit_code_for_board(&out))
 }
 
+fn run_inspect(all: bool, json: bool, github_token: Option<String>) -> Result<i32> {
+    let client = GitHubClient::new(github_token)?;
+    let cwd = env::current_dir()?;
+    let ctx = resolve_local_repo_context(&cwd)?;
+    let report = client.fetch_commit_report_for_sha(
+        &ctx.slug,
+        ctx.branch.clone(),
+        Some(ctx.sha.clone()),
+        CiSourceKind::CurrentRepo,
+        Some(ctx.repo_path.display().to_string()),
+    )?;
+    let inspect = build_inspect_report(&client, &ctx.slug, &report, all);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&inspect).context("serialize ci inspect output")?
+        );
+        return Ok(exit_code_for_state(report.state));
+    }
+
+    for line in render_inspect_report_lines(&inspect) {
+        println!("{line}");
+    }
+    Ok(exit_code_for_state(report.state))
+}
+
 fn resolve_list_targets(
     group: Option<String>,
     repos: Vec<String>,
@@ -678,6 +781,58 @@ fn build_commit_report(
     }
 }
 
+fn build_inspect_report(
+    client: &GitHubClient,
+    slug: &RepoSlug,
+    report: &CommitCiReport,
+    all: bool,
+) -> CommitCiInspectReport {
+    let selected_runs = report
+        .runs
+        .iter()
+        .filter(|run| all || matches!(run.state, CiState::Failed | CiState::Cancelled))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut workflows = Vec::with_capacity(selected_runs.len());
+
+    for run in selected_runs {
+        match client.fetch_workflow_jobs(slug, run.id) {
+            Ok(jobs) => workflows.push(WorkflowInspectReport {
+                run,
+                jobs: jobs
+                    .into_iter()
+                    .map(workflow_job_report)
+                    .filter(|job| {
+                        all || !job.state.is_terminal()
+                            || matches!(job.state, CiState::Failed | CiState::Cancelled)
+                    })
+                    .collect(),
+                job_query_error: None,
+            }),
+            Err(err) => workflows.push(WorkflowInspectReport {
+                run,
+                jobs: Vec::new(),
+                job_query_error: Some(err.to_string()),
+            }),
+        }
+    }
+
+    workflows.sort_by(|a, b| {
+        review_detail_priority(a.run.state)
+            .cmp(&review_detail_priority(b.run.state))
+            .then_with(|| a.run.name.cmp(&b.run.name))
+    });
+
+    CommitCiInspectReport {
+        repo: report.repo.clone(),
+        sha: report.sha.clone(),
+        selected_all_runs: all,
+        state: report.state,
+        summary: report.summary.clone(),
+        workflows,
+    }
+}
+
 fn workflow_run_report(run: GitHubWorkflowRun) -> WorkflowRunReport {
     WorkflowRunReport {
         id: run.id,
@@ -691,6 +846,28 @@ fn workflow_run_report(run: GitHubWorkflowRun) -> WorkflowRunReport {
         run_attempt: run.run_attempt,
         updated_at: normalize_owned(run.updated_at),
         html_url: normalize_owned(run.html_url),
+    }
+}
+
+fn workflow_job_report(job: GitHubWorkflowJob) -> WorkflowJobReport {
+    let state = workflow_run_state(job.status.as_deref(), job.conclusion.as_deref());
+    WorkflowJobReport {
+        id: job.id,
+        name: normalize_owned(job.name).unwrap_or_else(|| format!("job-{}", job.id)),
+        state,
+        status: normalize_owned(job.status),
+        conclusion: normalize_owned(job.conclusion),
+        html_url: normalize_owned(job.html_url),
+        attention_steps: job
+            .steps
+            .into_iter()
+            .filter_map(|step| {
+                let state = workflow_run_state(step.status.as_deref(), step.conclusion.as_deref());
+                (!matches!(state, CiState::Success | CiState::Skipped))
+                    .then(|| normalize_owned(step.name))
+                    .flatten()
+            })
+            .collect(),
     }
 }
 
@@ -928,6 +1105,14 @@ fn render_commit_report_lines(report: &CommitCiReport) -> Vec<String> {
     for run in ordered_review_runs(&report.runs) {
         lines.push(render_run_detail_line(run, report));
     }
+    if report
+        .runs
+        .iter()
+        .any(|run| matches!(run.state, CiState::Failed | CiState::Cancelled))
+    {
+        lines.push(String::new());
+        lines.push(tty_style::dim("inspect failures with `za gh ci inspect`"));
+    }
 
     lines
 }
@@ -1031,6 +1216,91 @@ fn render_watch_update_lines(report: &CommitCiReport) -> Vec<String> {
             if hidden_runs == 1 { "" } else { "s" }
         ));
     }
+    lines
+}
+
+fn render_inspect_report_lines(report: &CommitCiInspectReport) -> Vec<String> {
+    let sha = report
+        .sha
+        .as_deref()
+        .map(short_sha)
+        .unwrap_or_else(|| "-".to_string());
+    let selected = report.workflows.len();
+    let mut lines = vec![format!(
+        "{} {}  {}  {} {}",
+        style_ci_badge(report.state, 5),
+        tty_style::header(&report.repo),
+        tty_style::dim(sha),
+        tty_style::header(selected.to_string()),
+        tty_style::dim(if selected == 1 {
+            "workflow inspected"
+        } else {
+            "workflows inspected"
+        })
+    )];
+
+    if report.workflows.is_empty() {
+        lines.push(tty_style::dim(if report.selected_all_runs {
+            "No workflows matched for this commit."
+        } else {
+            "No failed or cancelled workflows for this commit."
+        }));
+        return lines;
+    }
+
+    lines.push(tty_style::header("inspect"));
+    for workflow in &report.workflows {
+        lines.push(format!(
+            "  {} {}",
+            style_ci_badge(workflow.run.state, 5),
+            style_ci_subject(&truncate_end(&workflow.run.name, 92), workflow.run.state)
+        ));
+        if let Some(url) = &workflow.run.html_url {
+            lines.push(format!(
+                "    {} {}",
+                tty_style::dim("url"),
+                tty_style::dim(url)
+            ));
+        }
+        if let Some(err) = &workflow.job_query_error {
+            lines.push(format!(
+                "    {} {}",
+                tty_style::warning("jobs"),
+                truncate_end(err, 120)
+            ));
+            continue;
+        }
+        if workflow.jobs.is_empty() {
+            lines.push(format!(
+                "    {} {}",
+                tty_style::dim("jobs"),
+                tty_style::dim("no matching jobs")
+            ));
+            continue;
+        }
+        for job in &workflow.jobs {
+            lines.push(format!(
+                "    {} {}",
+                style_ci_badge(job.state, 5),
+                style_ci_subject(&truncate_end(&job.name, 88), job.state)
+            ));
+            if let Some(url) = &job.html_url {
+                lines.push(format!(
+                    "      {} {}",
+                    tty_style::dim("url"),
+                    tty_style::dim(url)
+                ));
+            }
+            for step in &job.attention_steps {
+                lines.push(format!(
+                    "      {} {}",
+                    tty_style::dim("step"),
+                    truncate_end(step, 96)
+                ));
+            }
+        }
+    }
+
     lines
 }
 
@@ -1494,9 +1764,10 @@ fn split_no_proxy_rules(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CiManifest, CiSourceKind, CiState, CommitCiReport, WorkflowRunReport,
-        aggregate_commit_state, latest_head_sha, parse_owner_repo, parse_repo_slug,
-        render_board_output_lines, render_commit_report_lines, render_watch_update_lines,
+        CiManifest, CiSourceKind, CiState, CommitCiInspectReport, CommitCiReport,
+        WorkflowInspectReport, WorkflowJobReport, WorkflowRunReport, aggregate_commit_state,
+        latest_head_sha, parse_owner_repo, parse_repo_slug, render_board_output_lines,
+        render_commit_report_lines, render_inspect_report_lines, render_watch_update_lines,
         workflow_run_state,
     };
 
@@ -1912,5 +2183,53 @@ repos = ["openai/codex", "/code/za"]
         assert!(lines[1].contains("FAIL"));
         assert!(lines.iter().any(|line| line.contains("lvillis/za")));
         assert!(lines.iter().any(|line| line.contains("ERR")));
+    }
+
+    #[test]
+    fn render_inspect_report_lines_show_workflow_jobs_and_steps() {
+        let report = CommitCiInspectReport {
+            repo: "lvillis/za".to_string(),
+            sha: Some("15ff429123456789".to_string()),
+            selected_all_runs: false,
+            state: CiState::Failed,
+            summary: super::CiSummary {
+                failed: 1,
+                ..Default::default()
+            },
+            workflows: vec![WorkflowInspectReport {
+                run: WorkflowRunReport {
+                    id: 1,
+                    name: "build-linux-musl".to_string(),
+                    event: Some("push".to_string()),
+                    state: CiState::Failed,
+                    status: Some("completed".to_string()),
+                    conclusion: Some("failure".to_string()),
+                    run_attempt: Some(1),
+                    updated_at: Some("2026-03-09T00:00:00Z".to_string()),
+                    html_url: Some("https://github.com/lvillis/za/actions/runs/1".to_string()),
+                },
+                jobs: vec![WorkflowJobReport {
+                    id: 11,
+                    name: "cargo-test".to_string(),
+                    state: CiState::Failed,
+                    status: Some("completed".to_string()),
+                    conclusion: Some("failure".to_string()),
+                    html_url: Some(
+                        "https://github.com/lvillis/za/actions/runs/1/job/11".to_string(),
+                    ),
+                    attention_steps: vec!["cargo test".to_string()],
+                }],
+                job_query_error: None,
+            }],
+        };
+
+        let lines = render_inspect_report_lines(&report);
+        let output = lines.join("\n");
+        assert!(output.contains("FAIL"));
+        assert!(output.contains("build-linux-musl"));
+        assert!(output.contains("cargo-test"));
+        assert!(output.contains("cargo test"));
+        assert!(output.contains("actions/runs/1"));
+        assert!(output.contains("job/11"));
     }
 }

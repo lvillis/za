@@ -1,7 +1,8 @@
 use super::{
     AuditSummary, CargoDependency, CargoMetadata, CargoPackage, CargoResolve, CargoResolveDepKind,
-    CargoResolveNode, CargoResolveNodeDep, DepAuditRecord, RiskLevel, collect_dependency_specs,
-    derive_auto_jobs, render_report_lines,
+    CargoResolveNode, CargoResolveNodeDep, DepAuditRecord, LatestQuerySource, LatestRecord,
+    LatestStatus, LatestSummary, RiskLevel, collect_dependency_specs, derive_auto_jobs,
+    render_latest_lines, render_latest_toml, render_report_lines,
 };
 use std::path::Path;
 
@@ -122,6 +123,73 @@ fn render_report_lines_verbose_includes_baseline_and_manifest() {
     assert!(output.contains("manifest  /tmp/work/Cargo.toml"));
     assert!(output.contains("reqwest"));
     assert!(output.contains("bytes"));
+}
+
+#[test]
+fn render_latest_lines_show_summary_and_failure_note() {
+    let summary = LatestSummary {
+        total: 2,
+        resolved: 1,
+        failed: 1,
+    };
+    let records = vec![
+        LatestRecord {
+            name: "serde".to_string(),
+            requirement: Some("^1".to_string()),
+            kinds: Some("normal".to_string()),
+            source: LatestQuerySource::Manifest,
+            status: LatestStatus::Resolved,
+            latest_version: Some("1.0.228".to_string()),
+            note: None,
+        },
+        LatestRecord {
+            name: "mystery".to_string(),
+            requirement: None,
+            kinds: None,
+            source: LatestQuerySource::Args,
+            status: LatestStatus::Failed,
+            latest_version: None,
+            note: Some("crates.io query failed: timeout".to_string()),
+        },
+    ];
+
+    let lines = render_latest_lines(Some(Path::new("/tmp/work/Cargo.toml")), &summary, &records);
+    let output = lines.join("\n");
+    assert!(output.contains("latest"));
+    assert!(output.contains("1 resolved"));
+    assert!(output.contains("1 failed"));
+    assert!(output.contains("serde"));
+    assert!(output.contains("1.0.228"));
+    assert!(output.contains("mystery"));
+    assert!(output.contains("timeout"));
+    assert!(output.contains("manifest  /tmp/work/Cargo.toml"));
+}
+
+#[test]
+fn render_latest_toml_comments_failed_entries() {
+    let rendered = render_latest_toml(&[
+        LatestRecord {
+            name: "serde".to_string(),
+            requirement: None,
+            kinds: None,
+            source: LatestQuerySource::Args,
+            status: LatestStatus::Resolved,
+            latest_version: Some("1.0.228".to_string()),
+            note: None,
+        },
+        LatestRecord {
+            name: "broken".to_string(),
+            requirement: None,
+            kinds: None,
+            source: LatestQuerySource::Args,
+            status: LatestStatus::Failed,
+            latest_version: None,
+            note: Some("crates.io query failed: eof".to_string()),
+        },
+    ]);
+
+    assert!(rendered.contains("serde = \"1.0.228\""));
+    assert!(rendered.contains("# broken: crates.io query failed: eof"));
 }
 
 fn sample_record(name: &str, risk: RiskLevel, notes: &[&str]) -> DepAuditRecord {

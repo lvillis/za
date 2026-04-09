@@ -53,6 +53,69 @@ pub struct DepsRunOptions {
     pub verbose: bool,
 }
 
+pub struct DepsLatestOptions {
+    pub crates: Vec<String>,
+    pub manifest_path: Option<PathBuf>,
+    pub jobs: Option<usize>,
+    pub include_dev: bool,
+    pub include_build: bool,
+    pub include_optional: bool,
+    pub json: bool,
+    pub toml: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LatestQuery {
+    name: String,
+    requirement: Option<String>,
+    kinds: Option<String>,
+    source: LatestQuerySource,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LatestQuerySource {
+    Args,
+    Manifest,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LatestStatus {
+    Resolved,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LatestRecord {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requirement: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kinds: Option<String>,
+    source: LatestQuerySource,
+    status: LatestStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct LatestSummary {
+    total: usize,
+    resolved: usize,
+    failed: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct LatestReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_path: Option<String>,
+    summary: LatestSummary,
+    records: Vec<LatestRecord>,
+}
+
 pub fn run(opts: DepsRunOptions) -> Result<()> {
     let DepsRunOptions {
         manifest_path,
@@ -100,8 +163,401 @@ pub fn run(opts: DepsRunOptions) -> Result<()> {
     Ok(())
 }
 
+pub fn run_latest(opts: DepsLatestOptions) -> Result<()> {
+    let DepsLatestOptions {
+        crates,
+        manifest_path,
+        jobs,
+        include_dev,
+        include_build,
+        include_optional,
+        json,
+        toml,
+    } = opts;
+
+    let (manifest_path, queries) = collect_latest_queries(
+        crates,
+        manifest_path,
+        include_dev,
+        include_build,
+        include_optional,
+    )?;
+    if queries.is_empty() {
+        bail!("provide crate names or `--manifest-path <Cargo.toml>`");
+    }
+
+    let requested_jobs = jobs.unwrap_or_else(default_deps_jobs);
+    let worker_count = normalize_jobs(requested_jobs, queries.len());
+    if !json && !toml {
+        println!(
+            "Resolving latest stable versions for {} crate(s) with {} workers...",
+            queries.len(),
+            worker_count
+        );
+    }
+
+    let api = Arc::new(ApiClient::new(None)?);
+    let mut records = resolve_latest_records(Arc::clone(&api), queries, worker_count)?;
+    records.sort_by(|a, b| a.name.cmp(&b.name));
+    let summary = build_latest_summary(&records);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&LatestReport {
+                manifest_path: manifest_path
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                summary: summary.clone(),
+                records: records.clone(),
+            })
+            .context("serialize latest dependency output")?
+        );
+    } else if toml {
+        print!("{}", render_latest_toml(&records));
+    } else {
+        for line in render_latest_lines(manifest_path.as_deref(), &summary, &records) {
+            println!("{line}");
+        }
+    }
+
+    let _ = api.flush_cache();
+    Ok(())
+}
+
 fn normalize_jobs(requested_jobs: usize, deps_count: usize) -> usize {
     requested_jobs.max(1).min(deps_count.max(1))
+}
+
+fn collect_latest_queries(
+    crates: Vec<String>,
+    manifest_path: Option<PathBuf>,
+    include_dev: bool,
+    include_build: bool,
+    include_optional: bool,
+) -> Result<(Option<PathBuf>, Vec<LatestQuery>)> {
+    let mut queries = BTreeMap::<String, LatestQuery>::new();
+    let manifest_path = match manifest_path {
+        Some(path) => {
+            let manifest_path = canonical_manifest_path(Some(path))?;
+            let metadata = cargo_metadata(&manifest_path)?;
+            let specs =
+                collect_dependency_specs(&metadata, include_dev, include_build, include_optional)?;
+            for spec in specs {
+                let key = normalize_dependency_name(&spec.name);
+                queries
+                    .entry(key)
+                    .and_modify(|query| {
+                        if query.requirement.is_none() && !spec.requirement.is_empty() {
+                            query.requirement = Some(spec.requirement.clone());
+                        }
+                        if query.kinds.is_none() && !spec.kinds.is_empty() {
+                            query.kinds = Some(spec.kinds.clone());
+                        }
+                        query.source = LatestQuerySource::Manifest;
+                    })
+                    .or_insert_with(|| LatestQuery {
+                        name: spec.name,
+                        requirement: Some(spec.requirement),
+                        kinds: Some(spec.kinds),
+                        source: LatestQuerySource::Manifest,
+                    });
+            }
+            Some(manifest_path)
+        }
+        None => None,
+    };
+
+    for krate in crates {
+        let trimmed = krate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let key = normalize_dependency_name(trimmed);
+        queries.entry(key).or_insert_with(|| LatestQuery {
+            name: trimmed.to_string(),
+            requirement: None,
+            kinds: None,
+            source: LatestQuerySource::Args,
+        });
+    }
+
+    Ok((manifest_path, queries.into_values().collect()))
+}
+
+fn resolve_latest_records(
+    api: Arc<ApiClient>,
+    queries: Vec<LatestQuery>,
+    jobs: usize,
+) -> Result<Vec<LatestRecord>> {
+    let progress = build_progress(queries.len() as u64);
+    let queue = Arc::new(Mutex::new(VecDeque::from(queries)));
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let first_error: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
+
+    thread::scope(|scope| {
+        for _ in 0..jobs {
+            let api = Arc::clone(&api);
+            let queue = Arc::clone(&queue);
+            let records = Arc::clone(&records);
+            let first_error = Arc::clone(&first_error);
+            let progress = progress.clone();
+
+            scope.spawn(move || {
+                loop {
+                    if has_error(first_error.as_ref()) {
+                        break;
+                    }
+
+                    let query = match queue.lock() {
+                        Ok(mut guard) => guard.pop_front(),
+                        Err(_) => {
+                            store_error(
+                                first_error.as_ref(),
+                                anyhow!("latest version queue lock poisoned"),
+                            );
+                            break;
+                        }
+                    };
+
+                    let Some(query) = query else {
+                        break;
+                    };
+                    let record = resolve_latest_record(api.as_ref(), query);
+                    match records.lock() {
+                        Ok(mut guard) => guard.push(record),
+                        Err(_) => {
+                            store_error(
+                                first_error.as_ref(),
+                                anyhow!("latest version records lock poisoned"),
+                            );
+                            break;
+                        }
+                    }
+
+                    if let Some(bar) = progress.as_ref() {
+                        bar.inc(1);
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(bar) = progress {
+        bar.finish_and_clear();
+    }
+
+    let mut error_guard = first_error
+        .lock()
+        .map_err(|_| anyhow!("error state lock poisoned"))?;
+    if let Some(err) = error_guard.take() {
+        return Err(err);
+    }
+
+    let mut records_guard = records
+        .lock()
+        .map_err(|_| anyhow!("latest version records lock poisoned"))?;
+    Ok(std::mem::take(&mut *records_guard))
+}
+
+fn resolve_latest_record(api: &ApiClient, query: LatestQuery) -> LatestRecord {
+    match api.fetch_crate(&query.name) {
+        Ok(snapshot) => {
+            let mut notes = Vec::new();
+            if snapshot.latest_version_yanked == Some(true) {
+                notes.push("latest stable is yanked".to_string());
+            }
+            if let Some(rust_version) = snapshot.latest_version_rust_version.as_deref() {
+                notes.push(format!("rust {rust_version}"));
+            }
+            LatestRecord {
+                name: query.name,
+                requirement: query.requirement,
+                kinds: query.kinds,
+                source: query.source,
+                status: LatestStatus::Resolved,
+                latest_version: Some(snapshot.max_version),
+                note: (!notes.is_empty()).then(|| notes.join("; ")),
+            }
+        }
+        Err(err) => LatestRecord {
+            name: query.name,
+            requirement: query.requirement,
+            kinds: query.kinds,
+            source: query.source,
+            status: LatestStatus::Failed,
+            latest_version: None,
+            note: Some(format!("crates.io query failed: {err}")),
+        },
+    }
+}
+
+fn build_latest_summary(records: &[LatestRecord]) -> LatestSummary {
+    let mut summary = LatestSummary {
+        total: records.len(),
+        ..Default::default()
+    };
+    for record in records {
+        match record.status {
+            LatestStatus::Resolved => summary.resolved += 1,
+            LatestStatus::Failed => summary.failed += 1,
+        }
+    }
+    summary
+}
+
+fn render_latest_lines(
+    manifest_path: Option<&Path>,
+    summary: &LatestSummary,
+    records: &[LatestRecord],
+) -> Vec<String> {
+    let verdict = if summary.failed > 0 {
+        tty_style::warning(format!("{:<5}", "WARN"))
+    } else {
+        tty_style::success(format!("{:<5}", "OK"))
+    };
+    let mut lines = vec![format!(
+        "{} {}  {} {}  {}",
+        verdict,
+        tty_style::header("latest"),
+        tty_style::header(summary.total.to_string()),
+        tty_style::dim("crates"),
+        render_latest_summary(summary)
+    )];
+
+    if records.is_empty() {
+        return lines;
+    }
+
+    let name_width = records
+        .iter()
+        .map(|record| record.name.chars().count())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 28);
+    let req_width = records
+        .iter()
+        .map(|record| record.requirement.as_deref().unwrap_or("-").chars().count())
+        .max()
+        .unwrap_or(3)
+        .clamp(3, 20);
+    let latest_width = records
+        .iter()
+        .map(|record| {
+            record
+                .latest_version
+                .as_deref()
+                .unwrap_or("-")
+                .chars()
+                .count()
+        })
+        .max()
+        .unwrap_or(6)
+        .clamp(6, 20);
+    let kinds_width = records
+        .iter()
+        .map(|record| record.kinds.as_deref().unwrap_or("-").chars().count())
+        .max()
+        .unwrap_or(5)
+        .clamp(5, 16);
+
+    lines.push(String::new());
+    lines.push(tty_style::dim(format!(
+        "{:<5}  {:<name_width$}  {:<req_width$}  {:<latest_width$}  {:<kinds_width$}  note",
+        "st", "name", "req", "latest", "kinds"
+    )));
+    for record in records {
+        lines.push(format!(
+            "{}  {:<name_width$}  {:<req_width$}  {:<latest_width$}  {:<kinds_width$}  {}",
+            style_latest_status(record.status),
+            truncate(&record.name, name_width),
+            truncate(record.requirement.as_deref().unwrap_or("-"), req_width),
+            style_latest_version_cell(
+                &truncate(
+                    record.latest_version.as_deref().unwrap_or("-"),
+                    latest_width
+                ),
+                latest_width,
+                record.status,
+            ),
+            tty_style::dim(format!(
+                "{:<kinds_width$}",
+                truncate(record.kinds.as_deref().unwrap_or("-"), kinds_width)
+            )),
+            truncate(
+                record.note.as_deref().unwrap_or(match record.source {
+                    LatestQuerySource::Args => "explicit query",
+                    LatestQuerySource::Manifest => "manifest",
+                }),
+                96
+            )
+        ));
+    }
+
+    if let Some(path) = manifest_path {
+        lines.push(String::new());
+        lines.push(format!(
+            "{}  {}",
+            tty_style::dim("manifest"),
+            path.display()
+        ));
+    }
+
+    lines
+}
+
+fn render_latest_toml(records: &[LatestRecord]) -> String {
+    let mut out = String::new();
+    for record in records {
+        match record.latest_version.as_deref() {
+            Some(version) => {
+                out.push_str(&format!("{} = \"{}\"\n", record.name, version));
+            }
+            None => {
+                out.push_str("# ");
+                out.push_str(&record.name);
+                out.push_str(": ");
+                out.push_str(
+                    record
+                        .note
+                        .as_deref()
+                        .unwrap_or("latest version unavailable"),
+                );
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+fn render_latest_summary(summary: &LatestSummary) -> String {
+    let mut parts = Vec::new();
+    if summary.resolved > 0 {
+        parts.push(tty_style::success(format!("{} resolved", summary.resolved)));
+    }
+    if summary.failed > 0 {
+        parts.push(tty_style::warning(format!("{} failed", summary.failed)));
+    }
+    if parts.is_empty() {
+        tty_style::dim("no results")
+    } else {
+        parts.join(&format!(" {} ", tty_style::dim("·")))
+    }
+}
+
+fn style_latest_status(status: LatestStatus) -> String {
+    match status {
+        LatestStatus::Resolved => tty_style::success(format!("{:<5}", "OK")),
+        LatestStatus::Failed => tty_style::warning(format!("{:<5}", "WARN")),
+    }
+}
+
+fn style_latest_version_cell(value: &str, width: usize, status: LatestStatus) -> String {
+    let padded = format!("{value:<width$}");
+    match status {
+        LatestStatus::Resolved => tty_style::active(padded),
+        LatestStatus::Failed => tty_style::dim(padded),
+    }
 }
 
 fn default_deps_jobs() -> usize {
