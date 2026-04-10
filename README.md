@@ -214,9 +214,13 @@ za diff --unstaged --path 'src/**'
 za diff --kind code --kind docs
 za diff --exclude-risk generated --exclude-risk lockfile
 za diff --name-only
+za diff stats --since 7d
+za diff stats --since 30d --kind code --include-worktree
 ```
 
 The terminal report is review-oriented: it shows one merged file list with status markers (`M/A/D/R/?`), a narrow attention marker (`!` high, `~` medium), scope labels (`staged`, `unstaged`, `untracked`), a top-level `kinds` breakdown (`code`, `test`, `docs`, `config`, `generated`, `binary`, `other`), directory-dimmed file paths, rename arrows, colored `+`/`-` counts on TTY output, and a compact 5-block `STAT` diffstat column so larger files stand out immediately without taking over the row. On narrower terminals, scope labels compact automatically and file paths bias toward the trailing path/file name so the part you actually review stays visible; redirected non-TTY output drops the stat bar and stays plain. Risk kinds (`large`, `ci`, `config`, `lock`, `generated`, `binary`) stay in the top `attention` summary and JSON output instead of occupying a wide per-row column. The `large` cutoff is computed from recent Git history (`p90`, clamped to a sane range) and falls back to a fixed threshold when history is too shallow. Use `--path` for gitignore-style path globs, `--kind` to focus on change classes such as docs-only review, scope flags such as `--staged` / `--unstaged` / `--untracked` to narrow review focus, `--exclude-risk` to hide noisy generated or lockfile churn, and `--name-only` when you only want the review queue. Binary files are counted separately and excluded from `+/-` line totals. `--json` now carries stable filter metadata, risk policy metadata, per-section kind breakdowns, renamed path fields, and per-file kind/risk tags; use `--json --files` when you also want per-file detail in machine-readable output.
+
+Use `za diff stats` for day-level committed change volume. It reads Git history with `git log --numstat`, groups by day, and preserves the same `code/test/docs/config/generated/binary/other` kind model used by `za diff`. Current uncommitted changes are not historical data, so they are only shown when explicitly requested with `--include-worktree`, as a separate `worktree` row. Use `--json` for machine-readable daily totals.
 
 ## Shell Completion
 

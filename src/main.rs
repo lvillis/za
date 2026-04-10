@@ -21,41 +21,55 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        cli::Commands::Diff {
-            tui,
-            json,
-            files,
-            name_only,
-            staged,
-            unstaged,
-            untracked,
-            path,
-            kind,
-            exclude_risk,
-        } => {
-            let exit_code = command::diff::run(command::diff::DiffRunOptions {
-                tui,
-                json,
-                files,
-                name_only,
-                path_patterns: path,
-                scopes: [
-                    (staged, command::diff::DiffScope::Staged),
-                    (unstaged, command::diff::DiffScope::Unstaged),
-                    (untracked, command::diff::DiffScope::Untracked),
-                ]
-                .into_iter()
-                .filter_map(|(enabled, scope)| enabled.then_some(scope))
-                .collect(),
-                kinds: kind
+        cli::Commands::Diff { args, cmd } => {
+            let exit_code = match cmd {
+                Some(cli::DiffCommands::Stats {
+                    since,
+                    include_worktree,
+                    json,
+                    kind,
+                }) => {
+                    if args != cli::DiffArgs::default() {
+                        return Err(anyhow!(
+                            "`za diff stats` does not accept workspace diff flags before the subcommand; pass stats flags after `stats`"
+                        ));
+                    }
+                    command::diff::run_stats(command::diff::DiffStatsRunOptions {
+                        since,
+                        include_worktree,
+                        json,
+                        kinds: kind
+                            .into_iter()
+                            .map(command::diff::DiffFileKind::from)
+                            .collect(),
+                    })?
+                }
+                None => command::diff::run(command::diff::DiffRunOptions {
+                    tui: args.tui,
+                    json: args.json,
+                    files: args.files,
+                    name_only: args.name_only,
+                    path_patterns: args.path,
+                    scopes: [
+                        (args.staged, command::diff::DiffScope::Staged),
+                        (args.unstaged, command::diff::DiffScope::Unstaged),
+                        (args.untracked, command::diff::DiffScope::Untracked),
+                    ]
                     .into_iter()
-                    .map(command::diff::DiffFileKind::from)
+                    .filter_map(|(enabled, scope)| enabled.then_some(scope))
                     .collect(),
-                exclude_risks: exclude_risk
-                    .into_iter()
-                    .map(command::diff::DiffRiskKind::from)
-                    .collect(),
-            })?;
+                    kinds: args
+                        .kind
+                        .into_iter()
+                        .map(command::diff::DiffFileKind::from)
+                        .collect(),
+                    exclude_risks: args
+                        .exclude_risk
+                        .into_iter()
+                        .map(command::diff::DiffRiskKind::from)
+                        .collect(),
+                })?,
+            };
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }

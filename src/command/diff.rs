@@ -25,6 +25,7 @@ const LARGE_DIFF_HISTORY_COMMITS: usize = 200;
 const LARGE_DIFF_HISTORY_MIN_SAMPLES: usize = 32;
 const LARGE_DIFF_HISTORY_PERCENTILE: usize = 90;
 const DIFF_REPORT_SCHEMA_VERSION: u8 = 2;
+const DIFF_STATS_SCHEMA_VERSION: u8 = 1;
 const GENERATED_MARKERS: &[&str] = &[
     "/dist/",
     "/build/",
@@ -72,6 +73,14 @@ pub struct DiffRunOptions {
     pub exclude_risks: Vec<DiffRiskKind>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DiffStatsRunOptions {
+    pub since: String,
+    pub include_worktree: bool,
+    pub json: bool,
+    pub kinds: Vec<DiffFileKind>,
+}
+
 pub fn run(options: DiffRunOptions) -> Result<i32> {
     if options.tui {
         return tui::run_tui(options);
@@ -97,6 +106,30 @@ pub fn run(options: DiffRunOptions) -> Result<i32> {
                     name_only: options.name_only,
                     terminal_width: terminal_width(),
                     interactive: io::stdout().is_terminal(),
+                },
+            )
+        );
+    }
+
+    Ok(0)
+}
+
+pub fn run_stats(options: DiffStatsRunOptions) -> Result<i32> {
+    let repo_root = resolve_repo_root()?;
+    let report = collect_diff_stats(&repo_root, &options)?;
+
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("serialize diff stats output")?
+        );
+    } else {
+        print!(
+            "{}",
+            render_diff_stats_report(
+                &report,
+                StatsRenderOptions {
+                    use_color: color_enabled(),
                 },
             )
         );
@@ -209,6 +242,59 @@ struct DiffKindStat {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DiffStatsOutput {
+    schema_version: u8,
+    repo_root: String,
+    head: Option<String>,
+    since: String,
+    by: String,
+    filters: DiffStatsFilterSummary,
+    days: Vec<DiffStatsRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worktree: Option<DiffStatsRow>,
+    total: DiffStatsTotals,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+struct DiffStatsFilterSummary {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    kinds: Vec<DiffFileKind>,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+struct DiffStatsRow {
+    label: String,
+    source: DiffStatsSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commits: Option<usize>,
+    files: usize,
+    additions: u64,
+    deletions: u64,
+    binary_files: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    kind_breakdown: Vec<DiffKindStat>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DiffStatsSource {
+    #[default]
+    History,
+    Worktree,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+struct DiffStatsTotals {
+    commits: usize,
+    files: usize,
+    additions: u64,
+    deletions: u64,
+    binary_files: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    kind_breakdown: Vec<DiffKindStat>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct DiffWorkspaceOutput {
     schema_version: u8,
     repo_root: String,
@@ -271,6 +357,11 @@ struct RenderOptions {
     name_only: bool,
     terminal_width: Option<usize>,
     interactive: bool,
+}
+
+#[derive(Clone, Copy)]
+struct StatsRenderOptions {
+    use_color: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -407,6 +498,260 @@ fn collect_workspace_diff(
         untracked,
         total,
     })
+}
+
+fn collect_diff_stats(repo_root: &Path, options: &DiffStatsRunOptions) -> Result<DiffStatsOutput> {
+    let risk_policy = detect_risk_policy(repo_root)?;
+    let days = collect_git_daily_stats(repo_root, &options.since, &options.kinds, &risk_policy)?;
+    let worktree = if options.include_worktree {
+        let filters = DiffFilterSpec {
+            summary: DiffFilterSummary {
+                scopes: Vec::new(),
+                kinds: normalize_kind_filters(&options.kinds),
+                path_patterns: Vec::new(),
+                exclude_risks: Vec::new(),
+            },
+            path_matcher: None,
+        };
+        let workspace = collect_workspace_diff(repo_root, false, &filters)?;
+        (workspace.total.files > 0).then_some(DiffStatsRow {
+            label: "worktree".to_string(),
+            source: DiffStatsSource::Worktree,
+            commits: None,
+            files: workspace.total.files,
+            additions: workspace.total.additions,
+            deletions: workspace.total.deletions,
+            binary_files: workspace.total.binary_files,
+            kind_breakdown: workspace.total.kind_breakdown,
+        })
+    } else {
+        None
+    };
+    let total = build_diff_stats_totals(&days, worktree.as_ref());
+
+    Ok(DiffStatsOutput {
+        schema_version: DIFF_STATS_SCHEMA_VERSION,
+        repo_root: repo_root.display().to_string(),
+        head: git_head_short(repo_root)?,
+        since: options.since.clone(),
+        by: "day".to_string(),
+        filters: DiffStatsFilterSummary {
+            kinds: normalize_kind_filters(&options.kinds),
+        },
+        days,
+        worktree,
+        total,
+    })
+}
+
+fn collect_git_daily_stats(
+    repo_root: &Path,
+    since: &str,
+    kinds: &[DiffFileKind],
+    risk_policy: &DiffRiskPolicy,
+) -> Result<Vec<DiffStatsRow>> {
+    let since_arg = format!("--since={since}");
+    let output = git_output(
+        repo_root,
+        &[
+            "log",
+            "--no-merges",
+            "--numstat",
+            "-z",
+            "--date=format-local:%Y-%m-%d",
+            "--format=%x1e%ad",
+            &since_arg,
+            "--",
+        ],
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_unborn_head(&stderr) || stderr.contains("does not have any commits yet") {
+            return Ok(Vec::new());
+        }
+        bail!("`git log` failed: {}", stderr.trim());
+    }
+    parse_daily_diff_stats(&output.stdout, kinds, risk_policy)
+}
+
+fn parse_daily_diff_stats(
+    raw: &[u8],
+    kinds: &[DiffFileKind],
+    risk_policy: &DiffRiskPolicy,
+) -> Result<Vec<DiffStatsRow>> {
+    let kind_filters = normalize_kind_filters(kinds);
+    let mut by_day = BTreeMap::<String, DiffStatsRow>::new();
+    let mut current_day: Option<String> = None;
+
+    for token in raw.split(|byte| *byte == b'\0') {
+        if token.is_empty() {
+            continue;
+        }
+
+        let mut token = String::from_utf8_lossy(token).into_owned();
+        if token.contains('\u{1e}') {
+            let commit_markers = token.matches('\u{1e}').count();
+            token.retain(|ch| ch != '\u{1e}');
+            let date = token.trim_matches(|ch| matches!(ch, '\n' | '\r')).trim();
+            if !date.is_empty() {
+                current_day = Some(date.to_string());
+                let row = by_day
+                    .entry(date.to_string())
+                    .or_insert_with(|| history_stats_row(date));
+                row.commits = Some(row.commits.unwrap_or_default() + commit_markers);
+            }
+            continue;
+        }
+
+        let Some(day) = current_day.as_deref() else {
+            continue;
+        };
+        let token = token.trim_matches(|ch| matches!(ch, '\n' | '\r'));
+        if token.is_empty() {
+            continue;
+        }
+
+        let Some(entry) = parse_history_numstat_entry(token, risk_policy)? else {
+            continue;
+        };
+        if !kind_filters.is_empty() && !kind_filters.contains(&entry.kind) {
+            continue;
+        }
+        let row = by_day
+            .entry(day.to_string())
+            .or_insert_with(|| history_stats_row(day));
+        add_entry_to_stats_row(row, &entry);
+    }
+
+    let mut rows = by_day.into_values().collect::<Vec<_>>();
+    rows.sort_by(|lhs, rhs| rhs.label.cmp(&lhs.label));
+    Ok(rows)
+}
+
+fn parse_history_numstat_entry(
+    token: &str,
+    risk_policy: &DiffRiskPolicy,
+) -> Result<Option<DiffFileStat>> {
+    let mut fields = token.splitn(3, '\t');
+    let Some(additions) = fields.next() else {
+        return Ok(None);
+    };
+    let Some(deletions) = fields.next() else {
+        return Ok(None);
+    };
+    let Some(path) = fields.next() else {
+        return Ok(None);
+    };
+    let path = path.trim();
+    if path.is_empty() {
+        return Ok(None);
+    }
+
+    let binary = additions == "-" || deletions == "-";
+    let (additions, deletions) = if binary {
+        (0, 0)
+    } else {
+        (
+            additions
+                .parse::<u64>()
+                .with_context(|| format!("parse git additions from `{additions}`"))?,
+            deletions
+                .parse::<u64>()
+                .with_context(|| format!("parse git deletions from `{deletions}`"))?,
+        )
+    };
+
+    let mut entry = DiffFileStat {
+        path: path.to_string(),
+        previous_path: None,
+        renamed_from: None,
+        renamed_to: None,
+        additions,
+        deletions,
+        binary,
+        status: DiffStatus::Modified,
+        kind: DiffFileKind::Other,
+        primary_scope: None,
+        scopes: Vec::new(),
+        risks: Vec::new(),
+    };
+    entry.risks = detect_risks(&entry, risk_policy);
+    entry.kind = classify_file_kind(&entry);
+    Ok(Some(entry))
+}
+
+fn history_stats_row(label: &str) -> DiffStatsRow {
+    DiffStatsRow {
+        label: label.to_string(),
+        source: DiffStatsSource::History,
+        commits: Some(0),
+        ..DiffStatsRow::default()
+    }
+}
+
+fn add_entry_to_stats_row(row: &mut DiffStatsRow, entry: &DiffFileStat) {
+    row.files += 1;
+    row.additions = row.additions.saturating_add(entry.additions);
+    row.deletions = row.deletions.saturating_add(entry.deletions);
+    row.binary_files += usize::from(entry.binary);
+    add_kind_stat(
+        &mut row.kind_breakdown,
+        entry.kind,
+        1,
+        entry.additions,
+        entry.deletions,
+        usize::from(entry.binary),
+    );
+}
+
+fn add_kind_stat(
+    stats: &mut Vec<DiffKindStat>,
+    kind: DiffFileKind,
+    files: usize,
+    additions: u64,
+    deletions: u64,
+    binary_files: usize,
+) {
+    if let Some(stat) = stats.iter_mut().find(|stat| stat.kind == kind) {
+        stat.files += files;
+        stat.additions = stat.additions.saturating_add(additions);
+        stat.deletions = stat.deletions.saturating_add(deletions);
+        stat.binary_files += binary_files;
+    } else {
+        stats.push(DiffKindStat {
+            kind,
+            files,
+            additions,
+            deletions,
+            binary_files,
+        });
+        stats.sort_by_key(|stat| stat.kind.summary_rank());
+    }
+}
+
+fn build_diff_stats_totals(
+    days: &[DiffStatsRow],
+    worktree: Option<&DiffStatsRow>,
+) -> DiffStatsTotals {
+    let mut total = DiffStatsTotals::default();
+    for row in days.iter().chain(worktree) {
+        total.commits += row.commits.unwrap_or_default();
+        total.files += row.files;
+        total.additions = total.additions.saturating_add(row.additions);
+        total.deletions = total.deletions.saturating_add(row.deletions);
+        total.binary_files += row.binary_files;
+        for stat in &row.kind_breakdown {
+            add_kind_stat(
+                &mut total.kind_breakdown,
+                stat.kind,
+                stat.files,
+                stat.additions,
+                stat.deletions,
+                stat.binary_files,
+            );
+        }
+    }
+    total
 }
 
 fn build_diff_section(
@@ -1529,6 +1874,183 @@ fn render_diff_report(report: &DiffWorkspaceOutput, options: RenderOptions) -> S
     lines.join("\n") + "\n"
 }
 
+fn render_diff_stats_report(report: &DiffStatsOutput, options: StatsRenderOptions) -> String {
+    let use_color = options.use_color;
+    let repo_name = Path::new(&report.repo_root)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&report.repo_root);
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "za diff stats  {}  {} {}",
+        style_bold(repo_name, use_color),
+        style_dim("@", use_color),
+        style_head(report.head.as_deref().unwrap_or("(unborn)"), use_color),
+    ));
+    lines.push(format!(
+        "{} {}{}  {} day",
+        style_dim("range", use_color),
+        report.since,
+        style_dim("..HEAD", use_color),
+        style_dim("by", use_color),
+    ));
+    if !report.filters.kinds.is_empty() {
+        lines.push(format!(
+            "{} kind={}",
+            style_dim("filter", use_color),
+            style_dim(
+                &report
+                    .filters
+                    .kinds
+                    .iter()
+                    .map(|kind| kind.label())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                use_color,
+            )
+        ));
+    }
+
+    if report.days.is_empty() && report.worktree.is_none() {
+        lines.push(format!(
+            "{} no changes matched current stats range",
+            style_dim("status", use_color)
+        ));
+        return lines.join("\n") + "\n";
+    }
+
+    lines.push(String::new());
+    render_diff_stats_table(&mut lines, report, use_color);
+    lines.join("\n") + "\n"
+}
+
+fn render_diff_stats_table(lines: &mut Vec<String>, report: &DiffStatsOutput, use_color: bool) {
+    let rows = report
+        .days
+        .iter()
+        .chain(report.worktree.iter())
+        .collect::<Vec<_>>();
+    let label_width = rows
+        .iter()
+        .map(|row| row.label.chars().count())
+        .chain(std::iter::once("date".len()))
+        .max()
+        .unwrap_or(10)
+        .max(10);
+    let commits_width = rows
+        .iter()
+        .map(|row| {
+            row.commits
+                .map(|commits| commits.to_string())
+                .unwrap_or_else(|| "-".to_string())
+                .len()
+        })
+        .chain(std::iter::once("commits".len()))
+        .max()
+        .unwrap_or(7);
+    let files_width = rows
+        .iter()
+        .map(|row| row.files.to_string().len())
+        .chain(std::iter::once("files".len()))
+        .max()
+        .unwrap_or(5);
+    let add_width = rows
+        .iter()
+        .map(|row| format!("+{}", row.additions).len())
+        .chain(std::iter::once("+add".len()))
+        .max()
+        .unwrap_or(4);
+    let del_width = rows
+        .iter()
+        .map(|row| format!("-{}", row.deletions).len())
+        .chain(std::iter::once("-del".len()))
+        .max()
+        .unwrap_or(4);
+
+    lines.push(format!(
+        "{}  {}  {}  {}  {}  {}",
+        style_dim(&format!("{:<label_width$}", "date"), use_color),
+        style_dim(&format!("{:>commits_width$}", "commits"), use_color),
+        style_dim(&format!("{:>files_width$}", "files"), use_color),
+        colorize_additions(format!("{:>add_width$}", "+add"), use_color),
+        colorize_deletions(format!("{:>del_width$}", "-del"), use_color),
+        style_dim("kinds", use_color),
+    ));
+
+    for row in rows {
+        lines.push(format!(
+            "{}  {}  {}  {}  {}  {}",
+            style_stats_label(row, label_width, use_color),
+            style_dim(
+                &format!("{:>commits_width$}", stats_commits_label(row)),
+                use_color
+            ),
+            style_dim(&format!("{:>files_width$}", row.files), use_color),
+            colorize_additions(
+                format!("{:>add_width$}", format!("+{}", row.additions)),
+                use_color
+            ),
+            colorize_deletions(
+                format!("{:>del_width$}", format!("-{}", row.deletions)),
+                use_color
+            ),
+            render_inline_kind_breakdown(&row.kind_breakdown, use_color),
+        ));
+    }
+
+    lines.push(format!(
+        "{}  {}  {}  {}  {}  {}",
+        style_bold(&format!("{:<label_width$}", "total"), use_color),
+        style_dim(
+            &format!("{:>commits_width$}", report.total.commits),
+            use_color
+        ),
+        style_dim(&format!("{:>files_width$}", report.total.files), use_color),
+        colorize_additions(
+            format!("{:>add_width$}", format!("+{}", report.total.additions)),
+            use_color
+        ),
+        colorize_deletions(
+            format!("{:>del_width$}", format!("-{}", report.total.deletions)),
+            use_color
+        ),
+        render_inline_kind_breakdown(&report.total.kind_breakdown, use_color),
+    ));
+}
+
+fn stats_commits_label(row: &DiffStatsRow) -> String {
+    row.commits
+        .map(|commits| commits.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn style_stats_label(row: &DiffStatsRow, width: usize, use_color: bool) -> String {
+    let label = format!("{:<width$}", row.label);
+    match row.source {
+        DiffStatsSource::History => style_bold(&label, use_color),
+        DiffStatsSource::Worktree => style_ansi(&label, &["36", "1"], use_color),
+    }
+}
+
+fn render_inline_kind_breakdown(stats: &[DiffKindStat], use_color: bool) -> String {
+    if stats.is_empty() {
+        return style_dim("-", use_color);
+    }
+    stats
+        .iter()
+        .take(4)
+        .map(|stat| {
+            format!(
+                "{} {}",
+                style_kind_label(stat.kind.label(), stat.kind, use_color),
+                style_dim(&stat.files.to_string(), use_color),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(&format!(" {} ", style_dim("·", use_color)))
+}
+
 fn render_filter_summary(filters: &DiffFilterSummary, use_color: bool) -> String {
     let mut parts = Vec::new();
     if !filters.scopes.is_empty() {
@@ -2403,9 +2925,10 @@ mod tests {
         DIFF_REPORT_SCHEMA_VERSION, DIFF_STAT_FILLED_BLOCK, DiffFileKind, DiffFileStat,
         DiffFilterSpec, DiffFilterSummary, DiffLargeThresholdSource, DiffRisk, DiffRiskKind,
         DiffRiskLevel, DiffRiskPolicy, DiffScope, DiffSection, DiffStatus, DiffWorkspaceOutput,
-        NumstatPathMode, RenderOptions, collect_workspace_diff, compute_large_diff_threshold,
+        NumstatPathMode, RenderOptions, StatsRenderOptions, collect_diff_stats,
+        collect_workspace_diff, compute_large_diff_threshold, parse_daily_diff_stats,
         parse_diff_status, parse_historical_diff_samples, parse_name_status_z, parse_numstat_z,
-        render_diff_report, resolve_repo_root_from,
+        render_diff_report, render_diff_stats_report, resolve_repo_root_from,
     };
     use anyhow::Result;
     use std::{
@@ -2491,6 +3014,45 @@ mod tests {
         .expect("must parse");
         assert_eq!(history.commits, 2);
         assert_eq!(history.totals, vec![4, 5]);
+    }
+
+    #[test]
+    fn parse_daily_diff_stats_groups_commits_by_day_and_kind() {
+        let rows = parse_daily_diff_stats(
+            b"\x1e2026-04-10\x00\n3\t1\tsrc/main.rs\x00\n2\t0\tREADME.md\x00\x1e2026-04-09\x00\n1\t1\tCargo.toml\x00",
+            &[],
+            &DiffRiskPolicy::fallback(),
+        )
+        .expect("must parse");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "2026-04-10");
+        assert_eq!(rows[0].commits, Some(1));
+        assert_eq!(rows[0].files, 2);
+        assert_eq!(rows[0].additions, 5);
+        assert_eq!(rows[0].deletions, 1);
+        assert_eq!(
+            rows[0]
+                .kind_breakdown
+                .iter()
+                .map(|stat| (stat.kind, stat.files))
+                .collect::<Vec<_>>(),
+            vec![(DiffFileKind::Code, 1), (DiffFileKind::Docs, 1)]
+        );
+        assert_eq!(rows[1].label, "2026-04-09");
+        assert_eq!(rows[1].kind_breakdown[0].kind, DiffFileKind::Config);
+    }
+
+    #[test]
+    fn parse_daily_diff_stats_applies_kind_filter() {
+        let rows = parse_daily_diff_stats(
+            b"\x1e2026-04-10\x00\n3\t1\tsrc/main.rs\x00\n2\t0\tREADME.md\x00",
+            &[DiffFileKind::Docs],
+            &DiffRiskPolicy::fallback(),
+        )
+        .expect("must parse");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].files, 1);
+        assert_eq!(rows[0].kind_breakdown[0].kind, DiffFileKind::Docs);
     }
 
     #[test]
@@ -2925,6 +3487,109 @@ mod tests {
         let rendered = render_diff_report(&report, render_options(false, false, false));
         assert!(rendered.contains("1 other file hidden"));
         assert!(!rendered.contains("\n  other"));
+    }
+
+    #[test]
+    fn collect_diff_stats_can_include_worktree_row() {
+        let dir = TempDir::new("stats-worktree").expect("temp dir");
+        init_repo(&dir.path).expect("init repo");
+        write_file(dir.path.join("src/main.rs"), "fn main() {}\n").expect("write src");
+        git(&dir.path, &["add", "."]).expect("git add");
+        git(&dir.path, &["commit", "-qm", "init"]).expect("git commit");
+        write_file(
+            dir.path.join("src/main.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n",
+        )
+        .expect("modify src");
+
+        let report = collect_diff_stats(
+            &dir.path,
+            &super::DiffStatsRunOptions {
+                since: "30d".to_string(),
+                include_worktree: true,
+                json: false,
+                kinds: vec![DiffFileKind::Code],
+            },
+        )
+        .expect("collect stats");
+
+        assert_eq!(report.worktree.as_ref().map(|row| row.files), Some(1));
+        assert!(report.total.files >= 1);
+    }
+
+    #[test]
+    fn render_diff_stats_report_shows_daily_table_and_worktree() {
+        let report = super::DiffStatsOutput {
+            schema_version: super::DIFF_STATS_SCHEMA_VERSION,
+            repo_root: "/tmp/repo".to_string(),
+            head: Some("abc1234".to_string()),
+            since: "7d".to_string(),
+            by: "day".to_string(),
+            filters: super::DiffStatsFilterSummary::default(),
+            days: vec![super::DiffStatsRow {
+                label: "2026-04-10".to_string(),
+                source: super::DiffStatsSource::History,
+                commits: Some(2),
+                files: 3,
+                additions: 12,
+                deletions: 4,
+                binary_files: 0,
+                kind_breakdown: vec![super::DiffKindStat {
+                    kind: DiffFileKind::Code,
+                    files: 3,
+                    additions: 12,
+                    deletions: 4,
+                    binary_files: 0,
+                }],
+            }],
+            worktree: Some(super::DiffStatsRow {
+                label: "worktree".to_string(),
+                source: super::DiffStatsSource::Worktree,
+                commits: None,
+                files: 1,
+                additions: 5,
+                deletions: 0,
+                binary_files: 0,
+                kind_breakdown: vec![super::DiffKindStat {
+                    kind: DiffFileKind::Docs,
+                    files: 1,
+                    additions: 5,
+                    deletions: 0,
+                    binary_files: 0,
+                }],
+            }),
+            total: super::DiffStatsTotals {
+                commits: 2,
+                files: 4,
+                additions: 17,
+                deletions: 4,
+                binary_files: 0,
+                kind_breakdown: vec![
+                    super::DiffKindStat {
+                        kind: DiffFileKind::Code,
+                        files: 3,
+                        additions: 12,
+                        deletions: 4,
+                        binary_files: 0,
+                    },
+                    super::DiffKindStat {
+                        kind: DiffFileKind::Docs,
+                        files: 1,
+                        additions: 5,
+                        deletions: 0,
+                        binary_files: 0,
+                    },
+                ],
+            },
+        };
+
+        let rendered = render_diff_stats_report(&report, StatsRenderOptions { use_color: false });
+        assert!(rendered.contains("za diff stats"));
+        assert!(rendered.contains("2026-04-10"));
+        assert!(rendered.contains("worktree"));
+        assert!(rendered.contains("total"));
+        assert!(rendered.contains("code 3"));
+        assert!(rendered.contains("docs 1"));
     }
 
     fn init_repo(path: &Path) -> Result<()> {

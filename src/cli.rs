@@ -22,36 +22,10 @@ pub enum Commands {
     },
     /// Review current Git workspace changes
     Diff {
-        /// Open the continuous review TUI.
-        #[arg(long, conflicts_with_all = ["json", "files", "name_only"])]
-        tui: bool,
-        /// Print JSON output for scripting.
-        #[arg(long)]
-        json: bool,
-        /// Include per-file additions/deletions in JSON output.
-        #[arg(long)]
-        files: bool,
-        /// Only print status/scope/path rows, without numeric diff columns.
-        #[arg(long)]
-        name_only: bool,
-        /// Only include staged changes.
-        #[arg(long)]
-        staged: bool,
-        /// Only include unstaged changes.
-        #[arg(long)]
-        unstaged: bool,
-        /// Only include untracked changes.
-        #[arg(long)]
-        untracked: bool,
-        /// Restrict results to paths matching this gitignore-style glob. Repeatable.
-        #[arg(long, value_name = "GLOB")]
-        path: Vec<String>,
-        /// Only include files matching these change kinds. Repeatable.
-        #[arg(long, value_enum, value_name = "KIND")]
-        kind: Vec<DiffKindFilter>,
-        /// Hide files carrying the selected review risk tag. Repeatable.
-        #[arg(long, value_enum, value_name = "RISK")]
-        exclude_risk: Vec<DiffRiskFilter>,
+        #[command(flatten)]
+        args: DiffArgs,
+        #[command(subcommand)]
+        cmd: Option<DiffCommands>,
     },
     /// Generate a project context snapshot
     Gen {
@@ -131,6 +105,59 @@ pub enum Commands {
     Gh {
         #[command(subcommand)]
         cmd: GhCommands,
+    },
+}
+
+#[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
+pub struct DiffArgs {
+    /// Open the continuous review TUI.
+    #[arg(long, conflicts_with_all = ["json", "files", "name_only"])]
+    pub tui: bool,
+    /// Print JSON output for scripting.
+    #[arg(long)]
+    pub json: bool,
+    /// Include per-file additions/deletions in JSON output.
+    #[arg(long)]
+    pub files: bool,
+    /// Only print status/scope/path rows, without numeric diff columns.
+    #[arg(long)]
+    pub name_only: bool,
+    /// Only include staged changes.
+    #[arg(long)]
+    pub staged: bool,
+    /// Only include unstaged changes.
+    #[arg(long)]
+    pub unstaged: bool,
+    /// Only include untracked changes.
+    #[arg(long)]
+    pub untracked: bool,
+    /// Restrict results to paths matching this gitignore-style glob. Repeatable.
+    #[arg(long, value_name = "GLOB")]
+    pub path: Vec<String>,
+    /// Only include files matching these change kinds. Repeatable.
+    #[arg(long, value_enum, value_name = "KIND")]
+    pub kind: Vec<DiffKindFilter>,
+    /// Hide files carrying the selected review risk tag. Repeatable.
+    #[arg(long, value_enum, value_name = "RISK")]
+    pub exclude_risk: Vec<DiffRiskFilter>,
+}
+
+#[derive(Subcommand)]
+pub enum DiffCommands {
+    /// Show committed change volume grouped by day
+    Stats {
+        /// Git revision date range passed to `git log --since`.
+        #[arg(long, default_value = "7d", value_name = "RANGE")]
+        since: String,
+        /// Include the current uncommitted workspace as a separate worktree row.
+        #[arg(long)]
+        include_worktree: bool,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+        /// Only include files matching these change kinds. Repeatable.
+        #[arg(long, value_enum, value_name = "KIND")]
+        kind: Vec<DiffKindFilter>,
     },
 }
 
@@ -833,8 +860,8 @@ pub enum DiffKindFilter {
 mod tests {
     use super::{
         CiCommands, Cli, CodexCommands, ColorWhen, Commands, CompletionCommands, CompletionShell,
-        DepsCommands, DiffKindFilter, DiffRiskFilter, GhCommands, GitAuthCommands, PortCommands,
-        PortSignal, ToolCommands,
+        DepsCommands, DiffArgs, DiffCommands, DiffKindFilter, DiffRiskFilter, GhCommands,
+        GitAuthCommands, PortCommands, PortSignal, ToolCommands,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -1449,28 +1476,17 @@ mod tests {
         ])
         .expect("must parse");
         match cli.cmd {
-            Commands::Diff {
-                tui,
-                json,
-                files,
-                name_only,
-                staged,
-                unstaged,
-                untracked,
-                kind,
-                path,
-                exclude_risk,
-            } => {
-                assert!(tui);
-                assert!(!json);
-                assert!(!files);
-                assert!(!name_only);
-                assert!(staged);
-                assert!(!unstaged);
-                assert!(!untracked);
-                assert_eq!(kind, vec![DiffKindFilter::Code]);
-                assert_eq!(path, vec!["src/**"]);
-                assert_eq!(exclude_risk, vec![DiffRiskFilter::Generated]);
+            Commands::Diff { args, cmd: None } => {
+                assert!(args.tui);
+                assert!(!args.json);
+                assert!(!args.files);
+                assert!(!args.name_only);
+                assert!(args.staged);
+                assert!(!args.unstaged);
+                assert!(!args.untracked);
+                assert_eq!(args.kind, vec![DiffKindFilter::Code]);
+                assert_eq!(args.path, vec!["src/**"]);
+                assert_eq!(args.exclude_risk, vec![DiffRiskFilter::Generated]);
             }
             _ => panic!("unexpected command"),
         }
@@ -1499,28 +1515,17 @@ mod tests {
         ])
         .expect("must parse");
         match cli.cmd {
-            Commands::Diff {
-                tui,
-                json,
-                files,
-                name_only,
-                staged,
-                unstaged,
-                untracked,
-                kind,
-                path,
-                exclude_risk,
-            } => {
-                assert!(!tui);
-                assert!(json);
-                assert!(files);
-                assert!(name_only);
-                assert!(staged);
-                assert!(!unstaged);
-                assert!(!untracked);
-                assert_eq!(kind, vec![DiffKindFilter::Docs]);
-                assert_eq!(path, vec!["src/**"]);
-                assert_eq!(exclude_risk, vec![DiffRiskFilter::Generated]);
+            Commands::Diff { args, cmd: None } => {
+                assert!(!args.tui);
+                assert!(args.json);
+                assert!(args.files);
+                assert!(args.name_only);
+                assert!(args.staged);
+                assert!(!args.unstaged);
+                assert!(!args.untracked);
+                assert_eq!(args.kind, vec![DiffKindFilter::Docs]);
+                assert_eq!(args.path, vec!["src/**"]);
+                assert_eq!(args.exclude_risk, vec![DiffRiskFilter::Generated]);
             }
             _ => panic!("unexpected command"),
         }
@@ -1539,17 +1544,62 @@ mod tests {
         ])
         .expect("must parse");
         match cli.cmd {
+            Commands::Diff { args, cmd: None } => {
+                assert!(!args.staged);
+                assert!(args.unstaged);
+                assert!(!args.untracked);
+                assert_eq!(args.kind, vec![DiffKindFilter::Code, DiffKindFilter::Docs]);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn diff_stats_parses_range_worktree_json_and_kind() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "diff",
+            "stats",
+            "--since",
+            "30d",
+            "--include-worktree",
+            "--json",
+            "--kind",
+            "code",
+        ])
+        .expect("must parse");
+        match cli.cmd {
             Commands::Diff {
-                staged,
-                unstaged,
-                untracked,
-                kind,
+                cmd:
+                    Some(DiffCommands::Stats {
+                        since,
+                        include_worktree: true,
+                        json: true,
+                        kind,
+                    }),
                 ..
             } => {
-                assert!(!staged);
-                assert!(unstaged);
-                assert!(!untracked);
-                assert_eq!(kind, vec![DiffKindFilter::Code, DiffKindFilter::Docs]);
+                assert_eq!(since, "30d");
+                assert_eq!(kind, vec![DiffKindFilter::Code]);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn diff_stats_keeps_stats_flags_after_subcommand() {
+        let cli = Cli::try_parse_from(["za", "diff", "stats", "--json"]).expect("must parse");
+        match cli.cmd {
+            Commands::Diff {
+                args,
+                cmd:
+                    Some(DiffCommands::Stats {
+                        json: true,
+                        include_worktree: false,
+                        ..
+                    }),
+            } => {
+                assert_eq!(args, DiffArgs::default());
             }
             _ => panic!("unexpected command"),
         }
