@@ -1,3 +1,8 @@
+## [0.1.52] - 2026-04-10
+
+### 🚀 Features
+
+- *(diff)* Add daily change stats
 ## [0.1.51] - 2026-04-09
 
 ### 🚀 Features
@@ -9,6 +14,10 @@
 ### 🚜 Refactor
 
 - *(command)* Split ci, deps, and tool into submodules
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.51
 ## [0.1.50] - 2026-04-08
 
 ### 🚀 Features
