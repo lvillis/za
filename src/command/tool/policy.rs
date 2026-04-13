@@ -22,6 +22,9 @@ const TCPING_GITHUB_TAG_PREFIX: &str = "";
 const MOTDYN_GITHUB_OWNER: &str = "lvillis";
 const MOTDYN_GITHUB_REPO: &str = "motdyn";
 const MOTDYN_GITHUB_TAG_PREFIX: &str = "";
+const BOTTOM_GITHUB_OWNER: &str = "ClementTsang";
+const BOTTOM_GITHUB_REPO: &str = "bottom";
+const BOTTOM_GITHUB_TAG_PREFIX: &str = "";
 const BPFTOP_GITHUB_OWNER: &str = "Netflix";
 const BPFTOP_GITHUB_REPO: &str = "bpftop";
 const BPFTOP_GITHUB_TAG_PREFIX: &str = "v";
@@ -115,7 +118,7 @@ impl ToolPolicy {
     }
 }
 
-const TOOL_POLICIES: [ToolPolicy; 17] = [
+const TOOL_POLICIES: [ToolPolicy; 18] = [
     ToolPolicy {
         canonical_name: "za",
         aliases: &[],
@@ -230,6 +233,23 @@ const TOOL_POLICIES: [ToolPolicy; 17] = [
             repo: MOTDYN_GITHUB_REPO,
             tag_prefix: MOTDYN_GITHUB_TAG_PREFIX,
             expected_asset_name: Some(motdyn_expected_asset_name),
+            verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
+        }),
+        cargo_fallback_package: None,
+    },
+    ToolPolicy {
+        canonical_name: "btm",
+        aliases: &["bottom"],
+        source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
+        github_release: Some(GithubReleasePolicy {
+            project_label: "bottom",
+            owner: BOTTOM_GITHUB_OWNER,
+            repo: BOTTOM_GITHUB_REPO,
+            tag_prefix: BOTTOM_GITHUB_TAG_PREFIX,
+            expected_asset_name: Some(bottom_expected_asset_name),
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
@@ -476,6 +496,10 @@ fn motdyn_expected_asset_name(version: &str) -> Result<String> {
     ))
 }
 
+fn bottom_expected_asset_name(_version: &str) -> Result<String> {
+    Ok(format!("bottom_{}.tar.gz", bottom_target_triple()?))
+}
+
 fn bpftop_expected_asset_name(_version: &str) -> Result<String> {
     Ok(format!("bpftop-{}", bpftop_target_triple()?))
 }
@@ -611,6 +635,20 @@ fn motdyn_target_triple() -> Result<&'static str> {
         ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
         _ => bail!(
             "unsupported platform for motdyn release asset: {}-{}",
+            env::consts::ARCH,
+            env::consts::OS
+        ),
+    }
+}
+
+fn bottom_target_triple() -> Result<&'static str> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
+        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
+        _ => bail!(
+            "unsupported platform for bottom release asset: {}-{}",
             env::consts::ARCH,
             env::consts::OS
         ),
