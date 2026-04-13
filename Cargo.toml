@@ -35,6 +35,8 @@ libc = { version = "0.2.182", default-features = false }
 ignore = { version = "0.4.25", default-features = false }
 regex = { version = "1.12.3", default-features = false, features = ["std", "unicode", "perf"] }
 fs4 = { version = "0.13.1", default-features = false, features = ["sync"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["sqlite", "runtime-tokio"] }
+tokio = { version = "1.51.1", default-features = false, features = ["rt"] }
 
 # Serialization and integrity checks.
 serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
@@ -43,7 +45,7 @@ toml = { version = "1.1.2", default-features = false, features = ["parse", "serd
 sha2 = { version = "0.11.0", default-features = false }
 
 # HTTP transport and TLS crypto provider.
-reqx = { version = "0.1.31", default-features = false, features = ["blocking-tls-rustls-ring"] }
+reqx = { version = "0.1.34", default-features = false, features = ["blocking-tls-rustls-ring"] }
 rustls = { version = "0.23.36", default-features = false, features = ["ring"] }
 
 # Archive extraction for downloaded binaries.

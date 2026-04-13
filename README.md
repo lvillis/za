@@ -190,6 +190,7 @@ za gh auth test --repo https://github.com/org/repo.git
 
 | Command | Purpose |
 | --- | --- |
+| `za ai` | Session-local AI command surface for agent-friendly wrappers and diagnostics. |
 | `za diff` | Summarize current Git workspace additions/deletions for review. |
 | `za completion` | Generate shell completion scripts. |
 | `za gen` | Generate project context snapshots (`CONTEXT.md`). |
@@ -221,6 +222,26 @@ za diff stats --since 30d --kind code --include-worktree
 The terminal report is review-oriented: it shows one merged file list with status markers (`M/A/D/R/?`), a narrow attention marker (`!` high, `~` medium), scope labels (`staged`, `unstaged`, `untracked`), a top-level `kinds` breakdown (`code`, `test`, `docs`, `config`, `generated`, `binary`, `other`), directory-dimmed file paths, rename arrows, colored `+`/`-` counts on TTY output, and a compact 5-block `STAT` diffstat column so larger files stand out immediately without taking over the row. On narrower terminals, scope labels compact automatically and file paths bias toward the trailing path/file name so the part you actually review stays visible; redirected non-TTY output drops the stat bar and stays plain. Risk kinds (`large`, `ci`, `config`, `lock`, `generated`, `binary`) stay in the top `attention` summary and JSON output instead of occupying a wide per-row column. The `large` cutoff is computed from recent Git history (`p90`, clamped to a sane range) and falls back to a fixed threshold when history is too shallow. Use `--path` for gitignore-style path globs, `--kind` to focus on change classes such as docs-only review, scope flags such as `--staged` / `--unstaged` / `--untracked` to narrow review focus, `--exclude-risk` to hide noisy generated or lockfile churn, and `--name-only` when you only want the review queue. Binary files are counted separately and excluded from `+/-` line totals. `--json` now carries stable filter metadata, risk policy metadata, per-section kind breakdowns, renamed path fields, and per-file kind/risk tags; use `--json --files` when you also want per-file detail in machine-readable output.
 
 Use `za diff stats` for day-level committed change volume. It reads Git history with `git log --numstat`, groups by day, and preserves the same `code/test/docs/config/generated/binary/other` kind model used by `za diff`. Current uncommitted changes are not historical data, so they are only shown when explicitly requested with `--include-worktree`, as a separate `worktree` row. Use `--json` for machine-readable daily totals.
+
+## AI Session Helpers
+
+Use `za ai` to expose a session-local command surface for coding agents without modifying your global shell:
+
+```bash
+za ai explain
+eval "$(za ai shell bash)"
+za ai git status
+za ai git diff --staged
+za ai gain
+za ai env
+za ai doctor
+```
+
+`za ai shell <shell>` prints session-local wrappers instead of top-level aliases. The primary routes are `git status -> za ai git status` and supported `git diff` shapes such as bare `git diff`, `git diff --staged`, `git diff --cached`, and `git diff --name-only` -> `za ai git diff ...`; unsupported Git invocations fall back to raw `git`.
+
+`za run codex` and `za codex` also export `ZA_AI_SESSION=1`, `ZA_AI_AGENT=codex`, and `ZA_AI_WORKSPACE=<cwd>`, then attach a temporary `BASH_ENV` script so those Git wrappers only affect managed Codex sessions and do not leak into normal SSH shells.
+
+`za ai gain` aggregates raw-vs-summary savings for all AI-routed commands recorded in the current workspace and reports both bytes and estimated token savings. Use `--daily`, `--history`, or `--graph` for alternate views, and `--all` to aggregate across all recorded workspaces.
 
 ## Shell Completion
 

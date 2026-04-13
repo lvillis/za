@@ -15,6 +15,11 @@ pub struct Cli {
 /// Sub-command definitions
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Session-local AI command surface for coding agents
+    Ai {
+        #[command(subcommand)]
+        cmd: AiCommands,
+    },
     /// Print or install shell completions
     Completion {
         #[command(subcommand)]
@@ -463,6 +468,96 @@ pub enum CompletionCommands {
     },
 }
 
+#[derive(Subcommand)]
+pub enum AiCommands {
+    /// Print a session-local shell snippet with AI-aware command wrappers
+    Shell {
+        #[arg(value_enum)]
+        shell: AiShell,
+    },
+    /// Print AI session environment exports for the current shell
+    Env,
+    /// Explain the AI session command surface
+    Explain,
+    /// Show token-savings analytics for AI-routed commands
+    Gain {
+        /// Look back this many days.
+        #[arg(long, default_value_t = 7)]
+        days: u64,
+        /// Aggregate across all recorded workspaces.
+        #[arg(long)]
+        all: bool,
+        /// Show day-by-day savings instead of the route summary.
+        #[arg(long, conflicts_with_all = ["history", "graph"])]
+        daily: bool,
+        /// Show recent AI-routed command history.
+        #[arg(long, conflicts_with_all = ["daily", "graph"])]
+        history: bool,
+        /// Show an ASCII savings graph across the selected range.
+        #[arg(long, conflicts_with_all = ["daily", "history"])]
+        graph: bool,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect whether the current shell is running with AI session markers
+    Doctor {
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// AI-friendly summaries for high-signal Git commands
+    Git {
+        #[command(subcommand)]
+        cmd: AiGitCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AiGitCommands {
+    /// Summarize current Git workspace status for AI review
+    Status {
+        #[command(flatten)]
+        args: AiGitStatusArgs,
+    },
+    /// Summarize current Git diff for AI review
+    Diff {
+        #[command(flatten)]
+        args: AiGitDiffArgs,
+    },
+}
+
+#[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
+pub struct AiGitStatusArgs {
+    /// Print JSON output for scripting.
+    #[arg(long)]
+    pub json: bool,
+    /// Include per-file additions/deletions in JSON output.
+    #[arg(long)]
+    pub files: bool,
+    /// Only print status/scope/path rows, without numeric diff columns.
+    #[arg(long)]
+    pub name_only: bool,
+    /// Restrict results to paths matching this gitignore-style glob. Repeatable.
+    #[arg(long, value_name = "GLOB")]
+    pub path: Vec<String>,
+    /// Only include files matching these change kinds. Repeatable.
+    #[arg(long, value_enum, value_name = "KIND")]
+    pub kind: Vec<DiffKindFilter>,
+    /// Hide files carrying the selected review risk tag. Repeatable.
+    #[arg(long, value_enum, value_name = "RISK")]
+    pub exclude_risk: Vec<DiffRiskFilter>,
+}
+
+#[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
+pub struct AiGitDiffArgs {
+    #[command(flatten)]
+    pub common: AiGitStatusArgs,
+    /// Show staged changes only.
+    #[arg(long, alias = "cached")]
+    pub staged: bool,
+}
+
 #[derive(Args, Clone, Debug, Default)]
 pub struct DepsAuditArgs {
     /// Optional path to Cargo.toml (defaults to current workspace root).
@@ -542,6 +637,12 @@ pub enum CompletionShell {
     Fish,
     Elvish,
     Powershell,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum AiShell {
+    Bash,
+    Zsh,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -859,9 +960,9 @@ pub enum DiffKindFilter {
 #[cfg(test)]
 mod tests {
     use super::{
-        CiCommands, Cli, CodexCommands, ColorWhen, Commands, CompletionCommands, CompletionShell,
-        DepsCommands, DiffArgs, DiffCommands, DiffKindFilter, DiffRiskFilter, GhCommands,
-        GitAuthCommands, PortCommands, PortSignal, ToolCommands,
+        AiCommands, AiGitCommands, AiShell, CiCommands, Cli, CodexCommands, ColorWhen, Commands,
+        CompletionCommands, CompletionShell, DepsCommands, DiffArgs, DiffCommands, DiffKindFilter,
+        DiffRiskFilter, GhCommands, GitAuthCommands, PortCommands, PortSignal, ToolCommands,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -871,6 +972,82 @@ mod tests {
         let cli = Cli::try_parse_from(["za", "completion", "zsh"]).expect("must parse");
         match cli.cmd {
             Commands::Completion { cmd } => assert!(matches!(cmd, CompletionCommands::Zsh)),
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn ai_shell_parses_shell_enum() {
+        let cli = Cli::try_parse_from(["za", "ai", "shell", "bash"]).expect("must parse");
+        match cli.cmd {
+            Commands::Ai {
+                cmd: AiCommands::Shell {
+                    shell: AiShell::Bash,
+                },
+            } => {}
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn ai_doctor_parses_json_flag() {
+        let cli = Cli::try_parse_from(["za", "ai", "doctor", "--json"]).expect("must parse");
+        match cli.cmd {
+            Commands::Ai {
+                cmd: AiCommands::Doctor { json: true },
+            } => {}
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn ai_gain_parses_days_and_json() {
+        let cli = Cli::try_parse_from(["za", "ai", "gain", "--days", "14", "--all", "--json"])
+            .expect("must parse");
+        match cli.cmd {
+            Commands::Ai {
+                cmd:
+                    AiCommands::Gain {
+                        days,
+                        all,
+                        json,
+                        daily: false,
+                        history: false,
+                        graph: false,
+                    },
+            } => {
+                assert_eq!(days, 14);
+                assert!(all);
+                assert!(json);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn ai_git_status_parses() {
+        let cli = Cli::try_parse_from(["za", "ai", "git", "status", "--json"]).expect("must parse");
+        match cli.cmd {
+            Commands::Ai {
+                cmd:
+                    AiCommands::Git {
+                        cmd: AiGitCommands::Status { args },
+                    },
+            } => assert!(args.json),
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn ai_git_diff_parses_cached_alias() {
+        let cli = Cli::try_parse_from(["za", "ai", "git", "diff", "--cached"]).expect("must parse");
+        match cli.cmd {
+            Commands::Ai {
+                cmd:
+                    AiCommands::Git {
+                        cmd: AiGitCommands::Diff { args },
+                    },
+            } => assert!(args.staged),
             _ => panic!("unexpected command"),
         }
     }

@@ -114,6 +114,31 @@ pub fn run(options: DiffRunOptions) -> Result<i32> {
     Ok(0)
 }
 
+pub fn render_workspace_output_for_ai(options: &DiffRunOptions) -> Result<String> {
+    if options.tui {
+        bail!("TUI diff output cannot be rendered as plain text");
+    }
+
+    let repo_root = resolve_repo_root()?;
+    let filters = DiffFilterSpec::from_run_options(options, &repo_root)?;
+    let report = collect_workspace_diff(&repo_root, options.files || !options.json, &filters)?;
+
+    if options.json {
+        serde_json::to_string_pretty(&report).context("serialize diff output")
+    } else {
+        Ok(render_diff_report(
+            &report,
+            RenderOptions {
+                use_color: false,
+                use_unicode_stat: false,
+                name_only: options.name_only,
+                terminal_width: Some(100),
+                interactive: false,
+            },
+        ))
+    }
+}
+
 pub fn run_stats(options: DiffStatsRunOptions) -> Result<i32> {
     let repo_root = resolve_repo_root()?;
     let report = collect_diff_stats(&repo_root, &options)?;

@@ -14,6 +14,13 @@ fn main() -> Result<()> {
         cli::ColorWhen::Never => command::style::ColorMode::Never,
     });
     match args.cmd {
+        cli::Commands::Ai { cmd } => {
+            let exit_code = command::ai::run(cmd)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         cli::Commands::Completion { cmd } => {
             let exit_code = command::completion::run(cmd)?;
             if exit_code != 0 {

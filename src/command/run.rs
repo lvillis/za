@@ -27,6 +27,12 @@ pub fn run(tool: &str, args: &[String]) -> Result<i32> {
     for (key, value) in normalized_proxy_env_from_system()? {
         cmd.env(key, value);
     }
+    if canonical == "codex" {
+        let workspace = env::current_dir().context("read current working directory")?;
+        for (key, value) in crate::command::ai::codex_env_overrides(&workspace)? {
+            cmd.env(key, value);
+        }
+    }
 
     let status = cmd
         .status()

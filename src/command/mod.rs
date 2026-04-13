@@ -1,5 +1,6 @@
 //! Shared helpers and constants for all sub-commands.
 
+pub mod ai;
 pub mod ci;
 pub mod codex;
 pub mod completion;
