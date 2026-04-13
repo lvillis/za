@@ -1,8 +1,19 @@
+## [0.1.53] - 2026-04-13
+
+### 🚀 Features
+
+- *(ai)* Add command routing and savings analytics
+- *(tool)* Add btm release policy with bottom alias
+- *(tool)* Add hyperfine release policy
 ## [0.1.52] - 2026-04-10
 
 ### 🚀 Features
 
 - *(diff)* Add daily change stats
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.52
 ## [0.1.51] - 2026-04-09
 
 ### 🚀 Features
