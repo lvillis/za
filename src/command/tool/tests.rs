@@ -382,6 +382,17 @@ fn tool_policy_matches_alias_and_canonical() {
         bpftop.github_release.expect("github policy").verification,
         GithubReleaseVerification::RequiredSha256Digest
     );
+    let hyperfine = find_tool_policy("hyperfine").expect("canonical policy");
+    assert_eq!(hyperfine.canonical_name, "hyperfine");
+    assert_eq!(hyperfine.cargo_fallback_package, None);
+    assert_eq!(hyperfine.source_label, "GitHub Release (SHA-256 verified)");
+    assert_eq!(
+        hyperfine
+            .github_release
+            .expect("github policy")
+            .verification,
+        GithubReleaseVerification::RequiredSha256Digest
+    );
     let dust = find_tool_policy("dust").expect("canonical policy");
     assert_eq!(dust.canonical_name, "dust");
     let oha = find_tool_policy("oha").expect("canonical policy");
@@ -464,6 +475,7 @@ fn canonical_tool_name_resolves_aliases() {
     assert_eq!(canonical_tool_name("bottom"), "btm");
     assert_eq!(canonical_tool_name("btm"), "btm");
     assert_eq!(canonical_tool_name("bpftop"), "bpftop");
+    assert_eq!(canonical_tool_name("hyperfine"), "hyperfine");
     assert_eq!(canonical_tool_name("docker-compose"), "docker-compose");
     assert_eq!(canonical_tool_name("oha"), "oha");
     assert_eq!(canonical_tool_name("starship"), "starship");
@@ -491,6 +503,7 @@ fn supported_tool_names_csv_contains_all_aliases() {
     assert!(csv.contains("btm"));
     assert!(csv.contains("bottom"));
     assert!(csv.contains("bpftop"));
+    assert!(csv.contains("hyperfine"));
     assert!(csv.contains("dust"));
     assert!(csv.contains("just"));
     assert!(csv.contains("oha"));
@@ -682,6 +695,27 @@ fn bpftop_policy_expected_asset_name_matches_supported_binary() {
         other => panic!("unsupported local test platform: {other:?}"),
     };
     assert_eq!(asset_name, format!("bpftop-{expected_target}"));
+}
+
+#[test]
+fn hyperfine_policy_expected_asset_name_matches_supported_tarball() {
+    let policy = find_tool_policy("hyperfine")
+        .expect("policy")
+        .github_release
+        .expect("github policy");
+    let asset_name =
+        (policy.expected_asset_name.expect("asset resolver"))("1.20.0").expect("asset name");
+    let expected_target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        other => panic!("unsupported local test platform: {other:?}"),
+    };
+    assert_eq!(
+        asset_name,
+        format!("hyperfine-v1.20.0-{expected_target}.tar.gz")
+    );
 }
 
 #[test]
