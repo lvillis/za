@@ -766,13 +766,23 @@ fn ensure_ai_runtime_dir() -> Result<PathBuf> {
     let mut last_error = None;
     for dir in candidates {
         match fs::create_dir_all(&dir) {
-            Ok(()) => return Ok(dir),
-            Err(error) => last_error = Some((dir, error)),
+            Ok(()) => match ensure_dir_writable(&dir) {
+                Ok(()) => return Ok(dir),
+                Err(error) => last_error = Some((dir, error)),
+            },
+            Err(error) => last_error = Some((dir, error.into())),
         }
     }
 
     let (dir, error) = last_error.expect("AI runtime dir candidates must not be empty");
     Err(error).with_context(|| format!("create AI shell runtime dir {}", dir.display()))
+}
+
+fn ensure_dir_writable(dir: &Path) -> Result<()> {
+    let probe = dir.join(format!(".za-write-probe-{}", std::process::id()));
+    fs::write(&probe, b"ok").with_context(|| format!("write probe file {}", probe.display()))?;
+    let _ = fs::remove_file(&probe);
+    Ok(())
 }
 
 fn estimate_tokens_from_bytes(bytes: u64) -> u64 {

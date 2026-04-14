@@ -151,12 +151,16 @@ za ide ps
 za ide ps --duplicates
 za ide reconcile
 za ide reconcile --apply
+za ide fix --dry-run
+za ide fix
 za ide stop 42589
 ```
 
 `za ide reconcile` reads policy from config:
 - `ide-max-per-project` (default `1`)
 - `ide-orphan-ttl-minutes` (default `30`)
+
+`za ide fix` stops orphaned backends, stops stale Toolbox main processes, and cleans stale Toolbox IPC socket / semaphore state when no Toolbox main process remains.
 
 ### 7) Track GitHub Actions
 

@@ -3621,6 +3621,8 @@ mod tests {
         init_empty_repo(path)?;
         git(path, &["config", "user.email", "za@example.com"])?;
         git(path, &["config", "user.name", "za"])?;
+        git(path, &["config", "commit.gpgSign", "false"])?;
+        git(path, &["config", "tag.gpgSign", "false"])?;
         Ok(())
     }
 

@@ -12,8 +12,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    fs,
-    path::Path,
+    env, fs,
+    path::{Path, PathBuf},
     process::Command,
     thread,
     time::{Duration, Instant},
@@ -235,6 +235,38 @@ struct IdeReconcileOutput {
     orphan_failures: Vec<ReconcileFailure>,
 }
 
+#[derive(Debug, Clone)]
+struct ToolboxMainProcess {
+    pid: i32,
+    ppid: i32,
+    start_ticks: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct IdeFixFailure {
+    target: String,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct IdeFixOutput {
+    dry_run: bool,
+    orphan_backend_pids: Vec<i32>,
+    orphan_backend_stopped: Vec<i32>,
+    orphan_backend_failures: Vec<IdeFixFailure>,
+    toolbox_pids: Vec<i32>,
+    toolbox_stopped: Vec<i32>,
+    toolbox_failures: Vec<IdeFixFailure>,
+    ipc_socket_path: Option<String>,
+    ipc_socket_existed: bool,
+    ipc_socket_removed: bool,
+    semaphore_key: Option<String>,
+    semaphore_ids: Vec<i32>,
+    semaphore_removed: Vec<i32>,
+    semaphore_failures: Vec<IdeFixFailure>,
+    notes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum ConfidenceLevel {
@@ -254,6 +286,7 @@ struct IdeProjectRow {
     seconds_since_last_controller_activity: Option<u64>,
     date_last_opened_ms: Option<u64>,
     project_opened_age_secs: Option<u64>,
+    state: String,
     backend_unresponsive: bool,
     modal_dialog_is_opened: bool,
     background_tasks_running: bool,
@@ -287,6 +320,11 @@ pub fn run(cmd: IdeCommands) -> Result<i32> {
             timeout_secs,
             json,
         } => run_reconcile(apply, keep, timeout_secs, json),
+        IdeCommands::Fix {
+            dry_run,
+            timeout_secs,
+            json,
+        } => run_fix(dry_run, timeout_secs, json),
     }
 }
 
@@ -305,7 +343,8 @@ fn run_ps(duplicates_only: bool, json: bool) -> Result<i32> {
 
     let duplicate_groups = over_limit_group_count(&sessions, policy.max_per_project);
     let orphan_due = sessions.iter().filter(|s| s.orphan_due).count();
-    let project_rows = project_state::build_project_rows(&sessions, &opened_projects);
+    let mut project_rows = project_state::build_project_rows(&sessions, &opened_projects);
+    sort_project_rows_for_ps(&mut project_rows);
     if json {
         let out = IdePsOutput {
             total: sessions.len(),
@@ -333,8 +372,8 @@ fn run_ps(duplicates_only: bool, json: bool) -> Result<i32> {
     }
 
     println!(
-        "{:<7} {:<12} {:<12} {:>5} {:>6} {:>5} {:<12} {:>6} {:>6}  PROJECT",
-        "PID", "IDE", "VER", "CONN", "IDLE", "SHELL", "HEALTH", "FRESH", "CONF"
+        "{:<7} {:<12} {:<12} {:>5} {:>6} {:<10} {:<12} {:>5} {:>6} {:>6}  PROJECT",
+        "PID", "IDE", "VER", "CTRL", "IDLE", "STATE", "HEALTH", "SHELL", "FRESH", "CONF"
     );
     for row in &project_rows {
         let version = truncate_end(&project_state::ide_project_row_version_label(row), 12);
@@ -348,14 +387,15 @@ fn run_ps(duplicates_only: bool, json: bool) -> Result<i32> {
             .map(|secs| format!("{secs}s"))
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "{:<7} {:<12} {:<12} {:>5} {:>6} {:>5} {:<12} {:>6} {:>6}  {}",
+            "{:<7} {:<12} {:<12} {:>5} {:>6} {:<10} {:<12} {:>5} {:>6} {:>6}  {}",
             row.pid,
             truncate_end(&row.ide, 12),
             version,
             conn,
             idle,
-            row.shell_children,
+            truncate_end(&row.state, 10),
             truncate_end(&row.health, 12),
+            row.shell_children,
             freshness,
             project_state::confidence_label(row.confidence),
             row.project_path
@@ -372,6 +412,14 @@ fn run_ps(duplicates_only: bool, json: bool) -> Result<i32> {
         "Orphan due sessions (ttl={}m): {}",
         policy.orphan_ttl_minutes, orphan_due
     );
+    if orphan_due > 0 {
+        println!(
+            "Note: orphan means the backend was reparented to pid 1 and may no longer be attachable by Gateway/Toolbox."
+        );
+        println!(
+            "Hint: review `za ide reconcile` and apply cleanup with `za ide reconcile --apply`."
+        );
+    }
     Ok(0)
 }
 
@@ -631,6 +679,161 @@ fn run_reconcile(
     Ok(0)
 }
 
+fn run_fix(dry_run: bool, timeout_secs: u64, json: bool) -> Result<i32> {
+    let policy = za_config::load_ide_jetbrains_policy()?;
+    let mut sessions = collect_ide_sessions()?;
+    annotate_group_state(
+        &mut sessions,
+        policy.max_per_project,
+        policy.orphan_ttl_minutes,
+    );
+
+    let orphan_identities = sessions
+        .iter()
+        .filter(|session| session.orphan_due)
+        .map(|session| {
+            (
+                session.pid,
+                ProcessIdentity {
+                    pid: session.pid,
+                    start_ticks: session.start_ticks,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let toolbox_processes = collect_toolbox_main_processes()?;
+
+    let mut orphan_backend_stopped = Vec::new();
+    let mut orphan_backend_failures = Vec::new();
+    let mut toolbox_stopped = Vec::new();
+    let mut toolbox_failures = Vec::new();
+    let timeout = Duration::from_secs(timeout_secs);
+
+    if !dry_run {
+        for (pid, identity) in &orphan_identities {
+            match stop_session(*identity, timeout) {
+                Ok(_) => orphan_backend_stopped.push(*pid),
+                Err(err) => orphan_backend_failures.push(IdeFixFailure {
+                    target: format!("pid {pid}"),
+                    error: err.to_string(),
+                }),
+            }
+        }
+        for process in &toolbox_processes {
+            let identity = ProcessIdentity {
+                pid: process.pid,
+                start_ticks: process.start_ticks,
+            };
+            match stop_session(identity, timeout) {
+                Ok(_) => toolbox_stopped.push(process.pid),
+                Err(err) => toolbox_failures.push(IdeFixFailure {
+                    target: format!("pid {}", process.pid),
+                    error: err.to_string(),
+                }),
+            }
+        }
+    }
+
+    let active_toolbox = toolbox_processes
+        .iter()
+        .filter(|process| {
+            process_matches_identity(ProcessIdentity {
+                pid: process.pid,
+                start_ticks: process.start_ticks,
+            })
+        })
+        .map(|process| process.pid)
+        .collect::<Vec<_>>();
+
+    let ipc_socket_path = toolbox_ipc_socket_path();
+    let ipc_socket_existed = ipc_socket_path.as_ref().is_some_and(|path| path.exists());
+    let mut ipc_socket_removed = false;
+    let mut notes = Vec::new();
+    if !dry_run && !active_toolbox.is_empty() {
+        notes.push(format!(
+            "Toolbox main processes still active after stop attempt: {:?}; skipped IPC cleanup.",
+            active_toolbox
+        ));
+    }
+    if let Some(path) = ipc_socket_path.as_ref()
+        && ipc_socket_existed
+        && active_toolbox.is_empty()
+        && !dry_run
+    {
+        match fs::remove_file(path) {
+            Ok(()) => ipc_socket_removed = true,
+            Err(err) => notes.push(format!(
+                "Failed to remove Toolbox IPC socket {}: {err}",
+                path.display()
+            )),
+        }
+    }
+
+    let semaphore_key = discover_toolbox_ipc_key();
+    let semaphore_ids = match semaphore_key.as_deref() {
+        Some(key) => list_semaphore_ids_by_key(key)?,
+        None => Vec::new(),
+    };
+    let mut semaphore_removed = Vec::new();
+    let mut semaphore_failures = Vec::new();
+    if semaphore_key.is_none() {
+        notes.push("Could not infer Toolbox IPC semaphore key from Toolbox logs.".to_string());
+    }
+    if !semaphore_ids.is_empty() && active_toolbox.is_empty() {
+        for semid in &semaphore_ids {
+            if dry_run {
+                continue;
+            }
+            match remove_semaphore(*semid) {
+                Ok(()) => semaphore_removed.push(*semid),
+                Err(err) => semaphore_failures.push(IdeFixFailure {
+                    target: format!("semid {semid}"),
+                    error: err.to_string(),
+                }),
+            }
+        }
+    } else if !dry_run && !semaphore_ids.is_empty() && !active_toolbox.is_empty() {
+        notes.push(format!(
+            "Skipped semaphore cleanup for key {} because Toolbox main process(es) still appear active.",
+            semaphore_key.as_deref().unwrap_or("?")
+        ));
+    }
+
+    let output = IdeFixOutput {
+        dry_run,
+        orphan_backend_pids: orphan_identities.iter().map(|(pid, _)| *pid).collect(),
+        orphan_backend_stopped,
+        orphan_backend_failures,
+        toolbox_pids: toolbox_processes
+            .iter()
+            .map(|process| process.pid)
+            .collect(),
+        toolbox_stopped,
+        toolbox_failures,
+        ipc_socket_path: ipc_socket_path.map(|path| path.display().to_string()),
+        ipc_socket_existed,
+        ipc_socket_removed,
+        semaphore_key,
+        semaphore_ids,
+        semaphore_removed,
+        semaphore_failures,
+        notes,
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).context("serialize ide fix output")?
+        );
+    } else {
+        for line in render_fix_lines(&output) {
+            println!("{line}");
+        }
+    }
+
+    Ok((!dry_run && ide_fix_has_failures(&output)) as i32)
+}
+
 fn collect_ide_sessions() -> Result<Vec<IdeSession>> {
     proc_scan::collect_ide_sessions()
 }
@@ -796,6 +999,314 @@ fn truncate_end(input: &str, max_chars: usize) -> String {
     out
 }
 
+fn sort_project_rows_for_ps(rows: &mut [IdeProjectRow]) {
+    rows.sort_by(|a, b| {
+        project_row_attention_rank(a)
+            .cmp(&project_row_attention_rank(b))
+            .then_with(|| a.project_path.cmp(&b.project_path))
+            .then_with(|| a.ide.cmp(&b.ide))
+            .then_with(|| a.pid.cmp(&b.pid))
+    });
+}
+
+fn project_row_attention_rank(row: &IdeProjectRow) -> u8 {
+    if row.orphan_due {
+        return 0;
+    }
+    if row.over_limit {
+        return 1;
+    }
+    if row.backend_unresponsive || row.modal_dialog_is_opened {
+        return 2;
+    }
+    if !row.ide_station_socket_live {
+        return 3;
+    }
+    if row.remote_snapshot_age_secs.is_none() {
+        return 4;
+    }
+    if !row.controller_connected {
+        return 5;
+    }
+    if row.background_tasks_running {
+        return 6;
+    }
+    7
+}
+
+fn parse_proc_pid_dir_name(name: &str) -> Option<i32> {
+    if name.chars().all(|c| c.is_ascii_digit()) {
+        return name.parse::<i32>().ok();
+    }
+    None
+}
+
+fn collect_toolbox_main_processes() -> Result<Vec<ToolboxMainProcess>> {
+    let proc_root = Path::new(PROC_ROOT);
+    if !proc_root.exists() {
+        bail!("`za ide` is only supported on Linux with /proc");
+    }
+    let mut processes = Vec::new();
+    for entry in fs::read_dir(proc_root).context("read /proc for toolbox main processes")? {
+        let entry = match entry {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let Some(pid) = parse_proc_pid_dir_name(&entry.file_name().to_string_lossy()) else {
+            continue;
+        };
+        let proc_dir = entry.path();
+        let raw = fs::read(proc_dir.join("cmdline")).unwrap_or_default();
+        if raw.is_empty() {
+            continue;
+        }
+        let args = proc_scan::parse_cmdline(&raw);
+        if !args
+            .iter()
+            .any(|arg| arg.contains("com.jetbrains.toolbox.MainKt"))
+        {
+            continue;
+        }
+        let stat_raw = match fs::read_to_string(proc_dir.join("stat")) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let Some(stat) = proc_scan::parse_proc_stat_line(&stat_raw) else {
+            continue;
+        };
+        processes.push(ToolboxMainProcess {
+            pid,
+            ppid: stat.ppid,
+            start_ticks: stat.start_ticks,
+        });
+    }
+    processes.sort_by(|a, b| a.ppid.cmp(&b.ppid).then_with(|| a.pid.cmp(&b.pid)));
+    Ok(processes)
+}
+
+fn toolbox_ipc_socket_path() -> Option<PathBuf> {
+    let cache_home = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    Some(cache_home.join("JetBrains/Toolbox/ipc"))
+}
+
+fn toolbox_logs_dirs() -> Vec<PathBuf> {
+    let Some(data_home) = env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+    else {
+        return Vec::new();
+    };
+    let base = data_home.join("JetBrains/Toolbox/logs");
+    vec![base.clone(), base.join("secondary")]
+}
+
+fn discover_toolbox_ipc_key() -> Option<String> {
+    let mut newest: Option<(u128, String)> = None;
+    for dir in toolbox_logs_dirs() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let modified_ms = match fs::metadata(&path)
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            {
+                Some(duration) => duration.as_millis(),
+                None => continue,
+            };
+            let raw = match fs::read_to_string(&path) {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            let mut found = None;
+            for line in raw.lines() {
+                if let Some(key) = parse_toolbox_ipc_key_line(line) {
+                    found = Some(key);
+                }
+            }
+            let Some(key) = found else {
+                continue;
+            };
+            match &newest {
+                Some((seen_ms, _)) if *seen_ms > modified_ms => {}
+                _ => newest = Some((modified_ms, key)),
+            }
+        }
+    }
+    newest.map(|(_, key)| key)
+}
+
+fn parse_toolbox_ipc_key_line(line: &str) -> Option<String> {
+    let (_, rest) = line.split_once("ipc_key=")?;
+    let digits = rest
+        .chars()
+        .take_while(|ch| *ch == '-' || ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        return None;
+    }
+    let value = digits.parse::<i32>().ok()?;
+    Some(format!("0x{:08x}", value as u32))
+}
+
+fn list_semaphore_ids_by_key(key_hex: &str) -> Result<Vec<i32>> {
+    let output = Command::new("ipcs")
+        .arg("-s")
+        .output()
+        .context("run `ipcs -s` for Toolbox semaphore inspection")?;
+    if !output.status.success() {
+        bail!("`ipcs -s` failed with status {}", output.status);
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_ipcs_semaphore_rows(&raw)
+        .into_iter()
+        .filter_map(|(key, semid)| key.eq_ignore_ascii_case(key_hex).then_some(semid))
+        .collect())
+}
+
+fn parse_ipcs_semaphore_rows(raw: &str) -> Vec<(String, i32)> {
+    raw.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with("0x") && !line.starts_with("0X") {
+                return None;
+            }
+            let mut cols = line.split_whitespace();
+            let key = cols.next()?.to_ascii_lowercase();
+            let semid = cols.next()?.parse::<i32>().ok()?;
+            Some((key, semid))
+        })
+        .collect()
+}
+
+fn remove_semaphore(semid: i32) -> Result<()> {
+    let status = Command::new("ipcrm")
+        .args(["-s", &semid.to_string()])
+        .status()
+        .with_context(|| format!("run `ipcrm -s {semid}`"))?;
+    if !status.success() {
+        bail!("`ipcrm -s {semid}` failed with status {status}");
+    }
+    Ok(())
+}
+
+fn ide_fix_has_failures(output: &IdeFixOutput) -> bool {
+    !output.orphan_backend_failures.is_empty()
+        || !output.toolbox_failures.is_empty()
+        || !output.semaphore_failures.is_empty()
+}
+
+fn render_fix_lines(output: &IdeFixOutput) -> Vec<String> {
+    let status = if output.dry_run {
+        "plan"
+    } else if ide_fix_has_failures(output) {
+        "partial"
+    } else if output.orphan_backend_pids.is_empty()
+        && output.toolbox_pids.is_empty()
+        && !output.ipc_socket_existed
+        && output.semaphore_ids.is_empty()
+    {
+        "clean"
+    } else {
+        "fixed"
+    };
+    let mut lines = Vec::new();
+    lines.push("za ide fix".to_string());
+    lines.push(format!("status         {status}"));
+    lines.push(format!(
+        "orphan backends {}",
+        render_fix_pid_action(
+            &output.orphan_backend_pids,
+            &output.orphan_backend_stopped,
+            output.dry_run,
+            "stop"
+        )
+    ));
+    lines.push(format!(
+        "toolbox pids   {}",
+        render_fix_pid_action(
+            &output.toolbox_pids,
+            &output.toolbox_stopped,
+            output.dry_run,
+            "stop"
+        )
+    ));
+    lines.push(format!(
+        "ipc socket     {}",
+        match (
+            &output.ipc_socket_path,
+            output.ipc_socket_existed,
+            output.ipc_socket_removed,
+            output.dry_run
+        ) {
+            (Some(path), true, true, false) => format!("removed {path}"),
+            (Some(path), true, true, true) => format!("would remove {path}"),
+            (Some(path), true, false, true) => format!("would remove {path}"),
+            (Some(path), true, false, false) => format!("present {path}"),
+            (Some(path), false, _, _) => format!("absent {path}"),
+            (None, _, _, _) => "unavailable".to_string(),
+        }
+    ));
+    lines.push(format!(
+        "semaphore      {}",
+        match (
+            &output.semaphore_key,
+            output.semaphore_ids.is_empty(),
+            output.semaphore_removed.is_empty(),
+            output.dry_run
+        ) {
+            (Some(key), false, false, false) =>
+                format!("removed {key} {:?}", output.semaphore_removed),
+            (Some(key), false, false, true) => {
+                format!("would remove {key} {:?}", output.semaphore_ids)
+            }
+            (Some(key), false, true, true) =>
+                format!("would remove {key} {:?}", output.semaphore_ids),
+            (Some(key), false, true, false) => format!("present {key} {:?}", output.semaphore_ids),
+            (Some(key), true, _, _) => format!("none for {key}"),
+            (None, _, _, _) => "key unavailable".to_string(),
+        }
+    ));
+    if !output.orphan_backend_failures.is_empty()
+        || !output.toolbox_failures.is_empty()
+        || !output.semaphore_failures.is_empty()
+        || !output.notes.is_empty()
+    {
+        lines.push("notes".to_string());
+        for failure in &output.orphan_backend_failures {
+            lines.push(format!("  - failed {}: {}", failure.target, failure.error));
+        }
+        for failure in &output.toolbox_failures {
+            lines.push(format!("  - failed {}: {}", failure.target, failure.error));
+        }
+        for failure in &output.semaphore_failures {
+            lines.push(format!("  - failed {}: {}", failure.target, failure.error));
+        }
+        for note in &output.notes {
+            lines.push(format!("  - {note}"));
+        }
+    }
+    lines
+}
+
+fn render_fix_pid_action(targets: &[i32], stopped: &[i32], dry_run: bool, verb: &str) -> String {
+    if targets.is_empty() {
+        return "none".to_string();
+    }
+    if dry_run {
+        return format!("would {verb} {targets:?}");
+    }
+    format!("{verb} {stopped:?} (found {targets:?})")
+}
+
 #[cfg(test)]
 mod tests {
     use super::proc_scan::{
@@ -803,8 +1314,10 @@ mod tests {
         parse_build_number_from_build_txt, parse_cmdline, parse_proc_stat_line,
     };
     use super::{
-        IdeReconcileStrategy, IdeSession, ProcessIdentity, pick_keep_pid, pick_keep_pids,
-        process_matches_identity, read_process_start_ticks,
+        ConfidenceLevel, IdeFixOutput, IdeProjectRow, IdeReconcileStrategy, IdeSession,
+        ProcessIdentity, parse_ipcs_semaphore_rows, parse_toolbox_ipc_key_line, pick_keep_pid,
+        pick_keep_pids, process_matches_identity, project_row_attention_rank,
+        read_process_start_ticks, render_fix_lines, sort_project_rows_for_ps,
     };
 
     #[test]
@@ -962,5 +1475,103 @@ mod tests {
             pid,
             start_ticks: start_ticks.saturating_add(1),
         }));
+    }
+
+    #[test]
+    fn project_row_attention_rank_prioritizes_orphan_due_rows() {
+        let orphan = sample_project_row();
+        let mut live = sample_project_row();
+        live.orphan_due = false;
+        assert!(project_row_attention_rank(&orphan) < project_row_attention_rank(&live));
+    }
+
+    #[test]
+    fn sort_project_rows_for_ps_moves_attention_rows_first() {
+        let mut rows = vec![
+            {
+                let mut row = sample_project_row();
+                row.pid = 200;
+                row.orphan_due = false;
+                row.state = "live".to_string();
+                row
+            },
+            sample_project_row(),
+        ];
+        sort_project_rows_for_ps(&mut rows);
+        assert_eq!(rows[0].pid, 100);
+        assert!(rows[0].orphan_due);
+    }
+
+    #[test]
+    fn parse_toolbox_ipc_key_line_converts_signed_decimal_to_hex() {
+        assert_eq!(
+            parse_toolbox_ipc_key_line("13:59:02 | Semaphore | ipc_key=-855630266").as_deref(),
+            Some("0xcd001e46")
+        );
+    }
+
+    #[test]
+    fn parse_ipcs_semaphore_rows_extracts_key_and_semid() {
+        let rows = parse_ipcs_semaphore_rows(
+            "------ Semaphore Arrays --------\nkey        semid      owner\n0xcd001e46 1          root\n",
+        );
+        assert_eq!(rows, vec![("0xcd001e46".to_string(), 1)]);
+    }
+
+    #[test]
+    fn render_fix_lines_mentions_socket_and_semaphore_plan() {
+        let lines = render_fix_lines(&IdeFixOutput {
+            dry_run: true,
+            orphan_backend_pids: vec![11],
+            orphan_backend_stopped: Vec::new(),
+            orphan_backend_failures: Vec::new(),
+            toolbox_pids: vec![22],
+            toolbox_stopped: Vec::new(),
+            toolbox_failures: Vec::new(),
+            ipc_socket_path: Some("/root/.cache/JetBrains/Toolbox/ipc".to_string()),
+            ipc_socket_existed: true,
+            ipc_socket_removed: false,
+            semaphore_key: Some("0xcd001e46".to_string()),
+            semaphore_ids: vec![1],
+            semaphore_removed: Vec::new(),
+            semaphore_failures: Vec::new(),
+            notes: Vec::new(),
+        });
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("would stop [11]"));
+        assert!(rendered.contains("would remove /root/.cache/JetBrains/Toolbox/ipc"));
+        assert!(rendered.contains("would remove 0xcd001e46 [1]"));
+    }
+
+    fn sample_project_row() -> IdeProjectRow {
+        IdeProjectRow {
+            pid: 100,
+            ide: "rustrover".to_string(),
+            ide_version: Some("2026.1".to_string()),
+            ide_build_number: Some("261.1".to_string()),
+            project_path: "/opt/app/joint".to_string(),
+            controller_connected: true,
+            seconds_since_last_controller_activity: Some(0),
+            date_last_opened_ms: Some(0),
+            project_opened_age_secs: Some(0),
+            state: "orphan".to_string(),
+            backend_unresponsive: false,
+            modal_dialog_is_opened: false,
+            background_tasks_running: false,
+            health: "ok".to_string(),
+            users: Vec::new(),
+            users_count: 0,
+            cpu_percent: 0.0,
+            rss_bytes: 0,
+            uptime_secs: 0,
+            child_count: 0,
+            shell_children: 0,
+            remote_snapshot_age_secs: Some(0),
+            ide_station_socket_live: true,
+            confidence: ConfidenceLevel::High,
+            duplicate_group_size: 1,
+            over_limit: false,
+            orphan_due: true,
+        }
     }
 }

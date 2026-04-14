@@ -197,6 +197,13 @@ pub(super) fn build_project_rows(
                     now_ms,
                     project.date_last_opened_ms,
                 ),
+                state: project_state_label(
+                    session.orphan_due,
+                    session.over_limit,
+                    session.ide_station_socket_live,
+                    project_snapshot_age_secs,
+                    project.connected,
+                ),
                 backend_unresponsive: session.remote_backend_unresponsive,
                 modal_dialog_is_opened: session.remote_modal_dialog_is_opened,
                 background_tasks_running: project.background_tasks_running,
@@ -257,6 +264,13 @@ fn build_non_remote_project_row(session: &IdeSession, project_path: String) -> I
         seconds_since_last_controller_activity: None,
         date_last_opened_ms: None,
         project_opened_age_secs: None,
+        state: project_state_label(
+            session.orphan_due,
+            session.over_limit,
+            session.ide_station_socket_live,
+            session.remote_snapshot_age_secs,
+            false,
+        ),
         backend_unresponsive: session.remote_backend_unresponsive,
         modal_dialog_is_opened: session.remote_modal_dialog_is_opened,
         background_tasks_running: false,
@@ -565,6 +579,33 @@ fn project_health_label(
         return "ok".to_string();
     }
     parts.join("+")
+}
+
+fn project_state_label(
+    orphan_due: bool,
+    over_limit: bool,
+    ide_station_socket_live: bool,
+    remote_snapshot_age_secs: Option<u64>,
+    controller_connected: bool,
+) -> String {
+    if orphan_due {
+        return "orphan".to_string();
+    }
+    if over_limit {
+        return "duplicate".to_string();
+    }
+    if !ide_station_socket_live {
+        return "no-socket".to_string();
+    }
+    match remote_snapshot_age_secs {
+        Some(age) if age > PROJECT_SNAPSHOT_MAX_AGE_SECS => return "stale".to_string(),
+        None => return "unknown".to_string(),
+        Some(_) => {}
+    }
+    if !controller_connected {
+        return "detached".to_string();
+    }
+    "live".to_string()
 }
 
 fn infer_confidence(

@@ -716,6 +716,18 @@ pub enum IdeCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Fix stale JetBrains Toolbox IPC state and orphaned backends
+    Fix {
+        /// Print the planned actions without applying them.
+        #[arg(long)]
+        dry_run: bool,
+        /// Graceful shutdown timeout before SIGKILL.
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -962,7 +974,8 @@ mod tests {
     use super::{
         AiCommands, AiGitCommands, AiShell, CiCommands, Cli, CodexCommands, ColorWhen, Commands,
         CompletionCommands, CompletionShell, DepsCommands, DiffArgs, DiffCommands, DiffKindFilter,
-        DiffRiskFilter, GhCommands, GitAuthCommands, PortCommands, PortSignal, ToolCommands,
+        DiffRiskFilter, GhCommands, GitAuthCommands, IdeCommands, PortCommands, PortSignal,
+        ToolCommands,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -1901,6 +1914,33 @@ mod tests {
                 }
                 _ => panic!("unexpected gh command"),
             },
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn ide_fix_parses_flags() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "ide",
+            "fix",
+            "--dry-run",
+            "--timeout-secs",
+            "9",
+            "--json",
+        ])
+        .expect("must parse");
+        match cli.cmd {
+            Commands::Ide { cmd } => {
+                assert!(matches!(
+                    cmd,
+                    IdeCommands::Fix {
+                        dry_run: true,
+                        timeout_secs: 9,
+                        json: true
+                    }
+                ));
+            }
             _ => panic!("unexpected command"),
         }
     }
