@@ -1,3 +1,8 @@
+## [0.1.54] - 2026-04-14
+
+### 🚀 Features
+
+- *(ide)* Add toolbox IPC fix command
 ## [0.1.53] - 2026-04-13
 
 ### 🚀 Features
@@ -5,6 +10,10 @@
 - *(ai)* Add command routing and savings analytics
 - *(tool)* Add btm release policy with bottom alias
 - *(tool)* Add hyperfine release policy
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.53
 ## [0.1.52] - 2026-04-10
 
 ### 🚀 Features
