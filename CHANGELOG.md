@@ -1,8 +1,17 @@
+## [0.1.55] - 2026-04-20
+
+### 🚀 Features
+
+- *(tool)* Add cargo-fuzz install support
 ## [0.1.54] - 2026-04-14
 
 ### 🚀 Features
 
 - *(ide)* Add toolbox IPC fix command
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.54
 ## [0.1.53] - 2026-04-13
 
 ### 🚀 Features
