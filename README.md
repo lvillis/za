@@ -97,6 +97,7 @@ za tool install ble.sh
 za tool install git-cliff
 za tool install cargo-release
 za tool install cargo-nextest
+za tool install cargo-fuzz
 za tool install cross
 
 za tool ls
@@ -322,6 +323,7 @@ Current built-in tool policies:
 | `git-cliff` | - | GitHub Release (SHA-256 verify) |
 | `cargo-release` | - | GitHub Release (SHA-256 verify) |
 | `cargo-nextest` | - | GitHub Release (SHA-256 verify) |
+| `cargo-fuzz` | - | GitHub Release (SHA-256 verify) |
 | `cross` | - | GitHub Release (SHA-256 unavailable; unverified) |
 
 ### Common workflows
@@ -329,7 +331,7 @@ Current built-in tool policies:
 ```bash
 # install the latest release and make it active
 za tool install codex
-za tool install just bottom bpftop hyperfine starship ble.sh git-cliff cargo-release cargo-nextest cross
+za tool install just bottom bpftop hyperfine starship ble.sh git-cliff cargo-release cargo-nextest cargo-fuzz cross
 za tool install just starship ble.sh --verbose
 
 # install a specific version and make it active
