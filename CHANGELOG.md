@@ -1,8 +1,17 @@
+## [0.1.56] - 2026-04-21
+
+### 🚀 Features
+
+- *(codex)* Add workspace-scoped ps and global stop
 ## [0.1.55] - 2026-04-20
 
 ### 🚀 Features
 
 - *(tool)* Add cargo-fuzz install support
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.55
 ## [0.1.54] - 2026-04-14
 
 ### 🚀 Features
