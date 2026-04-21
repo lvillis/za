@@ -60,9 +60,9 @@ pub fn run(cmd: Option<CodexCommands>, passthrough_args: &[String]) -> Result<i3
         Some(CodexCommands::Attach) => run_attach(),
         Some(CodexCommands::Exec { args }) => run_exec(&args),
         Some(CodexCommands::Resume { args }) => run_resume(&args),
-        Some(CodexCommands::Ps { json }) => run_ps(json),
+        Some(CodexCommands::Ps { json, all }) => run_ps(json, all),
         Some(CodexCommands::Top { all, history }) => run_top(all, history),
-        Some(CodexCommands::Stop { json }) => run_stop(json),
+        Some(CodexCommands::Stop { json, all }) => run_stop(json, all),
         None if passthrough_args.is_empty() => run_up(&[]),
         None => run_up_with_args(passthrough_args, true, "passthrough"),
     }
@@ -93,12 +93,16 @@ fn run_up_with_args(args: &[String], force_recreate: bool, launcher: &str) -> Re
             start_managed_session(&ctx, CodexLaunchMode::Fresh, launcher, args)?;
         } else {
             persist_session_record(&ctx, launcher, args)?;
-            return maybe_attach_or_report(&ctx.session_name, &ctx.workspace_root);
+            return maybe_attach_or_report(
+                &ctx.session_name,
+                &ctx.workspace_root,
+                &ctx.workspace_label,
+            );
         }
     } else {
         start_managed_session(&ctx, CodexLaunchMode::Fresh, launcher, args)?;
     }
-    maybe_attach_or_report(&ctx.session_name, &ctx.workspace_root)
+    maybe_attach_or_report(&ctx.session_name, &ctx.workspace_root, &ctx.workspace_label)
 }
 
 fn run_resume(args: &[String]) -> Result<i32> {
@@ -126,12 +130,16 @@ fn run_resume_with_args(args: &[String], force_recreate: bool, launcher: &str) -
             start_managed_session(&ctx, CodexLaunchMode::ResumeLast, launcher, args)?;
         } else {
             persist_session_record(&ctx, launcher, args)?;
-            return maybe_attach_or_report(&ctx.session_name, &ctx.workspace_root);
+            return maybe_attach_or_report(
+                &ctx.session_name,
+                &ctx.workspace_root,
+                &ctx.workspace_label,
+            );
         }
     } else {
         start_managed_session(&ctx, CodexLaunchMode::ResumeLast, launcher, args)?;
     }
-    maybe_attach_or_report(&ctx.session_name, &ctx.workspace_root)
+    maybe_attach_or_report(&ctx.session_name, &ctx.workspace_root, &ctx.workspace_label)
 }
 
 fn restart_managed_session(ctx: &WorkspaceContext, launcher: &str, args: &[String]) -> Result<()> {
@@ -167,6 +175,7 @@ fn start_managed_session(
     let command = build_codex_launch_command(&ctx.workspace_root, mode, args)?;
     tmux_new_session(&ctx.session_name, &ctx.workspace_root, &command)?;
     tmux_apply_codex_terminal_fixes(&ctx.session_name)?;
+    tmux_apply_codex_session_style(&ctx.session_name, &ctx.workspace_label)?;
     persist_session_record(ctx, launcher, args)?;
     Ok(())
 }
@@ -181,7 +190,7 @@ fn run_attach() -> Result<i32> {
             ctx.workspace_root.display()
         );
     }
-    maybe_attach_or_report(&ctx.session_name, &ctx.workspace_root)
+    maybe_attach_or_report(&ctx.session_name, &ctx.workspace_root, &ctx.workspace_label)
 }
 
 fn run_exec(args: &[String]) -> Result<i32> {
@@ -211,7 +220,7 @@ fn run_exec(args: &[String]) -> Result<i32> {
     )?;
 
     if interactive {
-        attach_session(&ctx.session_name)
+        attach_session(&ctx.session_name, &ctx.workspace_label)
     } else {
         println!(
             "Started tmux window `{}` in session `{}` for {}.",
@@ -223,7 +232,7 @@ fn run_exec(args: &[String]) -> Result<i32> {
     }
 }
 
-fn run_ps(json: bool) -> Result<i32> {
+fn run_ps(json: bool, all: bool) -> Result<i32> {
     let tmux_probe = probe_tmux()?;
     let tmux_available = matches!(tmux_probe, TmuxProbe::Available);
     let tmux_sessions = if tmux_available {
@@ -231,7 +240,16 @@ fn run_ps(json: bool) -> Result<i32> {
     } else {
         BTreeMap::new()
     };
-    let rows = collect_session_rows(&tmux_sessions, tmux_available)?;
+    let current_session_name = if all {
+        None
+    } else {
+        Some(resolve_workspace_context()?.session_name)
+    };
+    let rows = collect_session_rows(
+        &tmux_sessions,
+        tmux_available,
+        current_session_name.as_deref(),
+    )?;
 
     if json {
         println!(
@@ -246,7 +264,7 @@ fn run_ps(json: bool) -> Result<i32> {
     }
 
     if rows.is_empty() {
-        println!("{}", no_managed_sessions_message(tmux_available));
+        println!("{}", no_managed_sessions_message(tmux_available, all));
         return Ok(0);
     }
 
@@ -276,7 +294,11 @@ fn run_ps(json: bool) -> Result<i32> {
     Ok(0)
 }
 
-fn run_stop(json: bool) -> Result<i32> {
+fn run_stop(json: bool, all: bool) -> Result<i32> {
+    if all {
+        return run_stop_all(json);
+    }
+
     let ctx = resolve_workspace_context()?;
     let metadata_present = ctx.metadata_path.exists();
     let output = match probe_tmux()? {
@@ -317,6 +339,96 @@ fn run_stop(json: bool) -> Result<i32> {
         );
     } else {
         println!("{}", render_stop_message(&output));
+    }
+    Ok(0)
+}
+
+fn run_stop_all(json: bool) -> Result<i32> {
+    let records = load_session_records()?;
+    let tmux_probe = probe_tmux()?;
+    let tmux_available = matches!(tmux_probe, TmuxProbe::Available);
+    let tmux_sessions = if tmux_available {
+        list_tmux_sessions()?
+    } else {
+        BTreeMap::new()
+    };
+    let record_by_name = records
+        .into_iter()
+        .map(|record| (record.session_name.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let target_names = stop_target_session_names(&record_by_name, &tmux_sessions);
+    if target_names.is_empty() {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&CodexStopAllOutput {
+                    tmux_available,
+                    sessions: Vec::new(),
+                })
+                .context("serialize codex stop --all output")?
+            );
+        } else {
+            println!("{}", no_managed_sessions_message(tmux_available, true));
+        }
+        return Ok(0);
+    }
+
+    let mut outputs = Vec::with_capacity(target_names.len());
+    for session_name in target_names {
+        let record = record_by_name.get(&session_name);
+        let metadata_removed = if let Some(record) = record {
+            let metadata_path = session_record_metadata_path(record)?;
+            let metadata_present = metadata_path.exists();
+            remove_session_record(&metadata_path)?;
+            metadata_present
+        } else {
+            false
+        };
+        let workspace_root = record
+            .map(|record| record.workspace_root.clone())
+            .unwrap_or_else(|| "<unknown workspace>".to_string());
+
+        let output = if tmux_available {
+            let session_running = tmux_sessions.contains_key(&session_name);
+            if session_running {
+                tmux_kill_session(&session_name)?;
+            }
+            CodexStopOutput {
+                session_name,
+                workspace_root,
+                stopped: session_running,
+                metadata_removed,
+                tmux_available: true,
+                note: (!session_running).then_some("no running tmux session was found".to_string()),
+            }
+        } else {
+            CodexStopOutput {
+                session_name,
+                workspace_root,
+                stopped: false,
+                metadata_removed,
+                tmux_available: false,
+                note: Some(
+                    "`tmux` is not installed; removed local session metadata only".to_string(),
+                ),
+            }
+        };
+        outputs.push(output);
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&CodexStopAllOutput {
+                tmux_available,
+                sessions: outputs,
+            })
+            .context("serialize codex stop --all output")?
+        );
+    } else {
+        for output in &outputs {
+            println!("{}", render_stop_message(output));
+        }
     }
     Ok(0)
 }
@@ -404,12 +516,31 @@ fn session_status_label(running: bool, metadata_present: bool, tmux_available: b
     }
 }
 
-fn no_managed_sessions_message(tmux_available: bool) -> &'static str {
-    if tmux_available {
-        "No managed Codex sessions found."
-    } else {
-        "No managed Codex sessions found. (`tmux` unavailable.)"
+fn no_managed_sessions_message(tmux_available: bool, all: bool) -> String {
+    if all {
+        if tmux_available {
+            return "No managed Codex sessions found.".to_string();
+        }
+        return "No managed Codex sessions found. (`tmux` unavailable.)".to_string();
     }
+
+    if tmux_available {
+        return "No managed Codex session found for the current workspace. Use `za codex ps --all` to list every local session.".to_string();
+    }
+    "No managed Codex session found for the current workspace. (`tmux` unavailable.) Use `za codex ps --all` to inspect every locally recorded session.".to_string()
+}
+
+fn stop_target_session_names(
+    records: &BTreeMap<String, SessionRecord>,
+    tmux_sessions: &BTreeMap<String, TmuxSessionInfo>,
+) -> Vec<String> {
+    let mut names = records.keys().cloned().collect::<BTreeSet<_>>();
+    for session_name in tmux_sessions.keys() {
+        if session_name.starts_with(SESSION_PREFIX) {
+            names.insert(session_name.clone());
+        }
+    }
+    names.into_iter().collect()
 }
 
 fn render_stop_message(output: &CodexStopOutput) -> String {
@@ -503,23 +634,54 @@ fn git_capture(path: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodexStopOutput, CodexTopApp, CodexTopRow, FileSessionState, OtelEventRecord,
-        OtelLiveState, OtelSessionState, SESSION_HASH_LEN, SessionFileTracker, SessionRecord,
-        TmuxSessionInfo, TopRowsInput, TopStreamFilter, TopStreamState, TopView,
-        activity_age_label, apply_session_log_line, best_tracker_match_for_record,
-        build_shell_exec_command, build_top_rows, calculate_context_left_percent,
-        config_overrides_otel, ensure_local_listener_no_proxy, is_tmux_no_server,
-        is_tmux_session_absent, parse_legacy_codex_context_left_percent_lines,
-        parse_otlp_session_events, parse_tmux_codex_window_ids, parse_tmux_sessions,
-        render_stop_message, resolve_state_home, sanitize_session_label, session_status_label,
-        shell_escape, summarize_codex_session_lines, tmux_panes_include_listener_endpoint,
+        CachedSessionSummaryEntry, CodexPsCache, CodexSessionSummary, CodexStopOutput, CodexTopApp,
+        CodexTopRow, FileSessionState, LegacyContextCache, OtelEventRecord, OtelLiveState,
+        OtelSessionState, SESSION_HASH_LEN, SessionFileTracker, SessionRecord, TmuxSessionInfo,
+        TopRowsInput, TopStreamFilter, TopStreamState, TopView, activity_age_label,
+        apply_session_log_line, best_tracker_match_for_record, build_shell_exec_command,
+        build_top_rows, calculate_context_left_percent, config_overrides_otel,
+        ensure_local_listener_no_proxy, is_tmux_no_server, is_tmux_session_absent,
+        load_codex_session_summaries, load_legacy_codex_context_left_percent_by_session_id,
+        parse_legacy_codex_context_left_percent_lines, parse_otlp_session_events,
+        parse_tmux_codex_window_ids, parse_tmux_sessions, render_stop_message, resolve_state_home,
+        sanitize_session_label, session_matches_scope, session_status_label, shell_escape,
+        stop_target_session_names, summarize_codex_session_lines, tmux_codex_status_left,
+        tmux_codex_status_left_length, tmux_panes_include_listener_endpoint,
         tmux_terminal_overrides_disable_alt_screen, workspace_hash,
     };
+    use anyhow::Result;
     use std::{
         collections::{BTreeMap, BTreeSet, VecDeque},
+        fs,
         io::Cursor,
         path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
     };
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> Result<Self> {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time must be after unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "za-codex-test-{name}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path)?;
+            Ok(Self { path })
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn sanitize_session_label_normalizes_and_truncates() {
@@ -658,6 +820,14 @@ mod tests {
     }
 
     #[test]
+    fn tmux_codex_status_left_hides_internal_session_name() {
+        let left = tmux_codex_status_left("ttd-pro-cli");
+        assert_eq!(left, "[ttd-pro-cli] ");
+        assert!(!left.contains("za-codex"));
+        assert_eq!(tmux_codex_status_left_length("ttd-pro-cli"), left.len());
+    }
+
+    #[test]
     fn activity_age_label_compacts_elapsed_time() {
         assert_eq!(activity_age_label(None), "-");
     }
@@ -706,6 +876,162 @@ mod tests {
             resolve_state_home(Some(PathBuf::from("/tmp/state")), None).expect("must resolve"),
             PathBuf::from("/tmp/state")
         );
+    }
+
+    #[test]
+    fn session_matches_scope_filters_to_current_workspace_session() {
+        assert!(session_matches_scope(
+            "za-codex-current-123",
+            Some("za-codex-current-123")
+        ));
+        assert!(!session_matches_scope(
+            "za-codex-other-456",
+            Some("za-codex-current-123")
+        ));
+        assert!(session_matches_scope("za-codex-other-456", None));
+    }
+
+    #[test]
+    fn stop_target_session_names_merges_records_and_managed_tmux_sessions() {
+        let records = BTreeMap::from([(
+            "za-codex-current-123".to_string(),
+            SessionRecord {
+                session_name: "za-codex-current-123".to_string(),
+                workspace_root: "/opt/app/current".to_string(),
+                workspace_label: "current".to_string(),
+                workspace_hash: "hash-current".to_string(),
+                created_at_unix: 1_700_000_000,
+                launcher: "up".to_string(),
+                launcher_args: Vec::new(),
+            },
+        )]);
+        let tmux_sessions = BTreeMap::from([
+            (
+                "za-codex-current-123".to_string(),
+                TmuxSessionInfo {
+                    created_unix: Some(1_700_000_000),
+                    activity_unix: Some(1_700_000_010),
+                    attached_clients: 1,
+                },
+            ),
+            (
+                "za-codex-orphan-456".to_string(),
+                TmuxSessionInfo {
+                    created_unix: Some(1_700_000_001),
+                    activity_unix: Some(1_700_000_020),
+                    attached_clients: 0,
+                },
+            ),
+            (
+                "other-session".to_string(),
+                TmuxSessionInfo {
+                    created_unix: Some(1_700_000_002),
+                    activity_unix: Some(1_700_000_030),
+                    attached_clients: 0,
+                },
+            ),
+        ]);
+
+        let names = stop_target_session_names(&records, &tmux_sessions);
+
+        assert_eq!(
+            names,
+            vec![
+                "za-codex-current-123".to_string(),
+                "za-codex-orphan-456".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn load_codex_session_summaries_reuses_cached_file_summary() {
+        let dir = TempDir::new("summary-cache").expect("temp dir");
+        let sessions_root = dir.path.join("codex/sessions/2026/04/21");
+        fs::create_dir_all(&sessions_root).expect("create sessions root");
+        let session_path = sessions_root.join("session.jsonl");
+        fs::write(&session_path, "not-json\n").expect("write placeholder session log");
+        let metadata = fs::metadata(&session_path).expect("session metadata");
+        let modified_unix = metadata
+            .modified()
+            .expect("mtime")
+            .duration_since(UNIX_EPOCH)
+            .expect("mtime after epoch")
+            .as_secs();
+
+        let mut cache = CodexPsCache {
+            session_files: BTreeMap::from([(
+                session_path.display().to_string(),
+                CachedSessionSummaryEntry {
+                    len: metadata.len(),
+                    modified_unix,
+                    summary: Some(CodexSessionSummary {
+                        session_id: "cached-session".to_string(),
+                        workspace_root: "/opt/app/za".to_string(),
+                        modified_unix,
+                        model: Some("gpt-5.4".to_string()),
+                        effort: Some("xhigh".to_string()),
+                        context_left_percent: Some(42.0),
+                    }),
+                },
+            )]),
+            ..CodexPsCache::default()
+        };
+        let records = vec![SessionRecord {
+            session_name: "za-codex-za-123".to_string(),
+            workspace_root: "/opt/app/za".to_string(),
+            workspace_label: "za".to_string(),
+            workspace_hash: "hash".to_string(),
+            created_at_unix: 1_700_000_000,
+            launcher: "up".to_string(),
+            launcher_args: Vec::new(),
+        }];
+
+        let summaries =
+            load_codex_session_summaries(&records, &dir.path.join("codex/sessions"), &mut cache)
+                .expect("must load summaries");
+
+        let summary = summaries.get("/opt/app/za").expect("cached summary");
+        assert_eq!(summary.session_id, "cached-session");
+        assert_eq!(summary.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(summary.effort.as_deref(), Some("xhigh"));
+        assert_eq!(summary.context_left_percent, Some(42.0));
+    }
+
+    #[test]
+    fn load_legacy_context_reuses_cached_log_usage() {
+        let dir = TempDir::new("legacy-cache").expect("temp dir");
+        let log_path = dir.path.join("codex/log/codex-tui.log");
+        fs::create_dir_all(log_path.parent().expect("log parent")).expect("create log dir");
+        fs::write(&log_path, "garbage\n").expect("write placeholder log");
+        let metadata = fs::metadata(&log_path).expect("log metadata");
+        let modified_unix = metadata
+            .modified()
+            .expect("mtime")
+            .duration_since(UNIX_EPOCH)
+            .expect("mtime after epoch")
+            .as_secs();
+        let session_ids = BTreeSet::from(["cached-session".to_string()]);
+        let mut cache = CodexPsCache {
+            legacy_log: Some(LegacyContextCache {
+                len: metadata.len(),
+                modified_unix,
+                values: BTreeMap::from([
+                    ("cached-session".to_string(), 58.5),
+                    ("other-session".to_string(), 12.0),
+                ]),
+            }),
+            ..CodexPsCache::default()
+        };
+
+        let usage = load_legacy_codex_context_left_percent_by_session_id(
+            &session_ids,
+            &log_path,
+            &mut cache,
+        )
+        .expect("must load legacy usage");
+
+        assert_eq!(usage.get("cached-session").copied(), Some(58.5));
+        assert!(!usage.contains_key("other-session"));
     }
 
     #[test]

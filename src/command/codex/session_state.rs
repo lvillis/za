@@ -1,6 +1,9 @@
 use super::*;
 use std::fmt::Write as _;
 
+const CODEX_PS_CACHE_RELATIVE: &str = "za/codex/ps-cache.json";
+const CODEX_PS_CACHE_VERSION: u32 = 1;
+
 #[derive(Debug)]
 pub(super) struct WorkspaceContext {
     pub(super) workspace_root: PathBuf,
@@ -53,7 +56,13 @@ pub(super) struct CodexStopOutput {
     pub(super) note: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Serialize)]
+pub(super) struct CodexStopAllOutput {
+    pub(super) tmux_available: bool,
+    pub(super) sessions: Vec<CodexStopOutput>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct CodexSessionSummary {
     pub(super) session_id: String,
     pub(super) workspace_root: String,
@@ -61,6 +70,37 @@ pub(super) struct CodexSessionSummary {
     pub(super) model: Option<String>,
     pub(super) effort: Option<String>,
     pub(super) context_left_percent: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct CodexPsScanPaths {
+    pub(super) sessions_root: PathBuf,
+    pub(super) legacy_log_path: PathBuf,
+    pub(super) cache_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(super) struct CodexPsCache {
+    #[serde(default)]
+    pub(super) version: u32,
+    #[serde(default)]
+    pub(super) session_files: BTreeMap<String, CachedSessionSummaryEntry>,
+    #[serde(default)]
+    pub(super) legacy_log: Option<LegacyContextCache>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct CachedSessionSummaryEntry {
+    pub(super) len: u64,
+    pub(super) modified_unix: u64,
+    pub(super) summary: Option<CodexSessionSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct LegacyContextCache {
+    pub(super) len: u64,
+    pub(super) modified_unix: u64,
+    pub(super) values: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,20 +291,17 @@ pub(super) fn remove_session_record(path: &Path) -> Result<()> {
 pub(super) fn collect_session_rows(
     tmux_sessions: &BTreeMap<String, TmuxSessionInfo>,
     tmux_available: bool,
+    current_session_name: Option<&str>,
 ) -> Result<Vec<CodexSessionRow>> {
     let mut rows = Vec::new();
     let mut seen = BTreeSet::new();
     let records = load_session_records()?;
-    let codex_summaries = load_codex_session_summaries(&records)?;
-    let missing_context_session_ids = codex_summaries
-        .values()
-        .filter(|summary| summary.context_left_percent.is_none())
-        .map(|summary| summary.session_id.clone())
-        .collect::<BTreeSet<_>>();
-    let legacy_codex_context =
-        load_legacy_codex_context_left_percent_by_session_id(&missing_context_session_ids)?;
+    let (codex_summaries, legacy_codex_context) = load_codex_session_enrichment(&records)?;
 
     for record in records {
+        if !session_matches_scope(&record.session_name, current_session_name) {
+            continue;
+        }
         let tmux = tmux_sessions.get(&record.session_name);
         let codex = codex_summaries.get(&record.workspace_root);
         rows.push(CodexSessionRow {
@@ -294,6 +331,9 @@ pub(super) fn collect_session_rows(
         if !name.starts_with(SESSION_PREFIX) || seen.contains(name) {
             continue;
         }
+        if !session_matches_scope(name, current_session_name) {
+            continue;
+        }
         rows.push(CodexSessionRow {
             session_name: name.clone(),
             status: session_status_label(true, false, tmux_available),
@@ -321,6 +361,43 @@ pub(super) fn collect_session_rows(
     Ok(rows)
 }
 
+pub(super) fn session_matches_scope(
+    session_name: &str,
+    current_session_name: Option<&str>,
+) -> bool {
+    match current_session_name {
+        Some(current) => session_name == current,
+        None => true,
+    }
+}
+
+fn load_codex_session_enrichment(
+    records: &[SessionRecord],
+) -> Result<(BTreeMap<String, CodexSessionSummary>, BTreeMap<String, f64>)> {
+    let paths = codex_ps_scan_paths()?;
+    load_codex_session_enrichment_for_paths(records, &paths)
+}
+
+pub(super) fn load_codex_session_enrichment_for_paths(
+    records: &[SessionRecord],
+    paths: &CodexPsScanPaths,
+) -> Result<(BTreeMap<String, CodexSessionSummary>, BTreeMap<String, f64>)> {
+    let mut cache = load_codex_ps_cache(&paths.cache_paths);
+    let codex_summaries = load_codex_session_summaries(records, &paths.sessions_root, &mut cache)?;
+    let missing_context_session_ids = codex_summaries
+        .values()
+        .filter(|summary| summary.context_left_percent.is_none())
+        .map(|summary| summary.session_id.clone())
+        .collect::<BTreeSet<_>>();
+    let legacy_codex_context = load_legacy_codex_context_left_percent_by_session_id(
+        &missing_context_session_ids,
+        &paths.legacy_log_path,
+        &mut cache,
+    )?;
+    let _ = persist_codex_ps_cache(&paths.cache_paths, &cache);
+    Ok((codex_summaries, legacy_codex_context))
+}
+
 pub(super) fn load_session_records() -> Result<Vec<SessionRecord>> {
     let state_dir = state_home()?.join(STATE_DIR_RELATIVE);
     let entries = match fs::read_dir(&state_dir) {
@@ -346,8 +423,16 @@ pub(super) fn load_session_records() -> Result<Vec<SessionRecord>> {
     Ok(records)
 }
 
+pub(super) fn session_record_metadata_path(record: &SessionRecord) -> Result<PathBuf> {
+    Ok(state_home()?
+        .join(STATE_DIR_RELATIVE)
+        .join(format!("{}.json", record.workspace_hash)))
+}
+
 pub(super) fn load_codex_session_summaries(
     records: &[SessionRecord],
+    sessions_root: &Path,
+    cache: &mut CodexPsCache,
 ) -> Result<BTreeMap<String, CodexSessionSummary>> {
     let workspace_starts = records
         .iter()
@@ -357,13 +442,13 @@ pub(super) fn load_codex_session_summaries(
         return Ok(BTreeMap::new());
     }
 
-    let sessions_root = codex_home()?.join("sessions");
     if !sessions_root.exists() {
         return Ok(BTreeMap::new());
     }
 
     let mut best: BTreeMap<String, CodexSessionSummary> = BTreeMap::new();
-    for dent in WalkBuilder::new(&sessions_root)
+    let mut seen_paths = BTreeSet::new();
+    for dent in WalkBuilder::new(sessions_root)
         .standard_filters(false)
         .hidden(false)
         .build()
@@ -374,9 +459,38 @@ pub(super) fn load_codex_session_summaries(
             continue;
         }
 
-        let Some(summary) = summarize_codex_session_file(path, &workspace_starts)? else {
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("read session metadata {}", path.display()))?;
+        let cache_key = path.display().to_string();
+        let modified_unix = file_modified_unix(&metadata);
+        let len = metadata.len();
+        seen_paths.insert(cache_key.clone());
+
+        let summary = match cache.session_files.get(&cache_key) {
+            Some(entry) if entry.len == len && entry.modified_unix == modified_unix => {
+                entry.summary.clone()
+            }
+            _ => {
+                let summary = scan_codex_session_file(path, modified_unix)?;
+                cache.session_files.insert(
+                    cache_key.clone(),
+                    CachedSessionSummaryEntry {
+                        len,
+                        modified_unix,
+                        summary: summary.clone(),
+                    },
+                );
+                summary
+            }
+        };
+
+        let Some(mut summary) = summary else {
             continue;
         };
+        let Some(started_unix) = workspace_starts.get(&summary.workspace_root).copied() else {
+            continue;
+        };
+        summary.modified_unix = summary.modified_unix.max(started_unix);
         let workspace_root = summary.workspace_root.clone();
         match best.get(&workspace_root) {
             Some(current) if current.modified_unix >= summary.modified_unix => {}
@@ -386,23 +500,133 @@ pub(super) fn load_codex_session_summaries(
         }
     }
 
+    cache
+        .session_files
+        .retain(|path, _| seen_paths.contains(path));
     Ok(best)
 }
 
-fn load_legacy_codex_context_left_percent_by_session_id(
+pub(super) fn load_legacy_codex_context_left_percent_by_session_id(
     session_ids: &BTreeSet<String>,
+    log_path: &Path,
+    cache: &mut CodexPsCache,
 ) -> Result<BTreeMap<String, f64>> {
     if session_ids.is_empty() {
         return Ok(BTreeMap::new());
     }
 
-    let log_path = codex_home()?.join("log/codex-tui.log");
-    let file = match fs::File::open(&log_path) {
-        Ok(file) => file,
+    let metadata = match fs::metadata(log_path) {
+        Ok(metadata) => metadata,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(err) => return Err(err).with_context(|| format!("open {}", log_path.display())),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read legacy log {}", log_path.display()));
+        }
     };
-    parse_legacy_codex_context_left_percent_lines(BufReader::new(file), session_ids)
+    let modified_unix = file_modified_unix(&metadata);
+    let len = metadata.len();
+    if let Some(entry) = cache
+        .legacy_log
+        .as_ref()
+        .filter(|entry| entry.len == len && entry.modified_unix == modified_unix)
+    {
+        return Ok(filter_context_left_percent_values(
+            &entry.values,
+            session_ids,
+        ));
+    }
+
+    let file = fs::File::open(log_path).with_context(|| format!("open {}", log_path.display()))?;
+    let values =
+        parse_legacy_codex_context_left_percent_lines_filtered(BufReader::new(file), None)?;
+    let filtered = filter_context_left_percent_values(&values, session_ids);
+    cache.legacy_log = Some(LegacyContextCache {
+        len,
+        modified_unix,
+        values,
+    });
+    Ok(filtered)
+}
+
+fn codex_ps_scan_paths() -> Result<CodexPsScanPaths> {
+    let codex_root = codex_home()?;
+    Ok(CodexPsScanPaths {
+        sessions_root: codex_root.join("sessions"),
+        legacy_log_path: codex_root.join("log/codex-tui.log"),
+        cache_paths: codex_ps_cache_paths(),
+    })
+}
+
+fn codex_ps_cache_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(state_home) = state_home() {
+        paths.push(state_home.join(CODEX_PS_CACHE_RELATIVE));
+    }
+    let temp_cache = env::temp_dir().join(CODEX_PS_CACHE_RELATIVE);
+    if !paths.iter().any(|path| path == &temp_cache) {
+        paths.push(temp_cache);
+    }
+    paths
+}
+
+fn load_codex_ps_cache(paths: &[PathBuf]) -> CodexPsCache {
+    for path in paths {
+        let Ok(bytes) = fs::read(path) else {
+            continue;
+        };
+        let Ok(cache) = serde_json::from_slice::<CodexPsCache>(&bytes) else {
+            continue;
+        };
+        if cache.version == CODEX_PS_CACHE_VERSION {
+            return cache;
+        }
+    }
+    CodexPsCache::default()
+}
+
+fn persist_codex_ps_cache(paths: &[PathBuf], cache: &CodexPsCache) -> Result<()> {
+    let mut cache = cache.clone();
+    cache.version = CODEX_PS_CACHE_VERSION;
+    let bytes = serde_json::to_vec_pretty(&cache).context("serialize Codex ps cache")?;
+    let mut last_err = None;
+    for path in paths {
+        if let Some(parent) = path.parent()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            last_err = Some(anyhow!(
+                "create Codex ps cache directory {}: {}",
+                parent.display(),
+                err
+            ));
+            continue;
+        }
+        match fs::write(path, &bytes) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = Some(anyhow!("write Codex ps cache {}: {}", path.display(), err));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("no Codex ps cache path candidates available")))
+}
+
+fn file_modified_unix(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn filter_context_left_percent_values(
+    values: &BTreeMap<String, f64>,
+    session_ids: &BTreeSet<String>,
+) -> BTreeMap<String, f64> {
+    values
+        .iter()
+        .filter(|(session_id, _)| session_ids.contains(*session_id))
+        .map(|(session_id, pct)| (session_id.clone(), *pct))
+        .collect()
 }
 
 pub(super) fn codex_home() -> Result<PathBuf> {
@@ -654,26 +878,30 @@ fn parse_codex_session_event(line: &str) -> Option<ParsedCodexSessionEvent> {
     }
 }
 
-fn summarize_codex_session_file(
-    path: &Path,
-    workspace_starts: &BTreeMap<String, u64>,
-) -> Result<Option<CodexSessionSummary>> {
-    let metadata =
-        fs::metadata(path).with_context(|| format!("read session metadata {}", path.display()))?;
-    let modified_unix = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default();
+fn scan_codex_session_file(path: &Path, modified_unix: u64) -> Result<Option<CodexSessionSummary>> {
     let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    summarize_codex_session_lines(BufReader::new(file), modified_unix, workspace_starts)
+    scan_codex_session_lines(BufReader::new(file), modified_unix)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn summarize_codex_session_lines<R: BufRead>(
     reader: R,
     modified_unix: u64,
     workspace_starts: &BTreeMap<String, u64>,
+) -> Result<Option<CodexSessionSummary>> {
+    let Some(mut summary) = scan_codex_session_lines(reader, modified_unix)? else {
+        return Ok(None);
+    };
+    let Some(started_unix) = workspace_starts.get(&summary.workspace_root).copied() else {
+        return Ok(None);
+    };
+    summary.modified_unix = summary.modified_unix.max(started_unix);
+    Ok(Some(summary))
+}
+
+fn scan_codex_session_lines<R: BufRead>(
+    reader: R,
+    modified_unix: u64,
 ) -> Result<Option<CodexSessionSummary>> {
     let mut session_id = None;
     let mut workspace_root = None;
@@ -712,14 +940,11 @@ pub(super) fn summarize_codex_session_lines<R: BufRead>(
     let Some(workspace_root) = workspace_root else {
         return Ok(None);
     };
-    let Some(started_unix) = workspace_starts.get(&workspace_root).copied() else {
-        return Ok(None);
-    };
 
     Ok(Some(CodexSessionSummary {
         session_id,
         workspace_root,
-        modified_unix: modified_unix.max(started_unix),
+        modified_unix,
         model,
         effort,
         context_left_percent,
@@ -733,9 +958,17 @@ pub(super) fn calculate_context_left_percent(used_tokens: u64, context_window: u
     Some(((context_window - used_tokens) as f64 / context_window as f64) * 100.0)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn parse_legacy_codex_context_left_percent_lines<R: BufRead>(
     reader: R,
     session_ids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, f64>> {
+    parse_legacy_codex_context_left_percent_lines_filtered(reader, Some(session_ids))
+}
+
+fn parse_legacy_codex_context_left_percent_lines_filtered<R: BufRead>(
+    reader: R,
+    session_ids: Option<&BTreeSet<String>>,
 ) -> Result<BTreeMap<String, f64>> {
     let regex = Regex::new(
         r"thread_id=(?P<session>[0-9a-f-]+).*?total_usage_tokens=(?P<used>\d+).*?auto_compact_limit=(?P<limit>\d+)",
@@ -751,7 +984,7 @@ pub(super) fn parse_legacy_codex_context_left_percent_lines<R: BufRead>(
         let Some(session_id) = captures.name("session").map(|value| value.as_str()) else {
             continue;
         };
-        if !session_ids.contains(session_id) {
+        if session_ids.is_some_and(|ids| !ids.contains(session_id)) {
             continue;
         }
         let Some(used_tokens) = captures

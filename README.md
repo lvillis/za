@@ -465,9 +465,11 @@ za codex resume
 za codex top
 za codex top --all --history
 za codex ps
+za codex ps --all
 
 # stop the current workspace session
 za codex stop
+za codex stop --all
 ```
 
 Behavior notes:
@@ -481,7 +483,9 @@ Behavior notes:
 - `za codex top` opens a live terminal dashboard for managed Codex sessions. By default it scopes to the current workspace and active sessions only; `--all` includes every local workspace and `--history` keeps inactive sessions visible.
 - While `za codex top` is open, new managed `za codex` launches automatically get a temporary local OTLP listener injected so the dashboard can show live event, API, and tool-failure counters without extra setup. Explicit user OTEL config still wins.
 - `za codex top` hotkeys: `j`/`k` move, `PgUp`/`PgDn` page, `a` toggles current-workspace vs all-workspaces scope, `h` toggles history, `Enter` opens the selected session's event stream, `f` toggles follow mode in the stream view, `0`/`a`/`s`/`t`/`e` filter stream events to all/API/SSE/tool/error, `[`/`]` scroll event detail, `{`/`}` page event detail, `Esc` returns, `q` quits.
-- `za codex ps` now surfaces the Codex session id plus the same `MODEL`, `EFFORT`, and remaining context percentage (`LEFT%`) shown in the Codex TUI by reading the latest `token_count` event in the local Codex session log, with older TUI sampling logs kept only as a compatibility fallback.
+- `za codex ps` defaults to the current workspace, while `za codex ps --all` lists every local managed Codex session.
+- `za codex stop` only stops the current workspace session by default; `za codex stop --all` stops every local managed Codex session and removes their local metadata records.
+- `za codex ps` always surfaces the Codex session id plus the same `MODEL`, `EFFORT`, and remaining context percentage (`LEFT%`) shown in the Codex TUI. To keep repeated runs fast, `za` caches per-session log summaries and only rescans files whose size or modified time changed, with older TUI sampling logs kept only as a compatibility fallback.
 - If `tmux` is not installed, `za codex ps` still shows locally recorded sessions as `unavailable`, and `za codex stop` degrades to local metadata cleanup instead of failing with an opaque error.
 
 ### Proxy behavior

@@ -93,6 +93,29 @@ pub(super) fn tmux_apply_codex_terminal_fixes(session_name: &str) -> Result<()> 
     Ok(())
 }
 
+pub(super) fn tmux_apply_codex_session_style(
+    session_name: &str,
+    workspace_label: &str,
+) -> Result<()> {
+    tmux_set_session_option(
+        session_name,
+        "status-left",
+        &tmux_codex_status_left(workspace_label),
+    )?;
+    tmux_set_session_option(
+        session_name,
+        "status-left-length",
+        &tmux_codex_status_left_length(workspace_label).to_string(),
+    )?;
+
+    if let Some(window_id) = tmux_primary_codex_window_id(session_name)? {
+        tmux_rename_window(&window_id, "main")?;
+        tmux_set_window_option(&window_id, "automatic-rename", "off")?;
+    }
+
+    Ok(())
+}
+
 fn tmux_disable_alternate_screen_for_codex_windows(session_name: &str) -> Result<()> {
     for window_id in tmux_codex_window_ids(session_name)? {
         tmux_set_window_option(&window_id, "alternate-screen", "off")?;
@@ -199,6 +222,66 @@ fn tmux_set_window_option(target: &str, option: &str, value: &str) -> Result<()>
     Ok(())
 }
 
+fn tmux_set_session_option(target: &str, option: &str, value: &str) -> Result<()> {
+    let output = Command::new("tmux")
+        .args(["set-option", "-t", target, option, value])
+        .output()
+        .with_context(|| format!("set tmux session option `{option}` for `{target}`"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "`tmux set-option -t {target} {option} {value}` failed: {}",
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+fn tmux_rename_window(target: &str, window_name: &str) -> Result<()> {
+    let output = Command::new("tmux")
+        .args(["rename-window", "-t", target, window_name])
+        .output()
+        .with_context(|| format!("rename tmux window `{target}` to `{window_name}`"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "`tmux rename-window -t {target} {window_name}` failed: {}",
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+fn tmux_primary_codex_window_id(session_name: &str) -> Result<Option<String>> {
+    if let Some(window_id) = tmux_codex_window_ids(session_name)?.into_iter().next() {
+        return Ok(Some(window_id));
+    }
+    tmux_first_window_id(session_name)
+}
+
+fn tmux_first_window_id(session_name: &str) -> Result<Option<String>> {
+    let output = Command::new("tmux")
+        .args(["list-windows", "-t", session_name, "-F", "#{window_id}"])
+        .output()
+        .with_context(|| format!("list tmux windows for `{session_name}`"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_tmux_session_absent(&stderr) {
+            return Ok(None);
+        }
+        bail!(
+            "`tmux list-windows -t {session_name}` failed: {}",
+            stderr.trim()
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned))
+}
+
 pub(super) fn tmux_panes_include_listener_endpoint(output: &str, endpoint: &str) -> bool {
     output.lines().any(|line| {
         let Some((current_command, start_command)) = line.split_once('\t') else {
@@ -279,9 +362,13 @@ pub(super) fn tmux_kill_session(session_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn maybe_attach_or_report(session_name: &str, workspace_root: &Path) -> Result<i32> {
+pub(super) fn maybe_attach_or_report(
+    session_name: &str,
+    workspace_root: &Path,
+    workspace_label: &str,
+) -> Result<i32> {
     if is_interactive_terminal() {
-        return attach_session(session_name);
+        return attach_session(session_name, workspace_label);
     }
 
     println!(
@@ -292,8 +379,9 @@ pub(super) fn maybe_attach_or_report(session_name: &str, workspace_root: &Path) 
     Ok(0)
 }
 
-pub(super) fn attach_session(session_name: &str) -> Result<i32> {
+pub(super) fn attach_session(session_name: &str, workspace_label: &str) -> Result<i32> {
     tmux_apply_codex_terminal_fixes(session_name)?;
+    tmux_apply_codex_session_style(session_name, workspace_label)?;
     let mut cmd = Command::new("tmux");
     if env::var_os("TMUX").is_some() {
         cmd.args(["switch-client", "-t", session_name]);
@@ -305,6 +393,14 @@ pub(super) fn attach_session(session_name: &str) -> Result<i32> {
         .status()
         .with_context(|| format!("attach tmux session `{session_name}`"))?;
     Ok(status.code().unwrap_or(130))
+}
+
+pub(super) fn tmux_codex_status_left(workspace_label: &str) -> String {
+    format!("[{workspace_label}] ")
+}
+
+pub(super) fn tmux_codex_status_left_length(workspace_label: &str) -> usize {
+    tmux_codex_status_left(workspace_label).len()
 }
 
 pub(super) fn is_interactive_terminal() -> bool {

@@ -764,11 +764,14 @@ pub enum CodexCommands {
         /// Print JSON output for scripting.
         #[arg(long)]
         json: bool,
+        /// Show all local Codex sessions instead of filtering to the current workspace.
+        #[arg(short = 'a', long)]
+        all: bool,
     },
     /// Watch Codex sessions in a live terminal dashboard
     Top {
         /// Show all local Codex sessions instead of filtering to the current workspace.
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         all: bool,
         /// Include historical sessions that are no longer active.
         #[arg(long)]
@@ -779,6 +782,9 @@ pub enum CodexCommands {
         /// Print JSON output for scripting.
         #[arg(long)]
         json: bool,
+        /// Stop all local managed Codex sessions instead of only the current workspace.
+        #[arg(short = 'a', long)]
+        all: bool,
     },
 }
 
@@ -1856,7 +1862,7 @@ mod tests {
     #[test]
     fn codex_top_parses_all_flag() {
         let cli =
-            Cli::try_parse_from(["za", "codex", "top", "--all", "--history"]).expect("must parse");
+            Cli::try_parse_from(["za", "codex", "top", "-a", "--history"]).expect("must parse");
         match cli.cmd {
             Commands::Codex { cmd, args } => {
                 assert!(args.is_empty());
@@ -1865,6 +1871,42 @@ mod tests {
                     Some(CodexCommands::Top {
                         all: true,
                         history: true
+                    })
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn codex_ps_parses_all_flag() {
+        let cli = Cli::try_parse_from(["za", "codex", "ps", "-a", "--json"]).expect("must parse");
+        match cli.cmd {
+            Commands::Codex { cmd, args } => {
+                assert!(args.is_empty());
+                assert!(matches!(
+                    cmd,
+                    Some(CodexCommands::Ps {
+                        json: true,
+                        all: true
+                    })
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn codex_stop_parses_all_flag() {
+        let cli = Cli::try_parse_from(["za", "codex", "stop", "-a", "--json"]).expect("must parse");
+        match cli.cmd {
+            Commands::Codex { cmd, args } => {
+                assert!(args.is_empty());
+                assert!(matches!(
+                    cmd,
+                    Some(CodexCommands::Stop {
+                        json: true,
+                        all: true
                     })
                 ));
             }
