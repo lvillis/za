@@ -45,8 +45,6 @@ Supported release matrix:
 | `linux/amd64 (musl)` | `x86_64-unknown-linux-musl` | `za-<version>-x86_64-unknown-linux-musl.tar.gz` | `za-linux-amd64` |
 | `linux/amd64 (gnu)` | `x86_64-unknown-linux-gnu` | `za-<version>-x86_64-unknown-linux-gnu.tar.gz` | - |
 | `linux/arm64 (musl)` | `aarch64-unknown-linux-musl` | `za-<version>-aarch64-unknown-linux-musl.tar.gz` | `za-linux-arm64` |
-| `linux/armhf (gnu)` | `arm-unknown-linux-gnueabihf` | `za-<version>-arm-unknown-linux-gnueabihf.tar.gz` | `za-linux-armhf` |
-| `linux/arm/v7 (gnu)` | `armv7-unknown-linux-gnueabihf` | `za-<version>-armv7-unknown-linux-gnueabihf.tar.gz` | `za-linux-armv7` |
 | `darwin/arm64` | `aarch64-apple-darwin` | `za-<version>-aarch64-apple-darwin.tar.gz` | `za-darwin-arm64` |
 | `windows/amd64` | `x86_64-pc-windows-msvc` | `za-<version>-x86_64-pc-windows-msvc.zip` | `za-windows-amd64.exe` |
 
