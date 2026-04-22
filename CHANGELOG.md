@@ -1,8 +1,22 @@
+## [0.1.57] - 2026-04-22
+
+### 🐛 Bug Fixes
+
+- *(tool)* Stabilize JetBrains bash init for starship and ble.sh
+
+### 🚜 Refactor
+
+- *(locking)* Replace fs4 with std file locks
+- *(deps)* Replace low-level crates with std and rust alternatives
 ## [0.1.56] - 2026-04-21
 
 ### 🚀 Features
 
 - *(codex)* Add workspace-scoped ps and global stop
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.56
 ## [0.1.55] - 2026-04-20
 
 ### 🚀 Features
