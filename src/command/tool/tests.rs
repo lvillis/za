@@ -1,6 +1,9 @@
+use super::integrations::{blesh_bash_init_bottom_block, blesh_bash_init_top_block};
 use super::policy::GithubReleaseVerification;
 use super::{
-    InstallOutcome, InstallResult, LatestCheck, ManagedBlockPosition, ManagedFileChange,
+    BLESH_BASH_INIT_BOTTOM_END_MARKER, BLESH_BASH_INIT_BOTTOM_START_MARKER,
+    BLESH_BASH_INIT_TOP_END_MARKER, BLESH_BASH_INIT_TOP_START_MARKER, InstallOutcome,
+    InstallResult, LatestCheck, ManagedBlockPosition, ManagedFileChange,
     STARSHIP_BASH_INIT_END_MARKER, STARSHIP_BASH_INIT_START_MARKER, ToolBatchKind,
     ToolBatchSummary, ToolHome, ToolRef, ToolScope, ToolSpec, canonical_tool_name,
     cleanup_legacy_current_dir_artifacts, collect_managed_tool_names, command_candidates,
@@ -537,6 +540,26 @@ fn starship_bash_init_block_uses_jeditem_guard() {
 }
 
 #[test]
+fn blesh_bash_init_top_block_sets_jetbrains_compatibility_options() {
+    let block = blesh_bash_init_top_block(std::path::Path::new("/tmp/blesh/ble.sh"));
+    assert!(block.contains(
+        r#"if [ "${TERMINAL_EMULATOR-}" = "JetBrains-JediTerm" ] && [[ $- == *i* ]]; then"#
+    ));
+    assert!(block.contains(r#"if source -- "/tmp/blesh/ble.sh" --attach=none; then"#));
+    assert!(block.contains("bleopt prompt_command_changes_layout=1"));
+    assert!(block.contains("bleopt internal_suppress_bash_output="));
+}
+
+#[test]
+fn blesh_bash_init_bottom_block_uses_immediate_attach_compatibility_shim() {
+    let block = blesh_bash_init_bottom_block();
+    assert!(block.contains(
+        r#"if [ "${TERMINAL_EMULATOR-}" = "JetBrains-JediTerm" ] && [[ ${BLE_VERSION-} ]]; then"#
+    ));
+    assert!(block.contains("VSCODE_INJECTION=1 ble-attach"));
+}
+
+#[test]
 fn starship_bash_init_managed_block_is_idempotent() {
     let root = std::env::temp_dir().join(format!(
         "za-test-starship-bashrc-{}-{}",
@@ -554,7 +577,7 @@ fn starship_bash_init_managed_block_is_idempotent() {
         &rc_path,
         STARSHIP_BASH_INIT_START_MARKER,
         STARSHIP_BASH_INIT_END_MARKER,
-        ManagedBlockPosition::Bottom,
+        ManagedBlockPosition::BeforeMarker(BLESH_BASH_INIT_BOTTOM_START_MARKER),
         starship_bash_init_block(),
     )
     .expect("insert block");
@@ -562,7 +585,7 @@ fn starship_bash_init_managed_block_is_idempotent() {
         &rc_path,
         STARSHIP_BASH_INIT_START_MARKER,
         STARSHIP_BASH_INIT_END_MARKER,
-        ManagedBlockPosition::Bottom,
+        ManagedBlockPosition::BeforeMarker(BLESH_BASH_INIT_BOTTOM_START_MARKER),
         starship_bash_init_block(),
     )
     .expect("update block");
@@ -573,6 +596,132 @@ fn starship_bash_init_managed_block_is_idempotent() {
     assert!(content.contains("export PATH=/tmp"));
     assert!(content.contains("JetBrains-JediTerm"));
     assert_eq!(content.matches(STARSHIP_BASH_INIT_START_MARKER).count(), 1);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn starship_bash_init_is_inserted_before_blesh_attach_block() {
+    let root = std::env::temp_dir().join(format!(
+        "za-test-starship-before-blesh-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("create temp root");
+    let rc_path = root.join(".bashrc");
+    fs::write(
+        &rc_path,
+        format!(
+            r#"export PATH=/tmp
+
+{top_start}
+source ble.sh --attach=none
+{top_end}
+
+alias ll='ls -l'
+
+{bottom_start}
+ble-attach
+{bottom_end}
+"#,
+            top_start = BLESH_BASH_INIT_TOP_START_MARKER,
+            top_end = BLESH_BASH_INIT_TOP_END_MARKER,
+            bottom_start = BLESH_BASH_INIT_BOTTOM_START_MARKER,
+            bottom_end = BLESH_BASH_INIT_BOTTOM_END_MARKER,
+        ),
+    )
+    .expect("write rc");
+
+    let change = upsert_managed_block(
+        &rc_path,
+        STARSHIP_BASH_INIT_START_MARKER,
+        STARSHIP_BASH_INIT_END_MARKER,
+        ManagedBlockPosition::BeforeMarker(BLESH_BASH_INIT_BOTTOM_START_MARKER),
+        starship_bash_init_block(),
+    )
+    .expect("insert block");
+
+    let content = fs::read_to_string(&rc_path).expect("read rc");
+    let top_index = content
+        .find(BLESH_BASH_INIT_TOP_START_MARKER)
+        .expect("ble top marker");
+    let starship_index = content
+        .find(STARSHIP_BASH_INIT_START_MARKER)
+        .expect("starship marker");
+    let bottom_index = content
+        .find(BLESH_BASH_INIT_BOTTOM_START_MARKER)
+        .expect("ble bottom marker");
+
+    assert_eq!(change, ManagedFileChange::Created);
+    assert!(top_index < starship_index);
+    assert!(starship_index < bottom_index);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn starship_bash_init_update_moves_block_above_blesh_attach_block() {
+    let root = std::env::temp_dir().join(format!(
+        "za-test-starship-reorder-blesh-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("create temp root");
+    let rc_path = root.join(".bashrc");
+    fs::write(
+        &rc_path,
+        format!(
+            r#"export PATH=/tmp
+
+{top_start}
+source ble.sh --attach=none
+{top_end}
+
+{bottom_start}
+ble-attach
+{bottom_end}
+
+{starship_start}
+legacy starship block
+{starship_end}
+"#,
+            top_start = BLESH_BASH_INIT_TOP_START_MARKER,
+            top_end = BLESH_BASH_INIT_TOP_END_MARKER,
+            bottom_start = BLESH_BASH_INIT_BOTTOM_START_MARKER,
+            bottom_end = BLESH_BASH_INIT_BOTTOM_END_MARKER,
+            starship_start = STARSHIP_BASH_INIT_START_MARKER,
+            starship_end = STARSHIP_BASH_INIT_END_MARKER,
+        ),
+    )
+    .expect("write rc");
+
+    let change = upsert_managed_block(
+        &rc_path,
+        STARSHIP_BASH_INIT_START_MARKER,
+        STARSHIP_BASH_INIT_END_MARKER,
+        ManagedBlockPosition::BeforeMarker(BLESH_BASH_INIT_BOTTOM_START_MARKER),
+        starship_bash_init_block(),
+    )
+    .expect("update block");
+
+    let content = fs::read_to_string(&rc_path).expect("read rc");
+    let starship_index = content
+        .find(STARSHIP_BASH_INIT_START_MARKER)
+        .expect("starship marker");
+    let bottom_index = content
+        .find(BLESH_BASH_INIT_BOTTOM_START_MARKER)
+        .expect("ble bottom marker");
+
+    assert_eq!(change, ManagedFileChange::Updated);
+    assert!(starship_index < bottom_index);
+    assert_eq!(content.matches(STARSHIP_BASH_INIT_START_MARKER).count(), 1);
+    assert!(content.contains(r#"eval "$(starship init bash)""#));
 
     let _ = fs::remove_dir_all(&root);
 }

@@ -30,7 +30,7 @@ fn ensure_starship_bash_init(emit_stages: bool) -> Result<()> {
         &rc_path,
         STARSHIP_BASH_INIT_START_MARKER,
         STARSHIP_BASH_INIT_END_MARKER,
-        ManagedBlockPosition::Bottom,
+        ManagedBlockPosition::BeforeMarker(BLESH_BASH_INIT_BOTTOM_START_MARKER),
         starship_bash_init_block(),
     )
     .with_context(|| format!("configure starship bash init in `{}`", rc_path.display()))?;
@@ -53,7 +53,7 @@ fn preview_starship_bash_init(emit_stages: bool) -> Result<()> {
         &rc_path,
         STARSHIP_BASH_INIT_START_MARKER,
         STARSHIP_BASH_INIT_END_MARKER,
-        ManagedBlockPosition::Bottom,
+        ManagedBlockPosition::BeforeMarker(BLESH_BASH_INIT_BOTTOM_START_MARKER),
         starship_bash_init_block(),
     )?;
     print_tool_stage_if(
@@ -171,18 +171,21 @@ pub(crate) fn starship_bash_init_block() -> &'static str {
 fi"#
 }
 
-fn blesh_bash_init_top_block(active_path: &Path) -> String {
+pub(crate) fn blesh_bash_init_top_block(active_path: &Path) -> String {
     format!(
         r#"if [ "${{TERMINAL_EMULATOR-}}" = "JetBrains-JediTerm" ] && [[ $- == *i* ]]; then
-  source -- "{}" --attach=none
+  if source -- "{}" --attach=none; then
+    bleopt prompt_command_changes_layout=1
+    bleopt internal_suppress_bash_output=
+  fi
 fi"#,
         active_path.display()
     )
 }
 
-fn blesh_bash_init_bottom_block() -> &'static str {
+pub(crate) fn blesh_bash_init_bottom_block() -> &'static str {
     r#"if [ "${TERMINAL_EMULATOR-}" = "JetBrains-JediTerm" ] && [[ ${BLE_VERSION-} ]]; then
-  ble-attach
+  VSCODE_INJECTION=1 ble-attach
 fi"#
 }
 
@@ -293,5 +296,24 @@ fn insert_managed_block(content: &str, block: &str, position: ManagedBlockPositi
     match position {
         ManagedBlockPosition::Top => format!("{block}\n\n{}\n", content.trim()),
         ManagedBlockPosition::Bottom => format!("{}\n\n{block}\n", content.trim_end()),
+        ManagedBlockPosition::BeforeMarker(marker) => {
+            insert_managed_block_before_marker(content, block, marker)
+        }
+    }
+}
+
+fn insert_managed_block_before_marker(content: &str, block: &str, marker: &str) -> String {
+    let trimmed = content.trim_end();
+    let Some(marker_start) = trimmed.find(marker) else {
+        return format!("{trimmed}\n\n{block}\n");
+    };
+
+    let prefix = trimmed[..marker_start].trim_end_matches('\n');
+    let suffix = trimmed[marker_start..].trim_start_matches('\n');
+    match (prefix.is_empty(), suffix.is_empty()) {
+        (true, true) => format!("{block}\n"),
+        (true, false) => format!("{block}\n\n{suffix}\n"),
+        (false, true) => format!("{prefix}\n\n{block}\n"),
+        (false, false) => format!("{prefix}\n\n{block}\n\n{suffix}\n"),
     }
 }
