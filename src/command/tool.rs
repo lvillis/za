@@ -9,7 +9,6 @@ mod source;
 mod state;
 
 use anyhow::{Context, Result, anyhow, bail};
-use fs4::fs_std::FileExt;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use regex::Regex;
 use reqx::{
@@ -1074,7 +1073,7 @@ impl ToolLock {
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("open lock file {}", lock_path.display()))?;
-        file.lock_exclusive()
+        file.lock()
             .with_context(|| format!("acquire lock {}", lock_path.display()))?;
         Ok(Self { _file: file })
     }

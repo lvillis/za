@@ -1,5 +1,4 @@
 use super::*;
-use fs4::fs_std::FileExt;
 use reqx::{
     advanced::ClientProfile,
     blocking::{Client, ClientBuilder},
@@ -147,7 +146,7 @@ impl DepsCacheLock {
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("open cache lock {}", lock_path.display()))?;
-        file.lock_exclusive()
+        file.lock()
             .with_context(|| format!("acquire cache lock {}", lock_path.display()))?;
         Ok(Self { _file: file })
     }
