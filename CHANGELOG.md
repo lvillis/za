@@ -1,3 +1,8 @@
+## [0.1.58] - 2026-04-22
+
+### 🐛 Bug Fixes
+
+- Ci
 ## [0.1.57] - 2026-04-22
 
 ### 🐛 Bug Fixes
@@ -8,6 +13,10 @@
 
 - *(locking)* Replace fs4 with std file locks
 - *(deps)* Replace low-level crates with std and rust alternatives
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.57
 ## [0.1.56] - 2026-04-21
 
 ### 🚀 Features
