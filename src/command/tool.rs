@@ -17,7 +17,6 @@ use reqx::{
     prelude::RetryPolicy,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use signal_hook::{consts::signal::SIGINT, flag as signal_flag};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;

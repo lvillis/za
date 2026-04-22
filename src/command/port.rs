@@ -1,5 +1,7 @@
 use crate::cli::{PortCommands, PortSignal};
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(target_os = "linux")]
+use rustix::process::{Pid, Signal, kill_process};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -1062,16 +1064,14 @@ fn port_signal_label(signal: PortSignal) -> &'static str {
 
 #[cfg(target_os = "linux")]
 fn send_signal(pid: u32, signal: PortSignal) -> Result<()> {
-    let signal_num = match signal {
-        PortSignal::Term => libc::SIGTERM,
-        PortSignal::Kill => libc::SIGKILL,
-        PortSignal::Int => libc::SIGINT,
+    let signal_kind = match signal {
+        PortSignal::Term => Signal::TERM,
+        PortSignal::Kill => Signal::KILL,
+        PortSignal::Int => Signal::INT,
     };
-    let rc = unsafe { libc::kill(pid as i32, signal_num) };
-    if rc == 0 {
-        return Ok(());
-    }
-    Err(std::io::Error::last_os_error())
+    let raw_pid = i32::try_from(pid).map_err(|_| anyhow!("pid {pid} is out of range"))?;
+    let target = Pid::from_raw(raw_pid).ok_or_else(|| anyhow!("pid {pid} is invalid"))?;
+    kill_process(target, signal_kind)
         .with_context(|| format!("send {} to pid {}", port_signal_label(signal), pid))
 }
 

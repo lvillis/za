@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
+use graviola::hashing::{Hash, HashContext, Sha256};
 use serde_json::Deserializer;
-use sha2::{Digest, Sha256};
 use sqlx::{
     Connection, Row, SqliteConnection,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
@@ -396,22 +396,23 @@ fn merge_record(
 
 fn record_fingerprint(record: &super::AiAnalyticsRecord) -> String {
     let mut hasher = Sha256::new();
-    hasher.update([record.schema_version]);
-    hasher.update(record.recorded_at_unix_ms.to_le_bytes());
+    hasher.update(&[record.schema_version]);
+    hasher.update(&record.recorded_at_unix_ms.to_le_bytes());
     hasher.update(record.agent.as_bytes());
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(record.workspace.as_bytes());
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(record.route.as_bytes());
-    hasher.update([0]);
+    hasher.update(&[0]);
     hasher.update(record.source_command.as_bytes());
-    hasher.update([0]);
-    hasher.update(record.raw_bytes.to_le_bytes());
-    hasher.update(record.summary_bytes.to_le_bytes());
-    hasher.update(record.raw_estimated_tokens.to_le_bytes());
-    hasher.update(record.summary_estimated_tokens.to_le_bytes());
-    hasher.update(record.duration_ms.to_le_bytes());
-    hex_string(&hasher.finalize())
+    hasher.update(&[0]);
+    hasher.update(&record.raw_bytes.to_le_bytes());
+    hasher.update(&record.summary_bytes.to_le_bytes());
+    hasher.update(&record.raw_estimated_tokens.to_le_bytes());
+    hasher.update(&record.summary_estimated_tokens.to_le_bytes());
+    hasher.update(&record.duration_ms.to_le_bytes());
+    let digest = hasher.finish();
+    hex_string(digest.as_ref())
 }
 
 fn hex_string(bytes: &[u8]) -> String {

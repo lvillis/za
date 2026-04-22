@@ -1,4 +1,5 @@
 use super::*;
+use graviola::hashing::{Hash, HashContext, Sha256};
 use std::fmt::Write as _;
 
 const CODEX_PS_CACHE_RELATIVE: &str = "za/codex/ps-cache.json";
@@ -213,9 +214,9 @@ fn resolve_workspace_root(cwd: &Path) -> Result<PathBuf> {
 pub(super) fn workspace_hash(root: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(root.to_string_lossy().as_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
+    let digest = hasher.finish();
+    let mut hex = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
         let _ = write!(hex, "{byte:02x}");
     }
     hex

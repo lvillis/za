@@ -812,6 +812,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "graviola"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4387e0458389da24c6fe732531e65595c7c4a32b027f98f4789e512e28224465"
+dependencies = [
+ "cfg-if",
+ "getrandom 0.3.4",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2794,18 +2804,18 @@ dependencies = [
  "clap",
  "crossterm",
  "flate2",
+ "graviola",
  "humantime",
  "ignore",
  "indicatif",
- "libc",
  "ratatui",
  "regex",
  "reqx",
+ "rustix",
  "rustls",
  "semver",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "shellcomp",
  "signal-hook 0.4.4",
  "sqlx",

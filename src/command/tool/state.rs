@@ -1,4 +1,5 @@
 use super::*;
+use graviola::hashing::{Hash, HashContext, Sha256};
 
 pub(super) fn write_manifest(
     home: &ToolHome,
@@ -73,9 +74,9 @@ pub(super) fn sha256_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
+    let digest = hasher.finish();
+    let mut hex = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
         let _ = write!(hex, "{byte:02x}");
     }
     Ok(hex)
