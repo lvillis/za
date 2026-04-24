@@ -13,6 +13,7 @@ use std::os::unix::fs::PermissionsExt;
 
 const GLOBAL_STORE_DIR: &str = "/var/lib/za/tools/store";
 const GLOBAL_CURRENT_DIR: &str = "/var/lib/za/tools/current";
+const IDE_AGENT_SHIM_MANAGED_MARKER_PREFIX: &str = "# za-managed: ide-agent-shim";
 
 pub fn run(tool: &str, args: &[String]) -> Result<i32> {
     let canonical = crate::command::tool::canonical_tool_name(tool);
@@ -119,18 +120,23 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     let path_env = env::var_os("PATH")?;
     for dir in env::split_paths(&path_env) {
         let candidate = dir.join(name);
-        if is_executable_file(&candidate) {
+        if is_executable_file(&candidate) && !is_ide_agent_shim(&candidate) {
             return Some(candidate);
         }
         #[cfg(windows)]
         {
             let candidate_exe = dir.join(format!("{name}.exe"));
-            if is_executable_file(&candidate_exe) {
+            if is_executable_file(&candidate_exe) && !is_ide_agent_shim(&candidate_exe) {
                 return Some(candidate_exe);
             }
         }
     }
     None
+}
+
+fn is_ide_agent_shim(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .is_ok_and(|content| content.contains(IDE_AGENT_SHIM_MANAGED_MARKER_PREFIX))
 }
 
 fn is_executable_file(path: &Path) -> bool {

@@ -681,6 +681,11 @@ pub enum ConfigCommands {
 /// `za ide` sub-commands
 #[derive(Subcommand)]
 pub enum IdeCommands {
+    /// Configure IDE-specific integrations
+    Agent {
+        #[command(subcommand)]
+        cmd: IdeAgentCommands,
+    },
     /// List JetBrains remote IDE server processes
     Ps {
         /// Only show projects with duplicate server instances.
@@ -727,6 +732,37 @@ pub enum IdeCommands {
         /// Print JSON output for scripting.
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum IdeAgentCommands {
+    /// Install a JetBrains terminal AI agent wrapper
+    Install {
+        /// Agent command name, e.g. `codex`
+        agent: String,
+        /// Overwrite an existing non-za-managed shim file.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show JetBrains terminal AI agent wrapper status
+    Status {
+        /// Optional agent command name. Omit to list installed shims.
+        agent: Option<String>,
+        /// Probe `command -v` from a JetBrains serverMode-like PATH.
+        #[arg(long)]
+        probe: bool,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a JetBrains terminal AI agent wrapper
+    Uninstall {
+        /// Agent command name, e.g. `codex`
+        agent: String,
+        /// Remove an existing non-za-managed shim file.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -980,8 +1016,8 @@ mod tests {
     use super::{
         AiCommands, AiGitCommands, AiShell, CiCommands, Cli, CodexCommands, ColorWhen, Commands,
         CompletionCommands, CompletionShell, DepsCommands, DiffArgs, DiffCommands, DiffKindFilter,
-        DiffRiskFilter, GhCommands, GitAuthCommands, IdeCommands, PortCommands, PortSignal,
-        ToolCommands,
+        DiffRiskFilter, GhCommands, GitAuthCommands, IdeAgentCommands, IdeCommands, PortCommands,
+        PortSignal, ToolCommands,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -1983,6 +2019,46 @@ mod tests {
                     }
                 ));
             }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn ide_agent_install_parses_agent_name() {
+        let cli =
+            Cli::try_parse_from(["za", "ide", "agent", "install", "codex"]).expect("must parse");
+        match cli.cmd {
+            Commands::Ide { cmd } => match cmd {
+                IdeCommands::Agent { cmd } => assert!(matches!(
+                    cmd,
+                    IdeAgentCommands::Install {
+                        agent,
+                        force: false
+                    } if agent == "codex"
+                )),
+                _ => panic!("unexpected ide command"),
+            },
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn ide_agent_status_parses_optional_agent_and_json() {
+        let cli =
+            Cli::try_parse_from(["za", "ide", "agent", "status", "codex", "--probe", "--json"])
+                .expect("must parse");
+        match cli.cmd {
+            Commands::Ide { cmd } => match cmd {
+                IdeCommands::Agent { cmd } => assert!(matches!(
+                    cmd,
+                    IdeAgentCommands::Status {
+                        agent: Some(agent),
+                        probe: true,
+                        json: true
+                    } if agent == "codex"
+                )),
+                _ => panic!("unexpected ide command"),
+            },
             _ => panic!("unexpected command"),
         }
     }

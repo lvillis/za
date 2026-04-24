@@ -5,11 +5,13 @@ mod project_state;
 mod toolbox_status;
 
 use crate::{
-    cli::{IdeCommands, IdeReconcileStrategy},
-    command::za_config,
+    cli::{IdeAgentCommands, IdeCommands, IdeReconcileStrategy},
+    command::{paths, za_config},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
@@ -28,6 +30,9 @@ const PROJECT_SNAPSHOT_MAX_AGE_SECS: u64 = 600;
 const PROJECT_DISCONNECTED_GRACE_SECS: u64 = 120;
 const PROJECT_REMOTE_LIVE_MAX_AGE_SECS: u64 = 15;
 const PROJECT_OPEN_SIGNAL_WORKSPACE_WINDOW_SECS: u64 = 8;
+const IDE_AGENT_BASH_START_MARKER: &str = "# >>> za ide agent shims (bash) >>>";
+const IDE_AGENT_BASH_END_MARKER: &str = "# <<< za ide agent shims (bash) <<<";
+const IDE_AGENT_SHIM_MANAGED_MARKER: &str = "# za-managed: ide-agent-shim v1";
 
 #[derive(Debug, Clone, Serialize)]
 struct IdeSession {
@@ -267,6 +272,35 @@ struct IdeFixOutput {
     notes: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct IdeAgentStatusOutput {
+    shim_dir: String,
+    bashrc_path: String,
+    bashrc_configured: bool,
+    agents: Vec<IdeAgentStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct IdeAgentStatus {
+    agent: String,
+    shim_path: String,
+    shim_installed: bool,
+    shim_managed: bool,
+    shim_current: bool,
+    run_target: Option<String>,
+    probe: Option<IdeAgentProbe>,
+    issues: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct IdeAgentProbe {
+    command: String,
+    success: bool,
+    resolved: Option<String>,
+    exit_code: Option<i32>,
+    stderr: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum ConfidenceLevel {
@@ -308,6 +342,7 @@ struct IdeProjectRow {
 
 pub fn run(cmd: IdeCommands) -> Result<i32> {
     match cmd {
+        IdeCommands::Agent { cmd } => run_agent(cmd),
         IdeCommands::Ps { duplicates, json } => run_ps(duplicates, json),
         IdeCommands::Stop {
             pid,
@@ -326,6 +361,631 @@ pub fn run(cmd: IdeCommands) -> Result<i32> {
             json,
         } => run_fix(dry_run, timeout_secs, json),
     }
+}
+
+fn run_agent(cmd: IdeAgentCommands) -> Result<i32> {
+    match cmd {
+        IdeAgentCommands::Install { agent, force } => run_agent_install(&agent, force),
+        IdeAgentCommands::Status { agent, probe, json } => {
+            run_agent_status(agent.as_deref(), probe, json)
+        }
+        IdeAgentCommands::Uninstall { agent, force } => run_agent_uninstall(&agent, force),
+    }
+}
+
+fn run_agent_install(agent: &str, force: bool) -> Result<i32> {
+    let agent = normalize_ide_agent_name(agent)?;
+    let run_target = crate::command::run::resolve_executable_path(&agent)
+        .with_context(|| format!("resolve real `{agent}` executable for `za run {agent}`"))?;
+    let za_executable = resolve_current_za_executable()?;
+    let shim_dir = paths::jetbrains_agent_shim_bin_dir()?;
+    let shim_path = ide_agent_shim_path(&shim_dir, &agent);
+    fs::create_dir_all(&shim_dir).with_context(|| {
+        format!(
+            "create JetBrains agent shim directory `{}`",
+            shim_dir.display()
+        )
+    })?;
+    let expected_shim = expected_ide_agent_shim_content(&agent, &za_executable, &run_target);
+    if let Some(existing) = read_optional_file_lossy(&shim_path)? {
+        if existing != expected_shim && !ide_agent_shim_is_managed(&existing) && !force {
+            bail!(
+                "refusing to overwrite non-za-managed shim `{}`; pass `--force` to replace it",
+                shim_path.display()
+            );
+        }
+    }
+    fs::write(&shim_path, expected_shim)
+        .with_context(|| format!("write JetBrains agent shim `{}`", shim_path.display()))?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(&shim_path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("chmod +x `{}`", shim_path.display()))?;
+    }
+
+    let bashrc_path = paths::home_dir()?.join(".bashrc");
+    let bashrc_removed = remove_ide_agent_bash_block(&bashrc_path)?;
+    let legacy_shim_removed = remove_managed_legacy_ide_agent_shim(&agent)?;
+
+    println!("installed JetBrains agent shim");
+    println!("agent          {agent}");
+    println!("shim           {}", shim_path.display());
+    println!("runs           za run {agent}");
+    println!("za             {}", za_executable.display());
+    println!("target         {}", run_target.display());
+    println!(
+        "legacy cleanup {}",
+        match (bashrc_removed, legacy_shim_removed) {
+            (false, false) => "unchanged",
+            (true, false) => "removed bashrc PATH block",
+            (false, true) => "removed old shim",
+            (true, true) => "removed old shim and bashrc PATH block",
+        }
+    );
+    Ok(0)
+}
+
+fn run_agent_status(agent: Option<&str>, probe: bool, json: bool) -> Result<i32> {
+    let output = collect_ide_agent_status(agent, probe)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).context("serialize ide agent status output")?
+        );
+        return Ok(0);
+    }
+
+    println!("za ide agent status");
+    println!("shim dir       {}", output.shim_dir);
+    println!(
+        "legacy bashrc  {} ({})",
+        output.bashrc_path,
+        if output.bashrc_configured {
+            "configured"
+        } else {
+            "missing"
+        }
+    );
+    if output.agents.is_empty() {
+        println!("agents         none");
+        return Ok(0);
+    }
+    println!(
+        "{:<18} {:<10} {:<10} {:<10} TARGET",
+        "AGENT", "SHIM", "MANAGED", "CURRENT"
+    );
+    for row in output.agents {
+        println!(
+            "{:<18} {:<10} {:<10} {:<10} {}",
+            row.agent,
+            if row.shim_installed {
+                "installed"
+            } else {
+                "missing"
+            },
+            if row.shim_managed { "yes" } else { "no" },
+            if row.shim_current { "yes" } else { "no" },
+            row.run_target.as_deref().unwrap_or("-")
+        );
+        if let Some(probe) = row.probe {
+            println!(
+                "  probe        {}",
+                probe.resolved.as_deref().unwrap_or("unresolved")
+            );
+        }
+        for issue in row.issues {
+            println!("  note         {issue}");
+        }
+    }
+    Ok(0)
+}
+
+fn run_agent_uninstall(agent: &str, force: bool) -> Result<i32> {
+    let agent = normalize_ide_agent_name(agent)?;
+    let shim_dir = paths::jetbrains_agent_shim_bin_dir()?;
+    let shim_path = ide_agent_shim_path(&shim_dir, &agent);
+    if let Some(existing) = read_optional_file_lossy(&shim_path)?
+        && !ide_agent_shim_is_managed(&existing)
+        && !force
+    {
+        bail!(
+            "refusing to remove non-za-managed shim `{}`; pass `--force` to remove it",
+            shim_path.display()
+        );
+    }
+    let removed = match fs::remove_file(&shim_path) {
+        Ok(()) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => return Err(err).with_context(|| format!("remove `{}`", shim_path.display())),
+    };
+
+    let legacy_removed = remove_managed_legacy_ide_agent_shim(&agent)?;
+    let bashrc_path = paths::home_dir()?.join(".bashrc");
+    let bashrc_removed = remove_ide_agent_bash_block(&bashrc_path)?;
+
+    println!("removed JetBrains agent shim");
+    println!("agent          {agent}");
+    println!(
+        "shim           {}",
+        if removed { "removed" } else { "absent" }
+    );
+    println!(
+        "legacy cleanup {}",
+        match (bashrc_removed, legacy_removed) {
+            (false, false) => "unchanged",
+            (true, false) => "removed bashrc PATH block",
+            (false, true) => "removed old shim",
+            (true, true) => "removed old shim and bashrc PATH block",
+        }
+    );
+    Ok(0)
+}
+
+fn collect_ide_agent_status(agent: Option<&str>, probe: bool) -> Result<IdeAgentStatusOutput> {
+    let shim_dir = paths::jetbrains_agent_shim_bin_dir()?;
+    let bashrc_path = paths::home_dir()?.join(".bashrc");
+    let agents = match agent {
+        Some(agent) => vec![normalize_ide_agent_name(agent)?],
+        None => list_installed_ide_agent_names(&shim_dir)?,
+    };
+    let bashrc_configured = ide_agent_bash_block_is_configured(&bashrc_path, &shim_dir)?;
+    let rows = agents
+        .into_iter()
+        .map(|agent| collect_single_ide_agent_status(&shim_dir, agent, probe))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(IdeAgentStatusOutput {
+        shim_dir: shim_dir.display().to_string(),
+        bashrc_path: bashrc_path.display().to_string(),
+        bashrc_configured,
+        agents: rows,
+    })
+}
+
+fn collect_single_ide_agent_status(
+    shim_dir: &Path,
+    agent: String,
+    probe: bool,
+) -> Result<IdeAgentStatus> {
+    let shim_path = ide_agent_shim_path(shim_dir, &agent);
+    let za_executable = resolve_current_za_executable().ok();
+    let run_target = match crate::command::run::resolve_executable_path(&agent) {
+        Ok(path) => Some(path),
+        Err(err) => {
+            let mut issues = Vec::new();
+            issues.push(format!(
+                "`za run {agent}` cannot resolve a real executable: {err}"
+            ));
+            let probe_result = if probe {
+                Some(probe_jetbrains_agent_command(&agent))
+            } else {
+                None
+            };
+            return Ok(IdeAgentStatus {
+                agent,
+                shim_path: shim_path.display().to_string(),
+                shim_installed: shim_path.exists(),
+                shim_managed: read_optional_file_lossy(&shim_path)?
+                    .as_deref()
+                    .is_some_and(ide_agent_shim_is_managed),
+                shim_current: false,
+                run_target: None,
+                probe: probe_result,
+                issues,
+            });
+        }
+    };
+    let expected = za_executable
+        .as_deref()
+        .zip(run_target.as_deref())
+        .map(|(za, target)| expected_ide_agent_shim_content(&agent, za, target));
+    let shim_content = read_optional_file_lossy(&shim_path)?;
+    let shim_installed = shim_content.is_some();
+    let shim_managed = shim_content
+        .as_deref()
+        .is_some_and(ide_agent_shim_is_managed);
+    let shim_current = expected
+        .as_deref()
+        .is_some_and(|expected| shim_content.as_deref() == Some(expected));
+    let mut issues = Vec::new();
+    if shim_installed && !shim_managed {
+        issues.push("shim exists but is not za-managed".to_string());
+    } else if shim_installed && !shim_current {
+        issues.push("shim is za-managed but points to an older za path or content".to_string());
+    }
+    if za_executable.is_none() {
+        issues.push("cannot resolve the current za executable path".to_string());
+    }
+    let legacy_shim_path =
+        ide_agent_shim_path(&paths::legacy_jetbrains_agent_shim_bin_dir()?, &agent);
+    if read_optional_file_lossy(&legacy_shim_path)?
+        .as_deref()
+        .is_some_and(ide_agent_shim_is_managed)
+    {
+        issues.push(format!(
+            "legacy shim exists at `{}`; `za ide agent install {agent}` will clean it up",
+            legacy_shim_path.display()
+        ));
+    }
+
+    let probe_result = if probe {
+        let probe = probe_jetbrains_agent_command(&agent);
+        if !probe.success {
+            issues.push(format!(
+                "probe failed with exit code {:?}: {}",
+                probe.exit_code, probe.stderr
+            ));
+        } else if probe.resolved.as_deref() != Some(&shim_path.display().to_string()) {
+            issues.push(format!(
+                "probe resolved `{agent}` to `{}` instead of `{}`",
+                probe.resolved.as_deref().unwrap_or("unresolved"),
+                shim_path.display()
+            ));
+        }
+        Some(probe)
+    } else {
+        None
+    };
+
+    Ok(IdeAgentStatus {
+        agent,
+        shim_path: shim_path.display().to_string(),
+        shim_installed,
+        shim_managed,
+        shim_current,
+        run_target: run_target.map(|path| path.display().to_string()),
+        probe: probe_result,
+        issues,
+    })
+}
+
+fn normalize_ide_agent_name(agent: &str) -> Result<String> {
+    let agent = agent.trim();
+    if agent.is_empty() {
+        bail!("agent name cannot be empty");
+    }
+    let agent = crate::command::tool::canonical_tool_name(agent);
+    if agent.starts_with('-')
+        || !agent
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        bail!("unsupported agent name `{agent}`; use a command name such as `codex`");
+    }
+    Ok(agent)
+}
+
+fn ide_agent_shim_path(shim_dir: &Path, agent: &str) -> PathBuf {
+    shim_dir.join(agent)
+}
+
+fn expected_ide_agent_shim_content(
+    agent: &str,
+    za_executable: &Path,
+    fallback_target: &Path,
+) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+{IDE_AGENT_SHIM_MANAGED_MARKER}
+za_agent={agent}
+za_bin={za}
+za_fallback={fallback}
+
+za_readlink() {{
+  readlink -f -- "$1" 2>/dev/null || printf '%s\n' "$1"
+}}
+
+za_is_direct_jetbrains_agent_launch() {{
+  [ "${{TERMINAL_EMULATOR-}}" = "JetBrains-JediTerm" ] || return 1
+  [ -r "/proc/${{PPID}}/cmdline" ] || return 1
+  za_parent_cmd="$(tr '\0' ' ' < "/proc/${{PPID}}/cmdline" 2>/dev/null || true)"
+  case "$za_parent_cmd" in *serverMode*) ;; *) return 1 ;; esac
+  case "$za_parent_cmd" in
+    *JetBrains*|*rustrover*|*idea*|*pycharm*|*webstorm*|*goland*|*clion*) return 0 ;;
+  esac
+  return 1
+}}
+
+za_exec_passthrough() {{
+  za_self="$(za_readlink "${{BASH_SOURCE[0]:-$0}}")"
+  old_ifs="$IFS"
+  IFS=:
+  for za_dir in $PATH; do
+    [ -n "$za_dir" ] || za_dir=.
+    za_candidate="$za_dir/$za_agent"
+    [ -x "$za_candidate" ] || continue
+    [ "$(za_readlink "$za_candidate")" = "$za_self" ] && continue
+    IFS="$old_ifs"
+    exec "$za_candidate" "$@"
+  done
+  IFS="$old_ifs"
+  if [ -x "$za_fallback" ] && [ "$(za_readlink "$za_fallback")" != "$za_self" ]; then
+    exec "$za_fallback" "$@"
+  fi
+  printf '%s\n' "za: cannot find real $za_agent executable after JetBrains shim" >&2
+  exit 127
+}}
+
+if za_is_direct_jetbrains_agent_launch; then
+  exec "$za_bin" run "$za_agent" "$@"
+fi
+
+za_exec_passthrough "$@"
+"#,
+        agent = shell_single_quote(agent),
+        za = shell_single_quote(&za_executable.display().to_string()),
+        fallback = shell_single_quote(&fallback_target.display().to_string()),
+    )
+}
+
+fn ide_agent_shim_is_managed(content: &str) -> bool {
+    content.contains(IDE_AGENT_SHIM_MANAGED_MARKER)
+        || content
+            .lines()
+            .any(|line| line.trim_start().starts_with("exec za run "))
+}
+
+fn resolve_current_za_executable() -> Result<PathBuf> {
+    let path = env::current_exe().context("resolve current za executable path")?;
+    let current = if path.is_absolute() {
+        path
+    } else {
+        env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .context("resolve current working directory for za executable")?
+    };
+
+    Ok(resolve_za_executable_from_path(&current).unwrap_or(current))
+}
+
+fn resolve_za_executable_from_path(current_exe: &Path) -> Option<PathBuf> {
+    let path_env = env::var_os("PATH")?;
+    resolve_za_executable_from_path_env(current_exe, &path_env)
+}
+
+fn resolve_za_executable_from_path_env(
+    current_exe: &Path,
+    path_env: &std::ffi::OsStr,
+) -> Option<PathBuf> {
+    let current_canonical = fs::canonicalize(current_exe).ok();
+    let mut same_as_current = None;
+
+    for dir in env::split_paths(path_env) {
+        let candidate = dir.join("za");
+        if !is_executable_file(&candidate) {
+            continue;
+        }
+        if path_matches(&candidate, current_exe, current_canonical.as_deref()) {
+            same_as_current.get_or_insert(candidate);
+            continue;
+        }
+        return Some(candidate);
+    }
+
+    same_as_current
+}
+
+fn path_matches(path: &Path, expected: &Path, expected_canonical: Option<&Path>) -> bool {
+    if path == expected {
+        return true;
+    }
+    let (Some(path_canonical), Some(expected_canonical)) =
+        (fs::canonicalize(path).ok(), expected_canonical)
+    else {
+        return false;
+    };
+    path_canonical == expected_canonical
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn read_optional_file_lossy(path: &Path) -> Result<Option<String>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("read `{}`", path.display())),
+    }
+}
+
+fn remove_managed_legacy_ide_agent_shim(agent: &str) -> Result<bool> {
+    let legacy_dir = paths::legacy_jetbrains_agent_shim_bin_dir()?;
+    let legacy_path = ide_agent_shim_path(&legacy_dir, agent);
+    let Some(existing) = read_optional_file_lossy(&legacy_path)? else {
+        return Ok(false);
+    };
+    if !ide_agent_shim_is_managed(&existing) {
+        return Ok(false);
+    }
+    match fs::remove_file(&legacy_path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("remove `{}`", legacy_path.display())),
+    }
+}
+
+fn probe_jetbrains_agent_command(agent: &str) -> IdeAgentProbe {
+    let bash_command = format!("command -v -- {}", shell_single_quote(agent));
+    let command = format!(
+        "TERMINAL_EMULATOR=JetBrains-JediTerm bash -c {}",
+        shell_single_quote(&bash_command)
+    );
+    let probe_path = paths::home_dir()
+        .map(|home| {
+            format!(
+                "{}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin",
+                home.join(".local/bin").display()
+            )
+        })
+        .unwrap_or_else(|_| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin".to_string());
+    let output = Command::new("bash")
+        .env("TERMINAL_EMULATOR", "JetBrains-JediTerm")
+        .env("PATH", probe_path)
+        .arg("-c")
+        .arg(bash_command)
+        .output();
+    match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let resolved = stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .next_back()
+                .map(str::to_string);
+            IdeAgentProbe {
+                command,
+                success: output.status.success(),
+                resolved,
+                exit_code: output.status.code(),
+                stderr,
+            }
+        }
+        Err(err) => IdeAgentProbe {
+            command,
+            success: false,
+            resolved: None,
+            exit_code: None,
+            stderr: err.to_string(),
+        },
+    }
+}
+
+fn list_installed_ide_agent_names(shim_dir: &Path) -> Result<Vec<String>> {
+    let entries = match fs::read_dir(shim_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("read `{}`", shim_dir.display())),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read entry in `{}`", shim_dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if normalize_ide_agent_name(name).is_ok_and(|normalized| normalized == name) {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[cfg(test)]
+fn upsert_ide_agent_bash_block(target_path: &Path, shim_dir: &Path) -> Result<bool> {
+    let existing = match fs::read_to_string(target_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err).with_context(|| format!("read `{}`", target_path.display())),
+    };
+    let (remaining, _) = remove_ide_agent_bash_block_from_content(&existing, target_path)?;
+    let block = format!(
+        "{}\n{}\n{}",
+        IDE_AGENT_BASH_START_MARKER,
+        ide_agent_bash_path_block(shim_dir),
+        IDE_AGENT_BASH_END_MARKER
+    );
+    let updated = if remaining.trim().is_empty() {
+        format!("{block}\n")
+    } else {
+        format!("{}\n\n{block}\n", remaining.trim_end())
+    };
+    if updated == existing {
+        return Ok(false);
+    }
+    fs::write(target_path, updated)
+        .with_context(|| format!("write `{}`", target_path.display()))?;
+    Ok(true)
+}
+
+fn remove_ide_agent_bash_block(target_path: &Path) -> Result<bool> {
+    let existing = match fs::read_to_string(target_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("read `{}`", target_path.display())),
+    };
+    let (updated, removed) = remove_ide_agent_bash_block_from_content(&existing, target_path)?;
+    if removed {
+        fs::write(target_path, updated)
+            .with_context(|| format!("write `{}`", target_path.display()))?;
+    }
+    Ok(removed)
+}
+
+fn ide_agent_bash_block_is_configured(target_path: &Path, _shim_dir: &Path) -> Result<bool> {
+    let existing = match fs::read_to_string(target_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("read `{}`", target_path.display())),
+    };
+    Ok(existing.contains(IDE_AGENT_BASH_START_MARKER)
+        && existing.contains(IDE_AGENT_BASH_END_MARKER))
+}
+
+fn remove_ide_agent_bash_block_from_content(
+    existing: &str,
+    target_path: &Path,
+) -> Result<(String, bool)> {
+    let Some(start) = existing.find(IDE_AGENT_BASH_START_MARKER) else {
+        return Ok((existing.to_string(), false));
+    };
+    let end = existing[start..]
+        .find(IDE_AGENT_BASH_END_MARKER)
+        .map(|offset| start + offset + IDE_AGENT_BASH_END_MARKER.len())
+        .ok_or_else(|| {
+            anyhow!(
+                "found `{}` in `{}` without matching `{}`",
+                IDE_AGENT_BASH_START_MARKER,
+                target_path.display(),
+                IDE_AGENT_BASH_END_MARKER
+            )
+        })?;
+    let prefix = existing[..start].trim_end_matches('\n');
+    let suffix = existing[end..].trim_start_matches('\n');
+    let updated = match (prefix.is_empty(), suffix.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!("{suffix}\n"),
+        (false, true) => format!("{prefix}\n"),
+        (false, false) => format!("{prefix}\n\n{suffix}\n"),
+    };
+    Ok((updated, true))
+}
+
+#[cfg(test)]
+fn ide_agent_bash_path_block(shim_dir: &Path) -> String {
+    format!(
+        r#"if [ "${{TERMINAL_EMULATOR-}}" = "JetBrains-JediTerm" ]; then
+  za_ide_agent_shim_dir={}
+  case ":${{PATH}}:" in
+    *":${{za_ide_agent_shim_dir}}:"*) ;;
+    *) export PATH="${{za_ide_agent_shim_dir}}:${{PATH}}" ;;
+  esac
+  unset za_ide_agent_shim_dir
+fi"#,
+        shell_single_quote(&shim_dir.display().to_string())
+    )
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn run_ps(duplicates_only: bool, json: bool) -> Result<i32> {
@@ -1315,10 +1975,16 @@ mod tests {
     };
     use super::{
         ConfidenceLevel, IdeFixOutput, IdeProjectRow, IdeReconcileStrategy, IdeSession,
-        ProcessIdentity, parse_ipcs_semaphore_rows, parse_toolbox_ipc_key_line, pick_keep_pid,
-        pick_keep_pids, process_matches_identity, project_row_attention_rank,
-        read_process_start_ticks, render_fix_lines, sort_project_rows_for_ps,
+        ProcessIdentity, expected_ide_agent_shim_content, ide_agent_bash_path_block,
+        ide_agent_shim_is_managed, normalize_ide_agent_name, parse_ipcs_semaphore_rows,
+        parse_toolbox_ipc_key_line, pick_keep_pid, pick_keep_pids, process_matches_identity,
+        project_row_attention_rank, read_process_start_ticks, remove_ide_agent_bash_block,
+        render_fix_lines, resolve_za_executable_from_path_env, shell_single_quote,
+        sort_project_rows_for_ps, upsert_ide_agent_bash_block,
     };
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::{fs, path::PathBuf, time::SystemTime};
 
     #[test]
     fn parse_cmdline_splits_nul_parts() {
@@ -1387,6 +2053,96 @@ mod tests {
             parse_build_number_from_build_txt(raw).as_deref(),
             Some("253.31033.132")
         );
+    }
+
+    #[test]
+    fn normalize_ide_agent_name_accepts_safe_aliases() {
+        assert_eq!(
+            normalize_ide_agent_name("codex-cli").expect("valid alias"),
+            "codex"
+        );
+        assert_eq!(
+            normalize_ide_agent_name("claude-code").expect("valid name"),
+            "claude-code"
+        );
+        assert!(normalize_ide_agent_name("../codex").is_err());
+        assert!(normalize_ide_agent_name("-codex").is_err());
+    }
+
+    #[test]
+    fn ide_agent_shim_execs_za_run_agent() {
+        let content = expected_ide_agent_shim_content(
+            "codex",
+            PathBuf::from("/usr/bin/za").as_path(),
+            PathBuf::from("/usr/local/bin/codex").as_path(),
+        );
+        assert!(content.contains("# za-managed: ide-agent-shim v1"));
+        assert!(content.contains("exec \"$za_bin\" run \"$za_agent\" \"$@\""));
+        assert!(content.contains("za_fallback='/usr/local/bin/codex'"));
+        assert!(content.contains("za_is_direct_jetbrains_agent_launch"));
+        assert!(content.contains(r#"case "$za_parent_cmd" in *serverMode*)"#));
+        assert!(ide_agent_shim_is_managed(&content));
+        assert!(ide_agent_shim_is_managed(
+            "#!/usr/bin/env bash\nexec za run codex \"$@\"\n"
+        ));
+        assert!(!ide_agent_shim_is_managed(
+            "#!/usr/bin/env bash\nexec codex \"$@\"\n"
+        ));
+    }
+
+    #[test]
+    fn ide_agent_bash_path_block_is_jetbrains_scoped() {
+        let block = ide_agent_bash_path_block(PathBuf::from("/tmp/za shims").as_path());
+        assert!(block.contains(r#""${TERMINAL_EMULATOR-}" = "JetBrains-JediTerm""#));
+        assert!(block.contains("za_ide_agent_shim_dir='/tmp/za shims'"));
+        assert!(block.contains("export PATH="));
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_single_quotes() {
+        assert_eq!(shell_single_quote("/tmp/a'b"), "'/tmp/a'\"'\"'b'");
+    }
+
+    #[test]
+    fn resolve_za_executable_from_path_prefers_installed_za_over_current_exe() {
+        let dir = TempDir::new("ide-agent-za-path").expect("temp dir");
+        let current_dir = dir.path.join("target/debug");
+        let installed_dir = dir.path.join("bin");
+        fs::create_dir_all(&current_dir).expect("create current dir");
+        fs::create_dir_all(&installed_dir).expect("create installed dir");
+        let current = current_dir.join("za");
+        let installed = installed_dir.join("za");
+        fs::write(&current, "#!/bin/sh\n").expect("write current");
+        fs::write(&installed, "#!/bin/sh\n").expect("write installed");
+        #[cfg(unix)]
+        {
+            fs::set_permissions(&current, fs::Permissions::from_mode(0o755))
+                .expect("chmod current");
+            fs::set_permissions(&installed, fs::Permissions::from_mode(0o755))
+                .expect("chmod installed");
+        }
+
+        let path = std::env::join_paths([current_dir, installed_dir]).expect("join path");
+        let resolved =
+            resolve_za_executable_from_path_env(&current, &path).expect("resolve installed za");
+
+        assert_eq!(resolved, installed);
+    }
+
+    #[test]
+    fn ide_agent_bash_block_upsert_and_remove_round_trip() {
+        let dir = TempDir::new("ide-agent-bashrc").expect("temp dir");
+        let rc_path = dir.path.join(".bashrc");
+        fs::write(&rc_path, "before\n").expect("write rc");
+        let shim_dir = dir.path.join("shims");
+
+        assert!(upsert_ide_agent_bash_block(&rc_path, &shim_dir).expect("upsert"));
+        let first = fs::read_to_string(&rc_path).expect("read rc");
+        assert!(first.contains("before"));
+        assert!(first.contains("za ide agent shims"));
+        assert!(!upsert_ide_agent_bash_block(&rc_path, &shim_dir).expect("upsert unchanged"));
+        assert!(remove_ide_agent_bash_block(&rc_path).expect("remove"));
+        assert_eq!(fs::read_to_string(&rc_path).expect("read rc"), "before\n");
     }
 
     #[test]
@@ -1541,6 +2297,29 @@ mod tests {
         assert!(rendered.contains("would stop [11]"));
         assert!(rendered.contains("would remove /root/.cache/JetBrains/Toolbox/ipc"));
         assert!(rendered.contains("would remove 0xcd001e46 [1]"));
+    }
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(prefix: &str) -> std::io::Result<Self> {
+            let unique = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("za-test-{prefix}-{}-{unique}", std::process::id()));
+            fs::create_dir_all(&path)?;
+            Ok(Self { path })
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 
     fn sample_project_row() -> IdeProjectRow {

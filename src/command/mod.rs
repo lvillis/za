@@ -9,6 +9,7 @@ pub mod diff;
 pub mod r#gen;
 pub mod git;
 pub mod ide;
+pub mod paths;
 pub mod port;
 pub mod render;
 pub mod run;
