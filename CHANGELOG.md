@@ -1,8 +1,17 @@
+## [0.1.59] - 2026-04-24
+
+### 🚀 Features
+
+- *(ide)* Route JetBrains agent launches through za run
 ## [0.1.58] - 2026-04-22
 
 ### 🐛 Bug Fixes
 
 - Ci
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.58
 ## [0.1.57] - 2026-04-22
 
 ### 🐛 Bug Fixes
