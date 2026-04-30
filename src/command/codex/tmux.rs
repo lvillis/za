@@ -45,8 +45,8 @@ pub(super) fn tmux_has_session(session_name: &str) -> Result<bool> {
         return Ok(false);
     }
     bail!(
-        "`tmux has-session -t {session_name}` failed: {}",
-        stderr.trim()
+        "Could not inspect Codex session `{session_name}`: {}",
+        tmux_failure_detail(&stderr)
     )
 }
 
@@ -80,8 +80,8 @@ fn tmux_list_panes_start_commands(session_name: &str) -> Result<String> {
             return Ok(String::new());
         }
         bail!(
-            "`tmux list-panes -t {session_name}` failed: {}",
-            stderr.trim()
+            "Could not inspect Codex session panes for `{session_name}`: {}",
+            tmux_failure_detail(&stderr)
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -139,8 +139,8 @@ fn tmux_ensure_outer_scrollback_preserved() -> Result<()> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "`tmux set-option -sa terminal-overrides ',*:smcup@:rmcup@'` failed: {}",
-            stderr.trim()
+            "Could not configure tmux scrollback preservation: {}",
+            tmux_failure_detail(&stderr)
         );
     }
     Ok(())
@@ -156,7 +156,10 @@ fn tmux_show_server_option(option: &str) -> Result<String> {
         if stderr.trim().eq_ignore_ascii_case("invalid option") {
             return Ok(String::new());
         }
-        bail!("`tmux show-options -s {option}` failed: {}", stderr.trim());
+        bail!(
+            "Could not read tmux server option `{option}`: {}",
+            tmux_failure_detail(&stderr)
+        );
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
@@ -178,8 +181,8 @@ fn tmux_codex_window_ids(session_name: &str) -> Result<BTreeSet<String>> {
             return Ok(BTreeSet::new());
         }
         bail!(
-            "`tmux list-panes -t {session_name}` failed: {}",
-            stderr.trim()
+            "Could not inspect Codex session panes for `{session_name}`: {}",
+            tmux_failure_detail(&stderr)
         );
     }
     Ok(parse_tmux_codex_window_ids(&String::from_utf8_lossy(
@@ -215,8 +218,8 @@ fn tmux_set_window_option(target: &str, option: &str, value: &str) -> Result<()>
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "`tmux set-window-option -t {target} {option} {value}` failed: {}",
-            stderr.trim()
+            "Could not configure Codex window `{target}` option `{option}`: {}",
+            tmux_failure_detail(&stderr)
         );
     }
     Ok(())
@@ -230,8 +233,8 @@ fn tmux_set_session_option(target: &str, option: &str, value: &str) -> Result<()
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "`tmux set-option -t {target} {option} {value}` failed: {}",
-            stderr.trim()
+            "Could not configure Codex session `{target}` option `{option}`: {}",
+            tmux_failure_detail(&stderr)
         );
     }
     Ok(())
@@ -245,8 +248,8 @@ fn tmux_rename_window(target: &str, window_name: &str) -> Result<()> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "`tmux rename-window -t {target} {window_name}` failed: {}",
-            stderr.trim()
+            "Could not rename Codex window `{target}` to `{window_name}`: {}",
+            tmux_failure_detail(&stderr)
         );
     }
     Ok(())
@@ -270,8 +273,8 @@ fn tmux_first_window_id(session_name: &str) -> Result<Option<String>> {
             return Ok(None);
         }
         bail!(
-            "`tmux list-windows -t {session_name}` failed: {}",
-            stderr.trim()
+            "Could not inspect Codex session windows for `{session_name}`: {}",
+            tmux_failure_detail(&stderr)
         );
     }
 
@@ -305,8 +308,8 @@ pub(super) fn tmux_new_session(session_name: &str, cwd: &Path, command: &str) ->
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "`tmux new-session -s {session_name}` failed: {}",
-            stderr.trim()
+            "Could not start Codex session `{session_name}`: {}",
+            tmux_failure_detail(&stderr)
         );
     }
     Ok(())
@@ -337,8 +340,8 @@ pub(super) fn tmux_new_window(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
-            "`tmux new-window -t {session_name}` failed: {}",
-            stderr.trim()
+            "Could not open command window in Codex session `{session_name}`: {}",
+            tmux_failure_detail(&stderr)
         );
     }
     Ok(())
@@ -355,8 +358,8 @@ pub(super) fn tmux_kill_session(session_name: &str) -> Result<()> {
             return Ok(());
         }
         bail!(
-            "`tmux kill-session -t {session_name}` failed: {}",
-            stderr.trim()
+            "Could not stop Codex session `{session_name}`: {}",
+            tmux_failure_detail(&stderr)
         );
     }
     Ok(())
@@ -421,7 +424,10 @@ pub(super) fn list_tmux_sessions() -> Result<BTreeMap<String, TmuxSessionInfo>> 
         if is_tmux_no_server(&stderr) {
             return Ok(BTreeMap::new());
         }
-        bail!("`tmux list-sessions` failed: {}", stderr.trim());
+        bail!(
+            "Could not list Codex sessions from tmux: {}",
+            tmux_failure_detail(&stderr)
+        );
     }
     parse_tmux_sessions(&String::from_utf8_lossy(&output.stdout))
 }
@@ -475,6 +481,15 @@ pub(super) fn is_tmux_no_server(stderr: &str) -> bool {
     lower.contains("failed to connect to server")
         || lower.contains("no server running")
         || (lower.contains("error connecting to") && lower.contains("no such file or directory"))
+}
+
+fn tmux_failure_detail(stderr: &str) -> &str {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        "tmux returned a non-zero exit status without details"
+    } else {
+        trimmed
+    }
 }
 
 fn is_tmux_missing_session(stderr: &str) -> bool {

@@ -84,7 +84,7 @@ fn run_up_with_args(args: &[String], force_recreate: bool, launcher: &str) -> Re
             active_listener.as_ref(),
         )? {
             eprintln!(
-                "Recreating managed Codex session `{}` to enable live OTLP streaming for `za codex top`.",
+                "Restarting Codex session `{}` so `za codex top` can stream live telemetry.",
                 ctx.session_name
             );
             tmux_kill_session(&ctx.session_name)?;
@@ -121,7 +121,7 @@ fn run_resume_with_args(args: &[String], force_recreate: bool, launcher: &str) -
             active_listener.as_ref(),
         )? {
             eprintln!(
-                "Recreating managed Codex session `{}` to enable live OTLP streaming for `za codex top`.",
+                "Restarting Codex session `{}` so `za codex top` can stream live telemetry.",
                 ctx.session_name
             );
             tmux_kill_session(&ctx.session_name)?;
@@ -143,7 +143,7 @@ fn run_resume_with_args(args: &[String], force_recreate: bool, launcher: &str) -
 
 fn restart_managed_session(ctx: &WorkspaceContext, launcher: &str, args: &[String]) -> Result<()> {
     eprintln!(
-        "Recreating managed Codex session `{}` with explicit startup args.",
+        "Restarting Codex session `{}` with the requested startup arguments.",
         ctx.session_name
     );
     tmux_kill_session(&ctx.session_name)?;
@@ -157,7 +157,7 @@ fn restart_managed_resume_session(
     args: &[String],
 ) -> Result<()> {
     eprintln!(
-        "Recreating managed Codex session `{}` with explicit resume args.",
+        "Restarting Codex session `{}` with the requested resume arguments.",
         ctx.session_name
     );
     tmux_kill_session(&ctx.session_name)?;
@@ -173,8 +173,13 @@ fn start_managed_session(
 ) -> Result<()> {
     let command = build_codex_launch_command(&ctx.workspace_root, mode, args)?;
     tmux_new_session(&ctx.session_name, &ctx.workspace_root, &command)?;
-    tmux_apply_codex_terminal_fixes(&ctx.session_name)?;
-    tmux_apply_codex_session_style(&ctx.session_name, &ctx.workspace_label)?;
+    ensure_codex_session_is_alive(&ctx.session_name, mode)?;
+    apply_to_live_codex_session(&ctx.session_name, mode, || {
+        tmux_apply_codex_terminal_fixes(&ctx.session_name)
+    })?;
+    apply_to_live_codex_session(&ctx.session_name, mode, || {
+        tmux_apply_codex_session_style(&ctx.session_name, &ctx.workspace_label)
+    })?;
     persist_session_record(ctx, launcher, args)?;
     Ok(())
 }
@@ -185,7 +190,7 @@ fn run_attach() -> Result<i32> {
     let ctx = resolve_workspace_context()?;
     if !tmux_has_session(&ctx.session_name)? {
         bail!(
-            "no managed Codex session for `{}`; start one with `za codex`",
+            "No Codex session for `{}`. Start one with `za codex`.",
             ctx.workspace_root.display()
         );
     }
@@ -202,7 +207,7 @@ fn run_exec(args: &[String]) -> Result<i32> {
     let ctx = resolve_workspace_context()?;
     if !tmux_has_session(&ctx.session_name)? {
         bail!(
-            "no managed Codex session for `{}`; start one with `za codex` first",
+            "No Codex session for `{}`. Start one with `za codex` first.",
             ctx.workspace_root.display()
         );
     }
@@ -222,7 +227,7 @@ fn run_exec(args: &[String]) -> Result<i32> {
         attach_session(&ctx.session_name, &ctx.workspace_label)
     } else {
         println!(
-            "Started tmux window `{}` in session `{}` for {}.",
+            "Started command window `{}` in Codex session `{}` for {}.",
             window_name,
             ctx.session_name,
             ctx.workspace_root.display()
@@ -367,7 +372,7 @@ fn run_stop_all(json: bool) -> Result<i32> {
                 .context("serialize codex stop --all output")?
             );
         } else {
-            println!("{}", no_managed_sessions_message(tmux_available, true));
+            println!("{}", render_stop_all_empty_message(tmux_available));
         }
         return Ok(0);
     }
@@ -436,6 +441,36 @@ fn run_stop_all(json: bool) -> Result<i32> {
 enum CodexLaunchMode {
     Fresh,
     ResumeLast,
+}
+
+fn ensure_codex_session_is_alive(session_name: &str, mode: CodexLaunchMode) -> Result<()> {
+    if !tmux_has_session(session_name)? {
+        bail!("{}", codex_session_exited_message(mode));
+    }
+    Ok(())
+}
+
+fn apply_to_live_codex_session<F>(session_name: &str, mode: CodexLaunchMode, apply: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    match apply() {
+        Ok(()) => Ok(()),
+        Err(err) => match tmux_has_session(session_name) {
+            Ok(false) => bail!("{}", codex_session_exited_message(mode)),
+            _ => Err(err),
+        },
+    }
+}
+
+fn codex_session_exited_message(mode: CodexLaunchMode) -> String {
+    let inspect_command = match mode {
+        CodexLaunchMode::Fresh => "za run codex",
+        CodexLaunchMode::ResumeLast => "za run codex resume --last",
+    };
+    format!(
+        "Codex exited before the session could be attached. Run `{inspect_command}` to inspect Codex output."
+    )
 }
 
 fn build_codex_launch_command(
@@ -518,15 +553,22 @@ fn session_status_label(running: bool, metadata_present: bool, tmux_available: b
 fn no_managed_sessions_message(tmux_available: bool, all: bool) -> String {
     if all {
         if tmux_available {
-            return "No managed Codex sessions found.".to_string();
+            return "No Codex sessions found.".to_string();
         }
-        return "No managed Codex sessions found. (`tmux` unavailable.)".to_string();
+        return "No Codex sessions found. (`tmux` is unavailable, so only local records were checked.)".to_string();
     }
 
     if tmux_available {
-        return "No managed Codex session found for the current workspace. Use `za codex ps --all` to list every local session.".to_string();
+        return "No Codex session for the current workspace. Use `za codex ps -a` to show sessions from other workspaces.".to_string();
     }
-    "No managed Codex session found for the current workspace. (`tmux` unavailable.) Use `za codex ps --all` to inspect every locally recorded session.".to_string()
+    "No Codex session for the current workspace. (`tmux` is unavailable, so only local records were checked.) Use `za codex ps -a` to show sessions from other workspaces.".to_string()
+}
+
+fn render_stop_all_empty_message(tmux_available: bool) -> String {
+    if tmux_available {
+        return "All Codex sessions are already stopped.".to_string();
+    }
+    "All Codex sessions are already stopped. (`tmux` is unavailable, so only local records were checked.)".to_string()
 }
 
 fn stop_target_session_names(
@@ -549,25 +591,22 @@ fn render_stop_message(output: &CodexStopOutput) -> String {
     if !output.tmux_available {
         if output.metadata_removed {
             return format!(
-                "Removed local Codex session metadata for `{}`; `tmux` is unavailable, so the underlying session was not stopped.",
+                "Codex session `{}` is stopped; cleaned local record. (`tmux` is unavailable, so no running session could be checked.)",
                 output.session_name
             );
         }
         return format!(
-            "No local Codex session metadata found for `{}`; `tmux` is unavailable, so no session could be checked.",
+            "Codex session `{}` is already stopped. (`tmux` is unavailable, so no running session could be checked.)",
             output.session_name
         );
     }
     if output.metadata_removed {
         return format!(
-            "Removed stale Codex session metadata for `{}`; no running tmux session was found.",
+            "Codex session `{}` is stopped; cleaned local record.",
             output.session_name
         );
     }
-    format!(
-        "No managed Codex session found for `{}`.",
-        output.workspace_root
-    )
+    "Codex session is already stopped.".to_string()
 }
 
 fn next_exec_window_name() -> String {
@@ -633,20 +672,22 @@ fn git_capture(path: &Path, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedSessionSummaryEntry, CodexPsCache, CodexSessionSummary, CodexStopOutput, CodexTopApp,
-        CodexTopRow, FileSessionState, LegacyContextCache, OtelEventRecord, OtelLiveState,
-        OtelSessionState, SESSION_HASH_LEN, SessionFileTracker, SessionRecord, TmuxSessionInfo,
-        TopRowsInput, TopStreamFilter, TopStreamState, TopView, activity_age_label,
-        apply_session_log_line, best_tracker_match_for_record, build_shell_exec_command,
-        build_top_rows, calculate_context_left_percent, config_overrides_otel,
-        ensure_local_listener_no_proxy, is_tmux_no_server, is_tmux_session_absent,
-        load_codex_session_summaries, load_legacy_codex_context_left_percent_by_session_id,
+        CachedSessionSummaryEntry, CodexLaunchMode, CodexPsCache, CodexSessionSummary,
+        CodexStopOutput, CodexTopApp, CodexTopRow, FileSessionState, LegacyContextCache,
+        OtelEventRecord, OtelLiveState, OtelSessionState, SESSION_HASH_LEN, SessionFileTracker,
+        SessionRecord, TmuxSessionInfo, TopRowsInput, TopStreamFilter, TopStreamState, TopView,
+        activity_age_label, apply_session_log_line, best_tracker_match_for_record,
+        build_shell_exec_command, build_top_rows, calculate_context_left_percent,
+        codex_session_exited_message, config_overrides_otel, ensure_local_listener_no_proxy,
+        is_tmux_no_server, is_tmux_session_absent, load_codex_session_summaries,
+        load_legacy_codex_context_left_percent_by_session_id, no_managed_sessions_message,
         parse_legacy_codex_context_left_percent_lines, parse_otlp_session_events,
-        parse_tmux_codex_window_ids, parse_tmux_sessions, render_stop_message, resolve_state_home,
-        sanitize_session_label, session_matches_scope, session_status_label, shell_escape,
-        stop_target_session_names, summarize_codex_session_lines, tmux_codex_status_left,
-        tmux_codex_status_left_length, tmux_panes_include_listener_endpoint,
-        tmux_terminal_overrides_disable_alt_screen, workspace_hash,
+        parse_tmux_codex_window_ids, parse_tmux_sessions, render_stop_all_empty_message,
+        render_stop_message, resolve_state_home, sanitize_session_label, session_matches_scope,
+        session_status_label, shell_escape, stop_target_session_names,
+        summarize_codex_session_lines, tmux_codex_status_left, tmux_codex_status_left_length,
+        tmux_panes_include_listener_endpoint, tmux_terminal_overrides_disable_alt_screen,
+        workspace_hash,
     };
     use anyhow::Result;
     use std::{
@@ -839,6 +880,38 @@ mod tests {
     }
 
     #[test]
+    fn no_sessions_message_is_user_facing() {
+        assert_eq!(
+            no_managed_sessions_message(true, false),
+            "No Codex session for the current workspace. Use `za codex ps -a` to show sessions from other workspaces."
+        );
+        assert_eq!(
+            no_managed_sessions_message(false, true),
+            "No Codex sessions found. (`tmux` is unavailable, so only local records were checked.)"
+        );
+    }
+
+    #[test]
+    fn stop_all_empty_message_is_idempotent() {
+        assert_eq!(
+            render_stop_all_empty_message(true),
+            "All Codex sessions are already stopped."
+        );
+        assert_eq!(
+            render_stop_all_empty_message(false),
+            "All Codex sessions are already stopped. (`tmux` is unavailable, so only local records were checked.)"
+        );
+    }
+
+    #[test]
+    fn exited_session_message_points_to_direct_codex_run() {
+        assert_eq!(
+            codex_session_exited_message(CodexLaunchMode::ResumeLast),
+            "Codex exited before the session could be attached. Run `za run codex resume --last` to inspect Codex output."
+        );
+    }
+
+    #[test]
     fn render_stop_message_explains_tmux_missing_cleanup() {
         let message = render_stop_message(&CodexStopOutput {
             session_name: "za-codex-za-123".to_string(),
@@ -848,8 +921,39 @@ mod tests {
             tmux_available: false,
             note: Some("`tmux` is not installed; removed local session metadata only".to_string()),
         });
-        assert!(message.contains("Removed local Codex session metadata"));
-        assert!(message.contains("tmux` is unavailable"));
+        assert_eq!(
+            message,
+            "Codex session `za-codex-za-123` is stopped; cleaned local record. (`tmux` is unavailable, so no running session could be checked.)"
+        );
+    }
+
+    #[test]
+    fn render_stop_message_uses_completion_tone_for_stale_record() {
+        let message = render_stop_message(&CodexStopOutput {
+            session_name: "za-codex-tier-rs-b2e778148163".to_string(),
+            workspace_root: "/opt/app/tier-rs".to_string(),
+            stopped: false,
+            metadata_removed: true,
+            tmux_available: true,
+            note: Some("no running tmux session was found".to_string()),
+        });
+        assert_eq!(
+            message,
+            "Codex session `za-codex-tier-rs-b2e778148163` is stopped; cleaned local record."
+        );
+    }
+
+    #[test]
+    fn render_stop_message_uses_already_stopped_for_empty_state() {
+        let message = render_stop_message(&CodexStopOutput {
+            session_name: "za-codex-tier-rs-b2e778148163".to_string(),
+            workspace_root: "/opt/app/tier-rs".to_string(),
+            stopped: false,
+            metadata_removed: false,
+            tmux_available: true,
+            note: None,
+        });
+        assert_eq!(message, "Codex session is already stopped.");
     }
 
     #[test]

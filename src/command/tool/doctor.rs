@@ -322,7 +322,7 @@ fn render_doctor_lines(report: &ToolDoctorReport) -> Vec<String> {
     ));
 
     if report.rows.is_empty() {
-        lines.push(tty_style::dim("No managed tools found in this scope."));
+        lines.push(tty_style::dim("No za-managed tools found in this scope."));
         return lines;
     }
 
@@ -377,7 +377,7 @@ fn render_doctor_summary(summary: &ToolDoctorSummary) -> String {
         parts.push(tty_style::success(format!("{} healthy", summary.ok)));
     }
     if parts.is_empty() {
-        tty_style::dim("no managed tools")
+        tty_style::dim("no za-managed tools")
     } else {
         parts.join(&format!(" {} ", tty_style::dim("·")))
     }

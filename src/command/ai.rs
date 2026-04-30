@@ -433,7 +433,7 @@ fn render_explain() -> String {
         out.push_str(&format!("  {source:<12} {target}\n"));
     }
     out.push_str(
-        "\n`za ai shell <shell>` prints session-local git wrappers instead of top-level aliases. In managed Codex sessions, `za run codex` and `za codex` also export `ZA_AI_*` markers and inject a `BASH_ENV` wrapper so bare `git status` and simple `git diff` calls resolve to `za ai git ...` automatically. Unsupported git invocations fall back to raw `git`.\n",
+        "\n`za ai shell <shell>` prints session-local git wrappers instead of top-level aliases. In Codex sessions started by `za`, `za run codex` and `za codex` also export `ZA_AI_*` markers and inject a `BASH_ENV` wrapper so bare `git status` and simple `git diff` calls resolve to `za ai git ...` automatically. Unsupported git invocations fall back to raw `git`.\n",
     );
     out.push_str(
         "\nUse `za ai gain` to inspect aggregated raw-vs-summary savings for all AI-routed commands recorded in this workspace.\n",

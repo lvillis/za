@@ -193,15 +193,15 @@ pub enum ToolCommands {
         #[arg(long)]
         verbose: bool,
     },
-    /// Diagnose managed tool state and repair hints
+    /// Diagnose za-managed tool state and repair hints
     Doctor {
-        /// Tool names. Omit to inspect all managed tools in this scope.
+        /// Tool names. Omit to inspect all za-managed tools in this scope.
         tools: Vec<String>,
         /// Print JSON output for scripting.
         #[arg(long)]
         json: bool,
     },
-    /// List managed tools and availability in this scope
+    /// List za-managed tools and availability in this scope
     #[command(name = "ls", alias = "list")]
     Ls {
         /// Tool names. Only valid together with `--outdated`.
@@ -212,7 +212,7 @@ pub enum ToolCommands {
         /// List built-in supported tools and source policies.
         #[arg(long)]
         supported: bool,
-        /// Check managed tools for newer upstream versions.
+        /// Check za-managed tools for newer upstream versions.
         #[arg(long)]
         outdated: bool,
         /// Return non-zero when updates are available. Requires `--outdated`.
@@ -224,10 +224,10 @@ pub enum ToolCommands {
     },
     /// Update tools to the newest available version
     Update {
-        /// Update all managed tools in this scope.
+        /// Update all za-managed tools in this scope.
         #[arg(long)]
         all: bool,
-        /// Tool names. Omit to update all managed tools in this scope.
+        /// Tool names. Omit to update all za-managed tools in this scope.
         tools: Vec<String>,
         /// Pin the update target to a specific version. Requires exactly one tool.
         #[arg(long, value_name = "VERSION")]
@@ -288,7 +288,7 @@ pub enum ToolCommands {
     /// Check installed tools for newer upstream versions
     #[command(hide = true)]
     Outdated {
-        /// Tool names. Omit to check all managed tools in this scope.
+        /// Tool names. Omit to check all za-managed tools in this scope.
         tools: Vec<String>,
         /// Print JSON output for scripting.
         #[arg(long)]
@@ -837,7 +837,7 @@ pub enum CodexCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// List managed Codex tmux sessions
+    /// List Codex sessions
     Ps {
         /// Print JSON output for scripting.
         #[arg(long)]
@@ -860,7 +860,7 @@ pub enum CodexCommands {
         /// Print JSON output for scripting.
         #[arg(long)]
         json: bool,
-        /// Stop all local managed Codex sessions instead of only the current workspace.
+        /// Stop all local Codex sessions instead of only the current workspace.
         #[arg(short = 'a', long)]
         all: bool,
     },

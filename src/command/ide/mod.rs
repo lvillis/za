@@ -1024,9 +1024,9 @@ fn run_ps(duplicates_only: bool, json: bool) -> Result<i32> {
 
     if project_rows.is_empty() {
         if duplicates_only {
-            println!("No duplicate JetBrains remote IDE sessions found.");
+            println!("No duplicate JetBrains remote IDE sessions.");
         } else {
-            println!("No JetBrains remote IDE sessions found.");
+            println!("No JetBrains remote IDE sessions are running.");
         }
         return Ok(0);
     }
@@ -1116,18 +1116,15 @@ fn run_stop(pid: i32, timeout_secs: u64, json: bool) -> Result<i32> {
     }
 
     if !stopped {
-        println!(
-            "ℹ️  {} (pid {}) already exited before signal delivery",
-            session.ide, session.pid
-        );
+        println!("{} (pid {}) is already stopped.", session.ide, session.pid);
     } else if forced {
         println!(
-            "🛑 Stopped {} (pid {}) with SIGKILL after timeout ({} ms)",
+            "Stopped {} (pid {}) with SIGKILL after timeout ({} ms).",
             session.ide, session.pid, elapsed_ms
         );
     } else {
         println!(
-            "✅ Stopped {} (pid {}) with SIGTERM ({} ms)",
+            "Stopped {} (pid {}) with SIGTERM ({} ms).",
             session.ide, session.pid, elapsed_ms
         );
     }
@@ -1230,7 +1227,7 @@ fn run_reconcile(
                 serde_json::to_string_pretty(&out).context("serialize ide reconcile output")?
             );
         } else {
-            println!("No over-limit or orphan-due JetBrains IDE sessions to reconcile.");
+            println!("No duplicate or stale JetBrains IDE sessions need cleanup.");
         }
         return Ok(0);
     }
@@ -1309,11 +1306,11 @@ fn run_reconcile(
         }
         if !orphan_pids.is_empty() {
             println!(
-                "- orphan ttl ({}m) stop={:?}",
+                "- stale sessions past ttl={}m stop={:?}",
                 policy.orphan_ttl_minutes, orphan_pids
             );
             for failure in &orphan_failures {
-                println!("  failed orphan pid {}: {}", failure.pid, failure.error);
+                println!("  failed stale pid {}: {}", failure.pid, failure.error);
             }
         }
         println!(

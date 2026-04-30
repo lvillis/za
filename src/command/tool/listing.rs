@@ -327,7 +327,7 @@ pub(super) fn list_outdated(
 
     if names.is_empty() {
         println!(
-            "No managed tools installed in {} scope.",
+            "No za-managed tools are installed in {} scope.",
             home.scope.label()
         );
         return Ok(0);
@@ -348,13 +348,13 @@ pub(super) fn list_outdated(
 
     if fail_on_check_errors && !report.check_failures.is_empty() {
         eprintln!(
-            "tool outdated policy failure: {} update checks failed",
+            "`za tool outdated` policy failed: {} update check(s) failed",
             report.check_failures.len()
         );
         return Ok(TOOL_EXIT_UPDATE_CHECK_FAILED);
     }
     if fail_on_updates && report.has_updates {
-        eprintln!("tool outdated policy failure: updates available");
+        eprintln!("`za tool outdated` policy failed: updates are available");
         return Ok(TOOL_EXIT_UPDATES_AVAILABLE);
     }
     Ok(0)
@@ -692,7 +692,7 @@ fn print_installed_text(report: &InstalledToolReport) {
     if let Some(table) = render_installed_table(&report.rows) {
         println!("{table}");
     } else {
-        println!("No managed tools installed.");
+        println!("No za-managed tools are installed.");
     }
 
     println!("\nScope: {}", report.scope);
@@ -820,7 +820,7 @@ fn print_outdated_text(report: &OutdatedReport) {
     if let Some(table) = render_outdated_table(&report.rows) {
         println!("{table}");
     } else {
-        println!("No managed tools installed.");
+        println!("No za-managed tools are installed.");
     }
 
     println!("\nScope: {}", report.scope);
@@ -952,7 +952,9 @@ pub(super) fn resolve_latest_checks_for_names(names: &[String]) -> Result<Latest
     if let Err(err) = cache.save_if_dirty()
         && !is_permission_denied_error(&err)
     {
-        eprintln!("warning: failed to persist tool update cache: {err}");
+        eprintln!(
+            "warning: tool update cache was not saved; continuing without cached update status: {err}"
+        );
     }
 
     let mut by_name = HashMap::new();

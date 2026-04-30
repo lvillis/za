@@ -34,7 +34,7 @@ pub(super) fn install_tools(
 
     if requested_names.is_empty() {
         println!(
-            "No managed tools installed in {} scope.",
+            "No za-managed tools are installed in {} scope.",
             home.scope.label()
         );
         return Ok(());
@@ -88,7 +88,7 @@ pub(super) fn update_tools(
 
     if requested_names.is_empty() {
         println!(
-            "No managed tools installed in {} scope.",
+            "No za-managed tools are installed in {} scope.",
             home.scope.label()
         );
         return Ok(());
@@ -425,7 +425,7 @@ pub(crate) fn render_batch_summary(
         if dry_run {
             tty_style::dim("dry-run complete")
         } else {
-            tty_style::dim("no managed tools changed")
+            tty_style::dim("no tool changes")
         }
     } else {
         parts.join(", ")
