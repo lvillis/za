@@ -40,6 +40,9 @@ const JUST_GITHUB_TAG_PREFIX: &str = "";
 const OHA_GITHUB_OWNER: &str = "hatoo";
 const OHA_GITHUB_REPO: &str = "oha";
 const OHA_GITHUB_TAG_PREFIX: &str = "v";
+const SCCACHE_GITHUB_OWNER: &str = "mozilla";
+const SCCACHE_GITHUB_REPO: &str = "sccache";
+const SCCACHE_GITHUB_TAG_PREFIX: &str = "v";
 const STARSHIP_GITHUB_OWNER: &str = "starship";
 const STARSHIP_GITHUB_REPO: &str = "starship";
 const STARSHIP_GITHUB_TAG_PREFIX: &str = "v";
@@ -124,7 +127,7 @@ impl ToolPolicy {
     }
 }
 
-const TOOL_POLICIES: [ToolPolicy; 20] = [
+const TOOL_POLICIES: [ToolPolicy; 21] = [
     ToolPolicy {
         canonical_name: "za",
         aliases: &[],
@@ -347,6 +350,23 @@ const TOOL_POLICIES: [ToolPolicy; 20] = [
         cargo_fallback_package: None,
     },
     ToolPolicy {
+        canonical_name: "sccache",
+        aliases: &[],
+        source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
+        github_release: Some(GithubReleasePolicy {
+            project_label: "sccache",
+            owner: SCCACHE_GITHUB_OWNER,
+            repo: SCCACHE_GITHUB_REPO,
+            tag_prefix: SCCACHE_GITHUB_TAG_PREFIX,
+            expected_asset_name: Some(sccache_expected_asset_name),
+            verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
+        }),
+        cargo_fallback_package: None,
+    },
+    ToolPolicy {
         canonical_name: "starship",
         aliases: &[],
         source_label: "GitHub Release (SHA-256 verified)",
@@ -563,6 +583,13 @@ fn oha_expected_asset_name(_version: &str) -> Result<String> {
     Ok(format!("oha-{}", oha_target()?))
 }
 
+fn sccache_expected_asset_name(version: &str) -> Result<String> {
+    Ok(format!(
+        "sccache-v{version}-{}.tar.gz",
+        sccache_target_triple()?
+    ))
+}
+
 fn starship_expected_asset_name(_version: &str) -> Result<String> {
     Ok(format!("starship-{}.tar.gz", starship_target_triple()?))
 }
@@ -770,6 +797,20 @@ fn oha_target() -> Result<&'static str> {
         ("macos", "aarch64") => Ok("macos-arm64"),
         _ => bail!(
             "unsupported platform for oha release asset: {}-{}",
+            env::consts::ARCH,
+            env::consts::OS
+        ),
+    }
+}
+
+fn sccache_target_triple() -> Result<&'static str> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
+        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
+        _ => bail!(
+            "unsupported platform for sccache release asset: {}-{}",
             env::consts::ARCH,
             env::consts::OS
         ),

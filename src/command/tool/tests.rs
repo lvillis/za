@@ -400,6 +400,14 @@ fn tool_policy_matches_alias_and_canonical() {
     assert_eq!(dust.canonical_name, "dust");
     let oha = find_tool_policy("oha").expect("canonical policy");
     assert_eq!(oha.canonical_name, "oha");
+    let sccache = find_tool_policy("sccache").expect("canonical policy");
+    assert_eq!(sccache.canonical_name, "sccache");
+    assert_eq!(sccache.cargo_fallback_package, None);
+    assert_eq!(sccache.source_label, "GitHub Release (SHA-256 verified)");
+    assert_eq!(
+        sccache.github_release.expect("github policy").verification,
+        GithubReleaseVerification::RequiredSha256Digest
+    );
     let starship = find_tool_policy("starship").expect("canonical policy");
     assert_eq!(starship.canonical_name, "starship");
     assert_eq!(starship.cargo_fallback_package, None);
@@ -492,6 +500,7 @@ fn canonical_tool_name_resolves_aliases() {
     assert_eq!(canonical_tool_name("hyperfine"), "hyperfine");
     assert_eq!(canonical_tool_name("docker-compose"), "docker-compose");
     assert_eq!(canonical_tool_name("oha"), "oha");
+    assert_eq!(canonical_tool_name("sccache"), "sccache");
     assert_eq!(canonical_tool_name("starship"), "starship");
     assert_eq!(canonical_tool_name("git-cliff"), "git-cliff");
     assert_eq!(canonical_tool_name("cargo-release"), "cargo-release");
@@ -522,6 +531,7 @@ fn supported_tool_names_csv_contains_all_aliases() {
     assert!(csv.contains("dust"));
     assert!(csv.contains("just"));
     assert!(csv.contains("oha"));
+    assert!(csv.contains("sccache"));
     assert!(csv.contains("starship"));
     assert!(csv.contains("git-cliff"));
     assert!(csv.contains("cargo-release"));
@@ -742,6 +752,27 @@ fn starship_policy_expected_asset_name_matches_supported_tarball() {
         other => panic!("unsupported local test platform: {other:?}"),
     };
     assert_eq!(asset_name, format!("starship-{expected_target}.tar.gz"));
+}
+
+#[test]
+fn sccache_policy_expected_asset_name_matches_supported_tarball() {
+    let policy = find_tool_policy("sccache")
+        .expect("policy")
+        .github_release
+        .expect("github policy");
+    let asset_name =
+        (policy.expected_asset_name.expect("asset resolver"))("0.15.0").expect("asset name");
+    let expected_target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+        ("linux", "aarch64") => "aarch64-unknown-linux-musl",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        other => panic!("unsupported local test platform: {other:?}"),
+    };
+    assert_eq!(
+        asset_name,
+        format!("sccache-v0.15.0-{expected_target}.tar.gz")
+    );
 }
 
 #[test]
