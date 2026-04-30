@@ -123,6 +123,13 @@ fn main() -> Result<()> {
                 suggest,
             }),
         },
+        cli::Commands::Pin { cmd } => {
+            let exit_code = command::pin::run(cmd)?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
         cli::Commands::Port { cmd } => {
             let exit_code = command::port::run(cmd)?;
             if exit_code != 0 {

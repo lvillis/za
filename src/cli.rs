@@ -54,6 +54,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: Option<DepsCommands>,
     },
+    /// Resolve package and GitHub Action references into copy-pastable pins
+    Pin {
+        #[command(subcommand)]
+        cmd: PinCommands,
+    },
     /// Inspect local TCP/UDP port bindings
     Port {
         #[command(subcommand)]
@@ -623,6 +628,43 @@ pub enum DepsCommands {
     },
 }
 
+#[derive(Subcommand)]
+pub enum PinCommands {
+    /// Resolve an npm package dist-tag or version
+    Npm {
+        /// Package name, optionally with an inline tag/version, e.g. react@latest.
+        #[arg(value_name = "PACKAGE")]
+        package: String,
+        /// Dist-tag or version to resolve. Cannot be combined with PACKAGE@TAG.
+        #[arg(long, value_name = "TAG")]
+        tag: Option<String>,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve a crates.io crate version
+    Crate {
+        /// Crate name.
+        #[arg(value_name = "CRATE")]
+        name: String,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve a GitHub Action ref to a commit SHA
+    Action {
+        /// Action reference, e.g. actions/checkout@v4 or owner/repo/path@main.
+        #[arg(value_name = "OWNER/REPO[/PATH]@REF")]
+        spec: String,
+        /// Optional GitHub token override for this request.
+        #[arg(long, value_name = "TOKEN")]
+        github_token: Option<String>,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum ColorWhen {
     Auto,
@@ -1016,8 +1058,8 @@ mod tests {
     use super::{
         AiCommands, AiGitCommands, AiShell, CiCommands, Cli, CodexCommands, ColorWhen, Commands,
         CompletionCommands, CompletionShell, DepsCommands, DiffArgs, DiffCommands, DiffKindFilter,
-        DiffRiskFilter, GhCommands, GitAuthCommands, IdeAgentCommands, IdeCommands, PortCommands,
-        PortSignal, ToolCommands,
+        DiffRiskFilter, GhCommands, GitAuthCommands, IdeAgentCommands, IdeCommands, PinCommands,
+        PortCommands, PortSignal, ToolCommands,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -1488,6 +1530,52 @@ mod tests {
                 }
                 _ => panic!("unexpected deps command"),
             },
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn pin_npm_parses_tag_and_json() {
+        let cli =
+            Cli::try_parse_from(["za", "pin", "npm", "@scope/pkg", "--tag", "next", "--json"])
+                .expect("must parse");
+        match cli.cmd {
+            Commands::Pin {
+                cmd: PinCommands::Npm { package, tag, json },
+            } => {
+                assert_eq!(package, "@scope/pkg");
+                assert_eq!(tag.as_deref(), Some("next"));
+                assert!(json);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn pin_action_parses_token_and_json() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "pin",
+            "action",
+            "actions/checkout@v4",
+            "--github-token",
+            "ghp_token",
+            "--json",
+        ])
+        .expect("must parse");
+        match cli.cmd {
+            Commands::Pin {
+                cmd:
+                    PinCommands::Action {
+                        spec,
+                        github_token,
+                        json,
+                    },
+            } => {
+                assert_eq!(spec, "actions/checkout@v4");
+                assert_eq!(github_token.as_deref(), Some("ghp_token"));
+                assert!(json);
+            }
             _ => panic!("unexpected command"),
         }
     }
