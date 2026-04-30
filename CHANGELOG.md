@@ -1,8 +1,18 @@
+## [0.1.60] - 2026-04-30
+
+### 🚀 Features
+
+- *(pin)* Add package and action pin resolver
+- *(tool)* Add sccache release policy
 ## [0.1.59] - 2026-04-24
 
 ### 🚀 Features
 
 - *(ide)* Route JetBrains agent launches through za run
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.59
 ## [0.1.58] - 2026-04-22
 
 ### 🐛 Bug Fixes
