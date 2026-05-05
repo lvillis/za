@@ -1,8 +1,17 @@
+## [0.1.62] - 2026-05-05
+
+### 🚀 Features
+
+- *(tool)* Add Codex alpha update channel
 ## [0.1.61] - 2026-05-05
 
 ### 🐛 Bug Fixes
 
 - *(cli)* Improve user-facing status messages
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.61
 ## [0.1.60] - 2026-04-30
 
 ### 🚀 Features
