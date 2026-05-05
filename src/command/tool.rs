@@ -269,6 +269,12 @@ enum ToolScope {
     User,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ToolUpdateChannel {
+    Stable,
+    CodexAlpha,
+}
+
 impl ToolScope {
     fn from_flags(user: bool) -> Self {
         if user { Self::User } else { Self::Global }
@@ -414,11 +420,12 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
             all,
             tools,
             version,
+            alpha,
             dry_run,
             verbose,
         } => {
             if dry_run {
-                update_tools(&home, all, &tools, version.as_deref(), true, verbose)?;
+                update_tools(&home, all, &tools, version.as_deref(), alpha, true, verbose)?;
                 Ok(0)
             } else {
                 let home_for_action = home.clone();
@@ -428,6 +435,7 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
                         all,
                         &tools,
                         version.as_deref(),
+                        alpha,
                         false,
                         verbose,
                     )

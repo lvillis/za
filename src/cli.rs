@@ -232,6 +232,9 @@ pub enum ToolCommands {
         /// Pin the update target to a specific version. Requires exactly one tool.
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
+        /// Update Codex to the newest alpha pre-release.
+        #[arg(long)]
+        alpha: bool,
         /// Preview the resolved update plan without downloading or changing any files.
         #[arg(long)]
         dry_run: bool,
@@ -1236,6 +1239,7 @@ mod tests {
                         all: false,
                         tools,
                         version: None,
+                        alpha: false,
                         dry_run: false,
                         verbose: false,
                     } if tools == vec!["codex", "rg"]
@@ -1369,7 +1373,30 @@ mod tests {
                         all: false,
                         tools,
                         version: None,
+                        alpha: false,
                         dry_run: true,
+                        verbose: false,
+                    } if tools == vec!["codex"]
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn tool_update_parses_alpha_flag() {
+        let cli =
+            Cli::try_parse_from(["za", "tool", "update", "codex", "--alpha"]).expect("must parse");
+        match cli.cmd {
+            Commands::Tool { cmd, .. } => {
+                assert!(matches!(
+                    cmd,
+                    ToolCommands::Update {
+                        all: false,
+                        tools,
+                        version: None,
+                        alpha: true,
+                        dry_run: false,
                         verbose: false,
                     } if tools == vec!["codex"]
                 ));
@@ -1390,6 +1417,7 @@ mod tests {
                         all: true,
                         tools,
                         version: None,
+                        alpha: false,
                         dry_run: false,
                         verbose: false,
                     } if tools.is_empty()
@@ -1412,6 +1440,7 @@ mod tests {
                         all: true,
                         tools,
                         version: None,
+                        alpha: false,
                         dry_run: false,
                         verbose: true,
                     } if tools.is_empty()

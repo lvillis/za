@@ -1,6 +1,8 @@
 use super::policy::{GithubReleaseTrack, GithubReleaseVerification, ToolLayout};
 use super::*;
 use flate2::read::GzDecoder;
+use semver::Version;
+use serde::de::DeserializeOwned;
 use std::{
     sync::{
         Arc,
@@ -20,6 +22,8 @@ const PARALLEL_DOWNLOAD_MIN_PART_BYTES: u64 = 1024 * 1024;
 const PARALLEL_DOWNLOAD_MAX_PARTS: usize = 4;
 const HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS: usize = 3;
 const HTTP_TRANSIENT_RETRY_BASE_DELAY_MS: u64 = 200;
+const GITHUB_RELEASE_SCAN_PER_PAGE: usize = 30;
+const GITHUB_RELEASE_SCAN_MAX_PAGES: usize = 10;
 
 static ACTIVE_TEMP_DIRS: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -231,6 +235,10 @@ pub(super) fn preview_install_source(
 struct GithubRelease {
     tag_name: String,
     #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
     assets: Vec<GithubReleaseAsset>,
 }
 
@@ -283,6 +291,105 @@ pub(super) fn fetch_latest_version_from_github_release(
             )
         }
     }
+}
+
+pub(super) fn fetch_latest_codex_alpha_version(
+    proxy_scope: za_config::ProxyScope,
+) -> Result<String> {
+    let policy = find_tool_policy("codex").context("codex source policy is not registered")?;
+    let release_policy = policy
+        .github_release
+        .context("codex source policy has no GitHub release policy")?;
+    fetch_latest_prerelease_version_from_github_release(
+        policy,
+        release_policy,
+        "alpha",
+        proxy_scope,
+    )
+}
+
+fn fetch_latest_prerelease_version_from_github_release(
+    tool_policy: ToolPolicy,
+    release_policy: GithubReleasePolicy,
+    channel: &str,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<String> {
+    if release_policy.track != GithubReleaseTrack::VersionedTags {
+        bail!(
+            "`{}` does not support semver pre-release channels",
+            tool_policy.canonical_name
+        );
+    }
+
+    let mut releases = Vec::new();
+    for page in 1..=GITHUB_RELEASE_SCAN_MAX_PAGES {
+        let path = format!(
+            "/repos/{}/{}/releases?per_page={GITHUB_RELEASE_SCAN_PER_PAGE}&page={page}",
+            release_policy.owner, release_policy.repo,
+        );
+        let mut page_releases =
+            fetch_github_releases(release_policy.project_label, &path, proxy_scope)?;
+        let is_last_page = page_releases.len() < GITHUB_RELEASE_SCAN_PER_PAGE;
+        let page_has_channel_release = page_releases.iter().any(|release| {
+            release_matches_prerelease_channel(release, release_policy.tag_prefix, channel)
+        });
+        releases.append(&mut page_releases);
+        if page_has_channel_release || is_last_page {
+            break;
+        }
+    }
+
+    latest_prerelease_version_for_channel(&releases, release_policy.tag_prefix, channel)
+        .with_context(|| {
+            format!(
+                "resolve latest {channel} pre-release for `{}`",
+                tool_policy.canonical_name
+            )
+        })
+}
+
+fn latest_prerelease_version_for_channel(
+    releases: &[GithubRelease],
+    tag_prefix: &str,
+    channel: &str,
+) -> Result<String> {
+    releases
+        .iter()
+        .filter(|release| release.prerelease && !release.draft)
+        .filter_map(|release| {
+            let version = parse_release_version(&release.tag_name, tag_prefix).ok()?;
+            let parsed = Version::parse(&version).ok()?;
+            prerelease_channel_matches(&parsed, channel).then_some((parsed, version))
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, version)| version)
+        .ok_or_else(|| anyhow!("no `{channel}` pre-release was found"))
+}
+
+fn release_matches_prerelease_channel(
+    release: &GithubRelease,
+    tag_prefix: &str,
+    channel: &str,
+) -> bool {
+    if !release.prerelease || release.draft {
+        return false;
+    }
+    let Ok(version) = parse_release_version(&release.tag_name, tag_prefix) else {
+        return false;
+    };
+    let Ok(parsed) = Version::parse(&version) else {
+        return false;
+    };
+    prerelease_channel_matches(&parsed, channel)
+}
+
+fn prerelease_channel_matches(version: &Version, channel: &str) -> bool {
+    version
+        .pre
+        .as_str()
+        .split('.')
+        .next()
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(channel))
 }
 
 fn download_from_github_release(
@@ -776,6 +883,22 @@ fn fetch_github_release(
     path: &str,
     proxy_scope: za_config::ProxyScope,
 ) -> Result<GithubRelease> {
+    fetch_github_json(project_label, path, proxy_scope)
+}
+
+fn fetch_github_releases(
+    project_label: &str,
+    path: &str,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<Vec<GithubRelease>> {
+    fetch_github_json(project_label, path, proxy_scope)
+}
+
+fn fetch_github_json<T: DeserializeOwned>(
+    project_label: &str,
+    path: &str,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<T> {
     ensure_not_interrupted()?;
 
     let client = build_http_client(GITHUB_API_BASE, "za-tool-manager", false, proxy_scope)
@@ -813,7 +936,7 @@ fn fetch_github_release(
                 );
             }
             response
-                .json::<GithubRelease>()
+                .json::<T>()
                 .with_context(|| format!("parse {project_label} release JSON"))
         },
     )
@@ -1750,12 +1873,14 @@ fn unique_temp_dir(prefix: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DownloadExtractionMode, DownloadRange, ParallelDownloadPlan, TEMP_DIR_PREFIX_DOWNLOAD,
-        build_parallel_download_plan, download_from_url, matched_temp_prefix,
-        parse_content_range_total, parse_temp_dir_pid, retry_transient_http_operation,
+        DownloadExtractionMode, DownloadRange, GithubRelease, ParallelDownloadPlan,
+        TEMP_DIR_PREFIX_DOWNLOAD, build_parallel_download_plan, download_from_url,
+        latest_prerelease_version_for_channel, matched_temp_prefix, parse_content_range_total,
+        parse_temp_dir_pid, prerelease_channel_matches, retry_transient_http_operation,
         split_download_ranges,
     };
     use crate::command::za_config;
+    use semver::Version;
     use std::{
         io::{self, Read, Write},
         net::{Shutdown, TcpListener, TcpStream},
@@ -1766,6 +1891,52 @@ mod tests {
         thread,
         time::Duration,
     };
+
+    #[test]
+    fn prerelease_channel_matches_first_identifier_case_insensitively() {
+        assert!(prerelease_channel_matches(
+            &Version::parse("0.129.0-alpha.6").expect("semver"),
+            "alpha"
+        ));
+        assert!(prerelease_channel_matches(
+            &Version::parse("0.129.0-ALPHA.6").expect("semver"),
+            "alpha"
+        ));
+        assert!(!prerelease_channel_matches(
+            &Version::parse("0.129.0-beta.1").expect("semver"),
+            "alpha"
+        ));
+        assert!(!prerelease_channel_matches(
+            &Version::parse("0.129.0").expect("semver"),
+            "alpha"
+        ));
+    }
+
+    #[test]
+    fn latest_prerelease_version_for_channel_prefers_highest_semver() {
+        let releases = vec![
+            github_release("rust-v0.129.0-alpha.6", true, false),
+            github_release("rust-v0.129.0-alpha.10", true, false),
+            github_release("rust-v0.130.0-beta.1", true, false),
+            github_release("rust-v0.130.0", false, false),
+            github_release("rust-v0.131.0-alpha.1", true, true),
+        ];
+
+        assert_eq!(
+            latest_prerelease_version_for_channel(&releases, "rust-v", "alpha")
+                .expect("latest alpha"),
+            "0.129.0-alpha.10"
+        );
+    }
+
+    fn github_release(tag_name: &str, prerelease: bool, draft: bool) -> GithubRelease {
+        GithubRelease {
+            tag_name: tag_name.to_string(),
+            prerelease,
+            draft,
+            assets: Vec::new(),
+        }
+    }
 
     #[test]
     fn parse_temp_dir_pid_accepts_expected_layout() {

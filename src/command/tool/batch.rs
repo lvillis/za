@@ -59,7 +59,15 @@ pub(super) fn install_tools(
         ToolAction::Install => ToolBatchKind::Install,
         ToolAction::Update => ToolBatchKind::Update,
     };
-    run_tool_batch(home, kind, specs, dry_run, verbose, None)
+    run_tool_batch(
+        home,
+        kind,
+        specs,
+        dry_run,
+        verbose,
+        None,
+        ToolUpdateChannel::Stable,
+    )
 }
 
 pub(super) fn update_tools(
@@ -67,6 +75,7 @@ pub(super) fn update_tools(
     all: bool,
     tools: &[String],
     version: Option<&str>,
+    alpha: bool,
     dry_run: bool,
     verbose: bool,
 ) -> Result<()> {
@@ -79,6 +88,7 @@ pub(super) fn update_tools(
     if version.is_some() && tools.len() != 1 {
         bail!("`za tool update --version` requires exactly one tool name");
     }
+    let channel = resolve_update_channel_request(all, tools, version, alpha)?;
 
     let requested_names = if all || tools.is_empty() {
         collect_managed_tool_names(home)?
@@ -98,7 +108,15 @@ pub(super) fn update_tools(
         .iter()
         .map(|name| ToolSpec::from_args(name, version))
         .collect::<Result<Vec<_>>>()?;
-    run_tool_batch(home, ToolBatchKind::Update, specs, dry_run, verbose, None)
+    run_tool_batch(
+        home,
+        ToolBatchKind::Update,
+        specs,
+        dry_run,
+        verbose,
+        None,
+        channel,
+    )
 }
 
 pub(super) fn run_tool_batch(
@@ -108,6 +126,7 @@ pub(super) fn run_tool_batch(
     dry_run: bool,
     verbose: bool,
     source_label: Option<&str>,
+    update_channel: ToolUpdateChannel,
 ) -> Result<()> {
     let total = specs.len();
     let batch_mode = total > 1 || matches!(kind, ToolBatchKind::Update | ToolBatchKind::Sync);
@@ -122,7 +141,7 @@ pub(super) fn run_tool_batch(
         );
     }
 
-    let latest_lookup = resolve_batch_latest_lookup(&specs)?;
+    let latest_lookup = resolve_batch_latest_lookup(&specs, update_channel)?;
 
     for (idx, requested) in specs.iter().enumerate() {
         ensure_not_interrupted()?;
@@ -197,7 +216,36 @@ pub(super) fn run_tool_batch(
     )
 }
 
-fn resolve_batch_latest_lookup(specs: &[ToolSpec]) -> Result<Option<HashMap<String, LatestCheck>>> {
+pub(super) fn resolve_update_channel_request(
+    all: bool,
+    tools: &[String],
+    version: Option<&str>,
+    alpha: bool,
+) -> Result<ToolUpdateChannel> {
+    if !alpha {
+        return Ok(ToolUpdateChannel::Stable);
+    }
+    if all {
+        bail!("`za tool update --alpha` does not accept `--all`");
+    }
+    if version.is_some() {
+        bail!("`za tool update --alpha` does not accept `--version`");
+    }
+    if tools.len() != 1 {
+        bail!("`za tool update --alpha` requires exactly one tool name: codex");
+    }
+
+    let canonical = canonical_tool_name(&ToolSpec::from_args(&tools[0], None)?.name);
+    if canonical != "codex" {
+        bail!("`za tool update --alpha` is only supported for `codex`");
+    }
+    Ok(ToolUpdateChannel::CodexAlpha)
+}
+
+fn resolve_batch_latest_lookup(
+    specs: &[ToolSpec],
+    update_channel: ToolUpdateChannel,
+) -> Result<Option<HashMap<String, LatestCheck>>> {
     let unresolved_names = specs
         .iter()
         .filter(|spec| spec.version.is_none())
@@ -205,6 +253,14 @@ fn resolve_batch_latest_lookup(specs: &[ToolSpec]) -> Result<Option<HashMap<Stri
         .collect::<Vec<_>>();
     if unresolved_names.is_empty() {
         return Ok(None);
+    }
+    if update_channel == ToolUpdateChannel::CodexAlpha {
+        let version = source::fetch_latest_codex_alpha_version(za_config::ProxyScope::Tool)?;
+        let latest_by_name = unresolved_names
+            .into_iter()
+            .map(|name| (name, LatestCheck::Latest(version.clone())))
+            .collect::<HashMap<_, _>>();
+        return Ok(Some(latest_by_name));
     }
     let lookup = resolve_latest_checks_for_names(&unresolved_names)?;
     Ok(Some(lookup.latest_by_name))
@@ -477,6 +533,7 @@ pub(super) fn sync_manifest(
         dry_run,
         verbose,
         Some(&source_label),
+        ToolUpdateChannel::Stable,
     )
 }
 

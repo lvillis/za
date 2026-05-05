@@ -5,12 +5,13 @@ use super::{
     BLESH_BASH_INIT_TOP_END_MARKER, BLESH_BASH_INIT_TOP_START_MARKER, InstallOutcome,
     InstallResult, LatestCheck, ManagedBlockPosition, ManagedFileChange,
     STARSHIP_BASH_INIT_END_MARKER, STARSHIP_BASH_INIT_START_MARKER, ToolBatchKind,
-    ToolBatchSummary, ToolHome, ToolRef, ToolScope, ToolSpec, canonical_tool_name,
-    cleanup_legacy_current_dir_artifacts, collect_managed_tool_names, command_candidates,
-    extract_version_from_text, find_tool_policy, latest_check_progress_message, list_update_status,
-    load_sync_specs_from_manifest, normalize_version, prune_non_active_versions,
-    render_batch_summary, render_compact_batch_result, source, starship_bash_init_block,
-    supported_tool_names_csv, upsert_managed_block,
+    ToolBatchSummary, ToolHome, ToolRef, ToolScope, ToolSpec, ToolUpdateChannel,
+    canonical_tool_name, cleanup_legacy_current_dir_artifacts, collect_managed_tool_names,
+    command_candidates, extract_version_from_text, find_tool_policy, latest_check_progress_message,
+    list_update_status, load_sync_specs_from_manifest, normalize_version,
+    prune_non_active_versions, render_batch_summary, render_compact_batch_result,
+    resolve_update_channel_request, source, starship_bash_init_block, supported_tool_names_csv,
+    upsert_managed_block,
 };
 use std::{fs, time::Duration};
 
@@ -108,6 +109,33 @@ fn parse_tool_spec_supports_optional_version() {
 
     assert!(ToolSpec::parse("codex:").is_err());
     assert!(ToolSpec::parse("codex@").is_err());
+}
+
+#[test]
+fn update_alpha_channel_accepts_codex_alias_only() {
+    assert_eq!(
+        resolve_update_channel_request(false, &["codex".to_string()], None, true)
+            .expect("codex alpha"),
+        ToolUpdateChannel::CodexAlpha
+    );
+    assert_eq!(
+        resolve_update_channel_request(false, &["codex-cli".to_string()], None, true)
+            .expect("codex alias alpha"),
+        ToolUpdateChannel::CodexAlpha
+    );
+}
+
+#[test]
+fn update_alpha_channel_rejects_ambiguous_or_non_codex_requests() {
+    assert!(resolve_update_channel_request(true, &[], None, true).is_err());
+    assert!(
+        resolve_update_channel_request(false, &["codex".to_string()], Some("0.1.0"), true).is_err()
+    );
+    assert!(
+        resolve_update_channel_request(false, &["codex".to_string(), "rg".to_string()], None, true)
+            .is_err()
+    );
+    assert!(resolve_update_channel_request(false, &["rg".to_string()], None, true).is_err());
 }
 
 #[test]
