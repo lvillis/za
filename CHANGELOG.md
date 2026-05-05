@@ -1,9 +1,18 @@
+## [0.1.61] - 2026-05-05
+
+### 🐛 Bug Fixes
+
+- *(cli)* Improve user-facing status messages
 ## [0.1.60] - 2026-04-30
 
 ### 🚀 Features
 
 - *(pin)* Add package and action pin resolver
 - *(tool)* Add sccache release policy
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.60
 ## [0.1.59] - 2026-04-24
 
 ### 🚀 Features
