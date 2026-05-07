@@ -665,11 +665,9 @@ fn run_tui_loop(
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-            KeyCode::Down | KeyCode::Char('j') => {
-                if state.selected + 1 < display_order.len() {
-                    state.selected += 1;
-                    state.message = None;
-                }
+            KeyCode::Down | KeyCode::Char('j') if state.selected + 1 < display_order.len() => {
+                state.selected += 1;
+                state.message = None;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let before = state.selected;
@@ -678,32 +676,24 @@ fn run_tui_loop(
                     state.message = None;
                 }
             }
-            KeyCode::Home => {
-                if !display_order.is_empty() {
-                    state.selected = 0;
-                    state.message = None;
-                }
+            KeyCode::Home if !display_order.is_empty() => {
+                state.selected = 0;
+                state.message = None;
             }
-            KeyCode::End => {
-                if !display_order.is_empty() {
-                    state.selected = display_order.len().saturating_sub(1);
-                    state.message = None;
-                }
+            KeyCode::End if !display_order.is_empty() => {
+                state.selected = display_order.len().saturating_sub(1);
+                state.message = None;
             }
-            KeyCode::PageDown => {
-                if !display_order.is_empty() {
-                    let step = state.viewport_rows.saturating_sub(1).max(1);
-                    let max = display_order.len().saturating_sub(1);
-                    state.selected = state.selected.saturating_add(step).min(max);
-                    state.message = None;
-                }
+            KeyCode::PageDown if !display_order.is_empty() => {
+                let step = state.viewport_rows.saturating_sub(1).max(1);
+                let max = display_order.len().saturating_sub(1);
+                state.selected = state.selected.saturating_add(step).min(max);
+                state.message = None;
             }
-            KeyCode::PageUp => {
-                if !display_order.is_empty() {
-                    let step = state.viewport_rows.saturating_sub(1).max(1);
-                    state.selected = state.selected.saturating_sub(step);
-                    state.message = None;
-                }
+            KeyCode::PageUp if !display_order.is_empty() => {
+                let step = state.viewport_rows.saturating_sub(1).max(1);
+                state.selected = state.selected.saturating_sub(step);
+                state.message = None;
             }
             KeyCode::Char('?') | KeyCode::F(1) => {
                 state.show_help = !state.show_help;

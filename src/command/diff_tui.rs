@@ -217,10 +217,8 @@ fn run_tui_loop(
         }
 
         match event::read().context("read diff tui event")? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                if app.handle_key(key.code)? {
-                    return Ok(());
-                }
+            Event::Key(key) if key.kind == KeyEventKind::Press && app.handle_key(key.code)? => {
+                return Ok(());
             }
             Event::Resize(_, _) => {}
             _ => {}
@@ -352,10 +350,8 @@ impl DiffTuiApp {
             KeyCode::Down | KeyCode::Char('j') => self.scroll_down(),
             KeyCode::Left | KeyCode::Char('h') => self.scroll_patch_left(),
             KeyCode::Right | KeyCode::Char('l') => self.scroll_patch_right(),
-            KeyCode::Char('0') => {
-                if self.focus == DiffTuiFocus::Patch {
-                    self.patch_scroll_x = 0;
-                }
+            KeyCode::Char('0') if self.focus == DiffTuiFocus::Patch => {
+                self.patch_scroll_x = 0;
             }
             _ => {}
         }

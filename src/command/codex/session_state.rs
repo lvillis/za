@@ -812,10 +812,8 @@ pub(super) fn apply_session_log_line(
                         state.tool_errors = state.tool_errors.saturating_add(1);
                     }
                 }
-                "custom_tool_call_output" => {
-                    if custom_tool_output_failed(&payload) {
-                        state.tool_errors = state.tool_errors.saturating_add(1);
-                    }
+                "custom_tool_call_output" if custom_tool_output_failed(&payload) => {
+                    state.tool_errors = state.tool_errors.saturating_add(1);
                 }
                 _ => {}
             }

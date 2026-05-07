@@ -387,13 +387,15 @@ fn run_agent_install(agent: &str, force: bool) -> Result<i32> {
         )
     })?;
     let expected_shim = expected_ide_agent_shim_content(&agent, &za_executable, &run_target);
-    if let Some(existing) = read_optional_file_lossy(&shim_path)? {
-        if existing != expected_shim && !ide_agent_shim_is_managed(&existing) && !force {
-            bail!(
-                "refusing to overwrite non-za-managed shim `{}`; pass `--force` to replace it",
-                shim_path.display()
-            );
-        }
+    if let Some(existing) = read_optional_file_lossy(&shim_path)?
+        && existing != expected_shim
+        && !ide_agent_shim_is_managed(&existing)
+        && !force
+    {
+        bail!(
+            "refusing to overwrite non-za-managed shim `{}`; pass `--force` to replace it",
+            shim_path.display()
+        );
     }
     fs::write(&shim_path, expected_shim)
         .with_context(|| format!("write JetBrains agent shim `{}`", shim_path.display()))?;
@@ -844,8 +846,7 @@ fn probe_jetbrains_agent_command(agent: &str) -> IdeAgentProbe {
             let resolved = stdout
                 .lines()
                 .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .next_back()
+                .rfind(|line| !line.is_empty())
                 .map(str::to_string);
             IdeAgentProbe {
                 command,
