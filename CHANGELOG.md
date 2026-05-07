@@ -1,3 +1,8 @@
+## [0.1.65] - 2026-05-07
+
+### ⚙️ Miscellaneous Tasks
+
+- *(ci)* Update
 ## [0.1.64] - 2026-05-07
 
 ### 🚀 Features
@@ -7,6 +12,10 @@
 ### 🐛 Bug Fixes
 
 - Ci
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.64
 ## [0.1.63] - 2026-05-07
 
 ### 🚀 Features
