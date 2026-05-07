@@ -3,7 +3,7 @@ name = "za"
 description = "AI-native CLI for context, tools, and dependency health."
 version = "0.1.62"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95.0"
 license = "MIT"
 authors = ["lvillis <lvillis@outlook.com>"]
 repository = "https://github.com/lvillis/za"
@@ -36,7 +36,7 @@ rustix = { version = "1.1.4", default-features = false, features = ["std", "proc
 ignore = { version = "0.4.25", default-features = false }
 regex = { version = "1.12.3", default-features = false, features = ["std", "unicode", "perf"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["sqlite", "runtime-tokio"] }
-tokio = { version = "1.52.1", default-features = false, features = ["rt"] }
+tokio = { version = "1.52.2", default-features = false, features = ["rt"] }
 
 # Serialization and integrity checks.
 serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
@@ -45,7 +45,7 @@ toml = { version = "1.1.2", default-features = false, features = ["parse", "serd
 graviola = { version = "0.3.4", default-features = false }
 
 # HTTP transport and TLS crypto provider.
-reqx = { version = "0.1.34", default-features = false, features = ["blocking-tls-rustls-ring"] }
+reqx = { version = "0.1.35", default-features = false, features = ["blocking-tls-rustls-ring"] }
 rustls = { version = "0.23.36", default-features = false, features = ["ring"] }
 
 # Archive extraction for downloaded binaries.

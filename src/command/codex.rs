@@ -78,11 +78,20 @@ fn run_up_with_args(args: &[String], force_recreate: bool, launcher: &str) -> Re
     let active_listener = top_listener_state_for_launch(args)?;
     if tmux_has_session(&ctx.session_name)? {
         if force_recreate {
+            ensure_not_running_inside_target_tmux_session(&ctx.session_name, "restart")?;
             restart_managed_session(&ctx, launcher, args)?;
         } else if tmux_session_needs_top_listener_restart(
             &ctx.session_name,
             active_listener.as_ref(),
         )? {
+            if tmux_current_session_is(&ctx.session_name)? {
+                persist_session_record(&ctx, launcher, args)?;
+                return maybe_attach_or_report(
+                    &ctx.session_name,
+                    &ctx.workspace_root,
+                    &ctx.workspace_label,
+                );
+            }
             eprintln!(
                 "Restarting Codex session `{}` so `za codex top` can stream live telemetry.",
                 ctx.session_name
@@ -115,11 +124,20 @@ fn run_resume_with_args(args: &[String], force_recreate: bool, launcher: &str) -
     let active_listener = top_listener_state_for_launch(args)?;
     if tmux_has_session(&ctx.session_name)? {
         if force_recreate {
+            ensure_not_running_inside_target_tmux_session(&ctx.session_name, "restart")?;
             restart_managed_resume_session(&ctx, launcher, args)?;
         } else if tmux_session_needs_top_listener_restart(
             &ctx.session_name,
             active_listener.as_ref(),
         )? {
+            if tmux_current_session_is(&ctx.session_name)? {
+                persist_session_record(&ctx, launcher, args)?;
+                return maybe_attach_or_report(
+                    &ctx.session_name,
+                    &ctx.workspace_root,
+                    &ctx.workspace_label,
+                );
+            }
             eprintln!(
                 "Restarting Codex session `{}` so `za codex top` can stream live telemetry.",
                 ctx.session_name
@@ -139,6 +157,15 @@ fn run_resume_with_args(args: &[String], force_recreate: bool, launcher: &str) -
         start_managed_session(&ctx, CodexLaunchMode::ResumeLast, launcher, args)?;
     }
     maybe_attach_or_report(&ctx.session_name, &ctx.workspace_root, &ctx.workspace_label)
+}
+
+fn ensure_not_running_inside_target_tmux_session(session_name: &str, action: &str) -> Result<()> {
+    if tmux_current_session_is(session_name)? {
+        bail!(
+            "Cannot {action} Codex session `{session_name}` from inside itself. Run the command from another shell, or stop the session first."
+        );
+    }
+    Ok(())
 }
 
 fn restart_managed_session(ctx: &WorkspaceContext, launcher: &str, args: &[String]) -> Result<()> {
@@ -178,7 +205,7 @@ fn start_managed_session(
         tmux_apply_codex_terminal_fixes(&ctx.session_name)
     })?;
     apply_to_live_codex_session(&ctx.session_name, mode, || {
-        tmux_apply_codex_session_style(&ctx.session_name, &ctx.workspace_label)
+        tmux_apply_codex_session_style(&ctx.session_name, &ctx.workspace_label, &ctx.workspace_root)
     })?;
     persist_session_record(ctx, launcher, args)?;
     Ok(())
@@ -224,7 +251,7 @@ fn run_exec(args: &[String]) -> Result<i32> {
     )?;
 
     if interactive {
-        attach_session(&ctx.session_name, &ctx.workspace_label)
+        attach_session(&ctx.session_name, &ctx.workspace_label, &ctx.workspace_root)
     } else {
         println!(
             "Started command window `{}` in Codex session `{}` for {}.",
@@ -685,7 +712,8 @@ mod tests {
         parse_tmux_codex_window_ids, parse_tmux_sessions, render_stop_all_empty_message,
         render_stop_message, resolve_state_home, sanitize_session_label, session_matches_scope,
         session_status_label, shell_escape, stop_target_session_names,
-        summarize_codex_session_lines, tmux_codex_status_left, tmux_codex_status_left_length,
+        summarize_codex_session_lines, tmux_codex_status_command, tmux_codex_status_format,
+        tmux_codex_status_helper_script, tmux_codex_status_left, tmux_codex_status_left_length,
         tmux_panes_include_listener_endpoint, tmux_terminal_overrides_disable_alt_screen,
         workspace_hash,
     };
@@ -861,10 +889,65 @@ mod tests {
 
     #[test]
     fn tmux_codex_status_left_hides_internal_session_name() {
-        let left = tmux_codex_status_left("ttd-pro-cli");
-        assert_eq!(left, "[ttd-pro-cli] ");
+        let left = tmux_codex_status_left("ttd-pro-cli", Path::new("/opt/app/ttd-pro-cli"))
+            .expect("must render status-left");
+        assert!(left.starts_with("[ttd-pro-cli] #("));
+        assert!(left.ends_with(" "));
+        assert!(left.contains("codex-status"));
+        assert!(left.contains("/opt/app/ttd-pro-cli"));
+        assert!(left.contains(".sh"));
+        assert!(left.contains(".loc"));
         assert!(!left.contains("za-codex"));
-        assert_eq!(tmux_codex_status_left_length("ttd-pro-cli"), left.len());
+        assert!(
+            tmux_codex_status_left_length("ttd-pro-cli").expect("must compute status-left length")
+                > "[ttd-pro-cli] ".len()
+        );
+    }
+
+    #[test]
+    fn tmux_codex_status_left_escapes_tmux_format_marker() {
+        let left =
+            tmux_codex_status_left("repo#1", Path::new("/opt/app/repo#1")).expect("must render");
+        assert!(left.starts_with("[repo##1] #("));
+    }
+
+    #[test]
+    fn tmux_codex_status_format_hides_single_window_list() {
+        let format = tmux_codex_status_format();
+        assert!(format.contains("#{?#{>:#{session_windows},1},"));
+        assert!(format.contains("#{W:"));
+        assert!(format.contains("status-right"));
+    }
+
+    #[test]
+    fn tmux_codex_status_command_uses_escaped_workspace_path() {
+        let command =
+            tmux_codex_status_command(Path::new("/tmp/repo with ) and #")).expect("must render");
+        assert!(command.contains("/tmp/repo\\ with\\ \\)\\ and\\ \\#"));
+        assert!(command.contains("codex-status"));
+        assert!(command.contains(".sh"));
+        assert!(command.contains(".loc"));
+        assert!(command.contains(" 60"));
+        assert!(!command.contains(" za "));
+        assert!(!command.contains("cargo run"));
+        assert!(!command.contains("printf '%b'"));
+        assert!(!command.contains("$root"));
+        assert!(!command.contains("/tmp/repo with"));
+    }
+
+    #[test]
+    fn tmux_codex_status_helper_tracks_diff_and_loc_without_za_binary() {
+        let script = tmux_codex_status_helper_script();
+        assert!(script.contains("diff --numstat HEAD -- ."));
+        assert!(script.contains("ls-files -co --exclude-standard"));
+        assert!(script.contains("*.rs"));
+        assert!(script.contains("*.ts"));
+        assert!(script.contains("*.tsx"));
+        assert!(script.contains("| code "));
+        assert!(script.contains("| rs "));
+        assert!(script.contains("| fe "));
+        assert!(!script.contains(" za "));
+        assert!(!script.contains("cargo run"));
     }
 
     #[test]

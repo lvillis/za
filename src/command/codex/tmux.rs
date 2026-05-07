@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TmuxProbe {
     Available,
@@ -11,6 +14,100 @@ pub(super) struct TmuxSessionInfo {
     pub(super) created_unix: Option<u64>,
     pub(super) activity_unix: Option<u64>,
     pub(super) attached_clients: usize,
+}
+
+const TMUX_CODEX_STATUS_INTERVAL_SECS: &str = "5";
+const TMUX_CODEX_LOC_CACHE_TTL_SECS: &str = "60";
+const TMUX_CODEX_STATUS_DIR: &str = "codex-status";
+const TMUX_CODEX_STATUS_WIDTH: usize = 72;
+const TMUX_CODEX_PRIMARY_WINDOW_NAME: &str = "work";
+const TMUX_CODEX_STATUS_HELPER_SCRIPT: &str = r#"#!/bin/sh
+root=$1
+cache=$2
+ttl=${3:-60}
+
+count_diff() {
+  git -C "$root" diff --numstat HEAD -- . 2>/dev/null |
+    awk 'BEGIN { a = 0; d = 0 } $1 ~ /^[0-9]+$/ { a += $1 } $2 ~ /^[0-9]+$/ { d += $2 } END { printf "+%d -%d", a, d }'
+}
+
+count_lines() {
+  git -C "$root" ls-files -co --exclude-standard -z -- "$@" 2>/dev/null |
+    xargs -0 -r wc -l 2>/dev/null |
+    awk '$1 ~ /^[0-9]+$/ && $2 != "total" { s += $1 } END { print s + 0 }'
+}
+
+compact_count() {
+  awk -v n="${1:-0}" 'BEGIN {
+    n += 0
+    if (n >= 1000000) {
+      if (n % 1000000 == 0) printf "%dm", n / 1000000
+      else printf "%.1fm", n / 1000000
+    } else if (n >= 1000) {
+      if (n % 1000 == 0) printf "%dk", n / 1000
+      else printf "%.1fk", n / 1000
+    } else {
+      printf "%d", n
+    }
+  }'
+}
+
+read_cached_loc() {
+  [ -n "$cache" ] && [ -r "$cache" ] || return 1
+  IFS=' ' read -r cached_at all rs fe < "$cache" || return 1
+  case "$cached_at" in ''|*[!0-9]*) return 1 ;; esac
+  case "$all" in ''|*[!0-9]*) return 1 ;; esac
+  case "$rs" in ''|*[!0-9]*) return 1 ;; esac
+  case "$fe" in ''|*[!0-9]*) return 1 ;; esac
+  age=$((now - cached_at))
+  [ "$age" -ge 0 ] 2>/dev/null || return 1
+  [ "$age" -lt "$ttl" ] 2>/dev/null || return 1
+  return 0
+}
+
+write_loc_cache() {
+  [ -n "$cache" ] || return 0
+  dir=${cache%/*}
+  [ "$dir" != "$cache" ] || return 0
+  mkdir -p "$dir" 2>/dev/null || return 0
+  tmp="$cache.$$"
+  printf '%s %s %s %s\n' "$now" "$all" "$rs" "$fe" > "$tmp" 2>/dev/null &&
+    mv -f "$tmp" "$cache" 2>/dev/null
+}
+
+compute_loc() {
+  all=$(count_lines \
+    '*.rs' '*.c' '*.h' '*.hpp' '*.cpp' '*.cc' '*.cxx' \
+    '*.go' '*.py' '*.java' '*.kt' '*.kts' '*.swift' '*.scala' \
+    '*.rb' '*.php' '*.ex' '*.exs' '*.erl' '*.hrl' \
+    '*.js' '*.jsx' '*.ts' '*.tsx' '*.mjs' '*.cjs' '*.mts' '*.cts' \
+    '*.vue' '*.svelte' '*.astro' '*.css' '*.scss' '*.sass' '*.less' '*.html' \
+    '*.sh' '*.bash' '*.zsh' '*.fish' '*.sql' '*.proto')
+  rs=$(count_lines '*.rs')
+  fe=$(count_lines \
+    '*.js' '*.jsx' '*.ts' '*.tsx' '*.mjs' '*.cjs' '*.mts' '*.cts' \
+    '*.vue' '*.svelte' '*.astro' '*.css' '*.scss' '*.sass' '*.less' '*.html')
+  write_loc_cache
+}
+
+now=$(date +%s 2>/dev/null || printf '0')
+case "$ttl" in ''|*[!0-9]*) ttl=60 ;; esac
+
+branch=$(git -C "$root" branch --show-current 2>/dev/null || true)
+[ -n "$branch" ] || branch=$(git -C "$root" rev-parse --short HEAD 2>/dev/null || true)
+diff=$(count_diff)
+
+if ! read_cached_loc; then
+  compute_loc
+fi
+
+printf '%s%s | code %s | rs %s | fe %s\n' "${branch:+$branch }" "$diff" "$(compact_count "$all")" "$(compact_count "$rs")" "$(compact_count "$fe")"
+"#;
+
+#[derive(Clone, Debug)]
+struct TmuxCodexStatusHelper {
+    script_path: PathBuf,
+    cache_path: PathBuf,
 }
 
 pub(super) fn ensure_tmux_available() -> Result<()> {
@@ -96,20 +193,28 @@ pub(super) fn tmux_apply_codex_terminal_fixes(session_name: &str) -> Result<()> 
 pub(super) fn tmux_apply_codex_session_style(
     session_name: &str,
     workspace_label: &str,
+    workspace_root: &Path,
 ) -> Result<()> {
+    let status_helper = ensure_tmux_codex_status_helper(workspace_root)?;
     tmux_set_session_option(
         session_name,
         "status-left",
-        &tmux_codex_status_left(workspace_label),
+        &tmux_codex_status_left_for_helper(workspace_label, workspace_root, &status_helper),
     )?;
     tmux_set_session_option(
         session_name,
         "status-left-length",
-        &tmux_codex_status_left_length(workspace_label).to_string(),
+        &tmux_codex_status_left_length(workspace_label)?.to_string(),
     )?;
+    tmux_set_session_option(
+        session_name,
+        "status-interval",
+        TMUX_CODEX_STATUS_INTERVAL_SECS,
+    )?;
+    tmux_set_session_option(session_name, "status-format[0]", tmux_codex_status_format())?;
 
     if let Some(window_id) = tmux_primary_codex_window_id(session_name)? {
-        tmux_rename_window(&window_id, "main")?;
+        tmux_rename_window(&window_id, TMUX_CODEX_PRIMARY_WINDOW_NAME)?;
         tmux_set_window_option(&window_id, "automatic-rename", "off")?;
     }
 
@@ -371,9 +476,11 @@ pub(super) fn maybe_attach_or_report(
     workspace_label: &str,
 ) -> Result<i32> {
     if is_interactive_terminal() {
-        return attach_session(session_name, workspace_label);
+        return attach_session(session_name, workspace_label, workspace_root);
     }
 
+    tmux_apply_codex_terminal_fixes(session_name)?;
+    tmux_apply_codex_session_style(session_name, workspace_label, workspace_root)?;
     println!(
         "Codex session `{}` is ready for {}.",
         session_name,
@@ -382,9 +489,17 @@ pub(super) fn maybe_attach_or_report(
     Ok(0)
 }
 
-pub(super) fn attach_session(session_name: &str, workspace_label: &str) -> Result<i32> {
+pub(super) fn attach_session(
+    session_name: &str,
+    workspace_label: &str,
+    workspace_root: &Path,
+) -> Result<i32> {
     tmux_apply_codex_terminal_fixes(session_name)?;
-    tmux_apply_codex_session_style(session_name, workspace_label)?;
+    tmux_apply_codex_session_style(session_name, workspace_label, workspace_root)?;
+    if tmux_current_session_is(session_name)? {
+        return Ok(0);
+    }
+
     let mut cmd = Command::new("tmux");
     if env::var_os("TMUX").is_some() {
         cmd.args(["switch-client", "-t", session_name]);
@@ -398,12 +513,219 @@ pub(super) fn attach_session(session_name: &str, workspace_label: &str) -> Resul
     Ok(status.code().unwrap_or(130))
 }
 
-pub(super) fn tmux_codex_status_left(workspace_label: &str) -> String {
-    format!("[{workspace_label}] ")
+pub(super) fn tmux_current_session_is(session_name: &str) -> Result<bool> {
+    Ok(tmux_current_session_name()?.as_deref() == Some(session_name))
 }
 
-pub(super) fn tmux_codex_status_left_length(workspace_label: &str) -> usize {
-    tmux_codex_status_left(workspace_label).len()
+fn tmux_current_session_name() -> Result<Option<String>> {
+    if env::var_os("TMUX").is_none() {
+        return Ok(None);
+    }
+
+    let output = Command::new("tmux")
+        .args(["display-message", "-p", "#{session_name}"])
+        .output()
+        .context("inspect current tmux session")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_tmux_no_server(&stderr) {
+            return Ok(None);
+        }
+        bail!(
+            "Could not inspect current tmux session: {}",
+            tmux_failure_detail(&stderr)
+        );
+    }
+
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!name.is_empty()).then_some(name))
+}
+
+#[cfg(test)]
+pub(super) fn tmux_codex_status_left(
+    workspace_label: &str,
+    workspace_root: &Path,
+) -> Result<String> {
+    let helper = tmux_codex_status_helper_paths(workspace_root)?;
+    Ok(tmux_codex_status_left_for_helper(
+        workspace_label,
+        workspace_root,
+        &helper,
+    ))
+}
+
+fn tmux_codex_status_left_for_helper(
+    workspace_label: &str,
+    workspace_root: &Path,
+    helper: &TmuxCodexStatusHelper,
+) -> String {
+    let label = tmux_escape_format_literal(workspace_label);
+    format!(
+        "[{label}] {} ",
+        tmux_codex_status_for_helper(workspace_root, helper)
+    )
+}
+
+pub(super) fn tmux_codex_status_left_length(workspace_label: &str) -> Result<usize> {
+    Ok(format!("[{workspace_label}] ").len() + TMUX_CODEX_STATUS_WIDTH)
+}
+
+pub(super) fn tmux_codex_status_format() -> &'static str {
+    concat!(
+        "#[align=left range=left #{E:status-left-style}]",
+        "#[push-default]#{T;=/#{status-left-length}:status-left}#[pop-default]",
+        "#{?#{>:#{session_windows},1},",
+        "#[list=on align=#{status-justify}]",
+        "#{W:#[push-default]#{T:window-status-format}#[pop-default]#{?window_end_flag,,#{window-status-separator}},",
+        "#[push-default]#{T:window-status-current-format}#[pop-default]#{?window_end_flag,,#{window-status-separator}}}",
+        "#[nolist],",
+        "}",
+        "#[align=right range=right #{E:status-right-style}]",
+        "#[push-default]#{T;=/#{status-right-length}:status-right}#[pop-default]",
+        "#[norange default]",
+    )
+}
+
+fn tmux_codex_status_for_helper(workspace_root: &Path, helper: &TmuxCodexStatusHelper) -> String {
+    format!(
+        "#({})",
+        tmux_codex_status_command_for_helper(workspace_root, helper)
+    )
+}
+
+#[cfg(test)]
+pub(super) fn tmux_codex_status_command(workspace_root: &Path) -> Result<String> {
+    let helper = tmux_codex_status_helper_paths(workspace_root)?;
+    Ok(tmux_codex_status_command_for_helper(
+        workspace_root,
+        &helper,
+    ))
+}
+
+fn tmux_codex_status_command_for_helper(
+    workspace_root: &Path,
+    helper: &TmuxCodexStatusHelper,
+) -> String {
+    let script = shell_escape_tmux_status_word(&helper.script_path);
+    let workspace = shell_escape_tmux_status_word(workspace_root);
+    let cache = shell_escape_tmux_status_word(&helper.cache_path);
+    format!("{script} {workspace} {cache} {TMUX_CODEX_LOC_CACHE_TTL_SECS}")
+}
+
+fn ensure_tmux_codex_status_helper(workspace_root: &Path) -> Result<TmuxCodexStatusHelper> {
+    let candidates = tmux_codex_status_helper_path_candidates(workspace_root);
+    let mut failures = Vec::new();
+    for helper in candidates {
+        match write_tmux_codex_status_helper(&helper) {
+            Ok(()) => return Ok(helper),
+            Err(err) => failures.push(format!("{}: {err:#}", helper.script_path.display())),
+        }
+    }
+    bail!(
+        "Could not write Codex tmux status helper: {}",
+        failures.join("; ")
+    )
+}
+
+fn write_tmux_codex_status_helper(helper: &TmuxCodexStatusHelper) -> Result<()> {
+    let parent = helper
+        .script_path
+        .parent()
+        .ok_or_else(|| anyhow!("invalid Codex tmux status helper path"))?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "create Codex tmux status helper directory {}",
+            parent.display()
+        )
+    })?;
+    fs::write(&helper.script_path, TMUX_CODEX_STATUS_HELPER_SCRIPT).with_context(|| {
+        format!(
+            "write Codex tmux status helper {}",
+            helper.script_path.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&helper.script_path)
+            .with_context(|| {
+                format!(
+                    "read Codex tmux status helper metadata {}",
+                    helper.script_path.display()
+                )
+            })?
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&helper.script_path, permissions).with_context(|| {
+            format!(
+                "set Codex tmux status helper permissions {}",
+                helper.script_path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn tmux_codex_status_helper_paths(workspace_root: &Path) -> Result<TmuxCodexStatusHelper> {
+    tmux_codex_status_helper_path_candidates(workspace_root)
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("could not resolve Codex tmux status helper path"))
+}
+
+fn tmux_codex_status_helper_path_candidates(workspace_root: &Path) -> Vec<TmuxCodexStatusHelper> {
+    let hash = workspace_hash(workspace_root);
+    let mut roots = Vec::new();
+    if let Some(path) = env_path("XDG_RUNTIME_DIR") {
+        roots.push(path.join(TMUX_CODEX_STATUS_DIR));
+    }
+    if let Ok(path) = state_home() {
+        roots.push(path.join(TMUX_CODEX_STATUS_DIR));
+    }
+    roots.push(env::temp_dir().join(format!("{TMUX_CODEX_STATUS_DIR}-{}", process::id())));
+
+    let mut helpers = Vec::new();
+    for root in roots {
+        let helper = TmuxCodexStatusHelper {
+            script_path: root.join(format!("{hash}.sh")),
+            cache_path: root.join(format!("{hash}.loc")),
+        };
+        if helpers
+            .iter()
+            .any(|existing: &TmuxCodexStatusHelper| existing.script_path == helper.script_path)
+        {
+            continue;
+        }
+        helpers.push(helper);
+    }
+    helpers
+}
+
+#[cfg(test)]
+pub(super) fn tmux_codex_status_helper_script() -> &'static str {
+    TMUX_CODEX_STATUS_HELPER_SCRIPT
+}
+
+fn shell_escape_tmux_status_word(path: &Path) -> String {
+    let value = path.as_os_str().to_string_lossy();
+    if value.is_empty() {
+        return "''".to_string();
+    }
+
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || "_@%+=:,./-".contains(ch) {
+            out.push(ch);
+        } else {
+            out.push('\\');
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn tmux_escape_format_literal(value: &str) -> String {
+    value.replace('#', "##")
 }
 
 pub(super) fn is_interactive_terminal() -> bool {
