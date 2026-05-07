@@ -1,8 +1,17 @@
+## [0.1.63] - 2026-05-07
+
+### 🚀 Features
+
+- *(codex)* Show workspace metrics in tmux statusline
 ## [0.1.62] - 2026-05-05
 
 ### 🚀 Features
 
 - *(tool)* Add Codex alpha update channel
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.62
 ## [0.1.61] - 2026-05-05
 
 ### 🐛 Bug Fixes
