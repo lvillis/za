@@ -939,13 +939,22 @@ mod tests {
     fn tmux_codex_status_helper_tracks_diff_and_loc_without_za_binary() {
         let script = tmux_codex_status_helper_script();
         assert!(script.contains("diff --numstat HEAD -- ."));
+        assert!(script.contains("tokei --output json"));
+        assert!(script.contains("jq -r"));
+        assert!(!script.contains("python3"));
         assert!(script.contains("ls-files -co --exclude-standard"));
+        assert!(script.contains("cargo_metadata_value"));
+        assert!(script.contains("workspace.package"));
+        assert!(script.contains("pkg v$pkg_version"));
+        assert!(script.contains("msrv $msrv"));
         assert!(script.contains("*.rs"));
         assert!(script.contains("*.ts"));
         assert!(script.contains("*.tsx"));
-        assert!(script.contains("| code "));
-        assert!(script.contains("| rs "));
-        assert!(script.contains("| fe "));
+        assert!(script.contains("[diff %s]  loc %s | rust %s | web %s"));
+        assert!(script.contains(" rust "));
+        assert!(!script.contains("| rs "));
+        assert!(script.contains(" web "));
+        assert!(!script.contains("| fe "));
         assert!(!script.contains(" za "));
         assert!(!script.contains("cargo run"));
     }

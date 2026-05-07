@@ -37,6 +37,113 @@ count_lines() {
     awk '$1 ~ /^[0-9]+$/ && $2 != "total" { s += $1 } END { print s + 0 }'
 }
 
+count_tokei_loc() {
+  command -v tokei >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  tokei --output json "$root" 2>/dev/null | jq -r '
+    . as $data
+    | def code($name): ($data[$name].code // 0);
+      [
+        code("Total"),
+        code("Rust"),
+        (
+          [
+            "Astro",
+            "CSS",
+            "HTML",
+            "JSX",
+            "JavaScript",
+            "LESS",
+            "Sass",
+            "Svelte",
+            "SVG",
+            "TSX",
+            "TypeScript",
+            "Vue"
+          ] | map(code(.)) | add
+        )
+      ] | @tsv
+  ' 2>/dev/null
+}
+
+cargo_metadata_value() {
+  key=$1
+  manifest=$root/Cargo.toml
+  [ -r "$manifest" ] || return 1
+  awk -v key="$key" '
+    function trim(s) {
+      sub(/^[[:space:]]+/, "", s)
+      sub(/[[:space:]]+$/, "", s)
+      return s
+    }
+    function unquote(s) {
+      s = trim(s)
+      if (s ~ /^"/) {
+        sub(/^"/, "", s)
+        sub(/".*$/, "", s)
+      }
+      return s
+    }
+    /^[[:space:]]*#/ {
+      next
+    }
+    /^[[:space:]]*\[/ {
+      section = $0
+      sub(/^[[:space:]]*\[/, "", section)
+      sub(/\][[:space:]]*$/, "", section)
+      next
+    }
+    {
+      pattern = "^[[:space:]]*" key "[[:space:]]*="
+      if ($0 !~ pattern) {
+        next
+      }
+      value = $0
+      sub(/^[^=]*=/, "", value)
+      value = unquote(value)
+      if (section == "package") {
+        print value
+        found = 1
+        exit
+      }
+      if (section == "workspace.package" && fallback == "") {
+        fallback = value
+      }
+    }
+    END {
+      if (!found && fallback != "") {
+        print fallback
+      }
+    }
+  ' "$manifest"
+}
+
+normalize_msrv() {
+  version=$1
+  case "$version" in
+    *.*.0) version=${version%.0} ;;
+  esac
+  printf '%s' "$version"
+}
+
+build_rust_metadata() {
+  pkg_version=$(cargo_metadata_value version 2>/dev/null || true)
+  msrv=$(cargo_metadata_value rust-version 2>/dev/null || true)
+  out=
+  if [ -n "$pkg_version" ]; then
+    out="pkg v$pkg_version"
+  fi
+  if [ -n "$msrv" ]; then
+    msrv=$(normalize_msrv "$msrv")
+    if [ -n "$out" ]; then
+      out="$out | msrv $msrv"
+    else
+      out="msrv $msrv"
+    fi
+  fi
+  [ -n "$out" ] && printf '%s  ' "$out"
+}
+
 compact_count() {
   awk -v n="${1:-0}" 'BEGIN {
     n += 0
@@ -54,11 +161,11 @@ compact_count() {
 
 read_cached_loc() {
   [ -n "$cache" ] && [ -r "$cache" ] || return 1
-  IFS=' ' read -r cached_at all rs fe < "$cache" || return 1
+  IFS=' ' read -r cached_at all rust web < "$cache" || return 1
   case "$cached_at" in ''|*[!0-9]*) return 1 ;; esac
   case "$all" in ''|*[!0-9]*) return 1 ;; esac
-  case "$rs" in ''|*[!0-9]*) return 1 ;; esac
-  case "$fe" in ''|*[!0-9]*) return 1 ;; esac
+  case "$rust" in ''|*[!0-9]*) return 1 ;; esac
+  case "$web" in ''|*[!0-9]*) return 1 ;; esac
   age=$((now - cached_at))
   [ "$age" -ge 0 ] 2>/dev/null || return 1
   [ "$age" -lt "$ttl" ] 2>/dev/null || return 1
@@ -71,11 +178,11 @@ write_loc_cache() {
   [ "$dir" != "$cache" ] || return 0
   mkdir -p "$dir" 2>/dev/null || return 0
   tmp="$cache.$$"
-  printf '%s %s %s %s\n' "$now" "$all" "$rs" "$fe" > "$tmp" 2>/dev/null &&
+  printf '%s %s %s %s\n' "$now" "$all" "$rust" "$web" > "$tmp" 2>/dev/null &&
     mv -f "$tmp" "$cache" 2>/dev/null
 }
 
-compute_loc() {
+compute_fallback_loc() {
   all=$(count_lines \
     '*.rs' '*.c' '*.h' '*.hpp' '*.cpp' '*.cc' '*.cxx' \
     '*.go' '*.py' '*.java' '*.kt' '*.kts' '*.swift' '*.scala' \
@@ -83,25 +190,36 @@ compute_loc() {
     '*.js' '*.jsx' '*.ts' '*.tsx' '*.mjs' '*.cjs' '*.mts' '*.cts' \
     '*.vue' '*.svelte' '*.astro' '*.css' '*.scss' '*.sass' '*.less' '*.html' \
     '*.sh' '*.bash' '*.zsh' '*.fish' '*.sql' '*.proto')
-  rs=$(count_lines '*.rs')
-  fe=$(count_lines \
+  rust=$(count_lines '*.rs')
+  web=$(count_lines \
     '*.js' '*.jsx' '*.ts' '*.tsx' '*.mjs' '*.cjs' '*.mts' '*.cts' \
-    '*.vue' '*.svelte' '*.astro' '*.css' '*.scss' '*.sass' '*.less' '*.html')
+    '*.vue' '*.svelte' '*.astro' '*.css' '*.scss' '*.sass' '*.less' '*.html' \
+    '*.svg')
+}
+
+compute_loc() {
+  if loc=$(count_tokei_loc); then
+    set -- $loc
+    all=${1:-0}
+    rust=${2:-0}
+    web=${3:-0}
+  else
+    compute_fallback_loc
+  fi
   write_loc_cache
 }
 
 now=$(date +%s 2>/dev/null || printf '0')
 case "$ttl" in ''|*[!0-9]*) ttl=60 ;; esac
 
-branch=$(git -C "$root" branch --show-current 2>/dev/null || true)
-[ -n "$branch" ] || branch=$(git -C "$root" rev-parse --short HEAD 2>/dev/null || true)
+metadata=$(build_rust_metadata)
 diff=$(count_diff)
 
 if ! read_cached_loc; then
   compute_loc
 fi
 
-printf '%s%s | code %s | rs %s | fe %s\n' "${branch:+$branch }" "$diff" "$(compact_count "$all")" "$(compact_count "$rs")" "$(compact_count "$fe")"
+printf '%s[diff %s]  loc %s | rust %s | web %s\n' "$metadata" "$diff" "$(compact_count "$all")" "$(compact_count "$rust")" "$(compact_count "$web")"
 "#;
 
 #[derive(Clone, Debug)]
