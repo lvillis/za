@@ -6,7 +6,6 @@ on:
     types: [completed]
 
 permissions:
-  actions: read
   contents: write
 
 env:
@@ -25,54 +24,68 @@ jobs:
       tag: ${{ steps.metadata.outputs.tag }}
       sha: ${{ steps.metadata.outputs.sha }}
     steps:
-      - name: Download CI trigger metadata
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUN_ID: ${{ github.event.workflow_run.id }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/ci-trigger"
-          gh run download "$RUN_ID" --name ci-trigger --dir "$RUNNER_TEMP/ci-trigger"
-
       - name: Resolve release tag
         id: metadata
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CI_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          CI_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         shell: bash
         run: |
           set -euo pipefail
-          file="$RUNNER_TEMP/ci-trigger/ci-trigger.env"
-          if [ ! -f "$file" ]; then
-            echo "CI trigger metadata artifact is missing"
-            exit 1
-          fi
 
-          value() {
-            awk -F= -v key="$1" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$file"
+          tag_points_to_head() {
+            ref_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$1" 2>/dev/null || true)
+            [ -n "$ref_json" ] || return 1
+
+            ref_type=$(jq -r '.object.type // ""' <<<"$ref_json")
+            ref_sha=$(jq -r '.object.sha // ""' <<<"$ref_json")
+            if [ "$ref_type" = "commit" ] && [ "$ref_sha" = "$CI_HEAD_SHA" ]; then
+              return 0
+            fi
+            if [ "$ref_type" = "tag" ]; then
+              peeled_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$ref_sha" --jq '.object.sha' 2>/dev/null || true)
+              [ "$peeled_sha" = "$CI_HEAD_SHA" ] && return 0
+            fi
+            return 1
           }
 
-          ref_type="$(value ref_type)"
-          ref_name="$(value ref_name)"
-          sha="$(value sha)"
+          resolve_tag_for_head() {
+            if [ -n "$CI_HEAD_BRANCH" ] && tag_points_to_head "$CI_HEAD_BRANCH"; then
+              printf '%s\n' "$CI_HEAD_BRANCH"
+              return 0
+            fi
 
-          if [ "$sha" != "$CI_HEAD_SHA" ]; then
-            echo "CI metadata SHA $sha does not match workflow_run head SHA $CI_HEAD_SHA"
-            exit 1
-          fi
+            while IFS=$'\t' read -r ref ref_type ref_sha; do
+              tag=${ref#refs/tags/}
+              if [ "$ref_type" = "commit" ] && [ "$ref_sha" = "$CI_HEAD_SHA" ]; then
+                printf '%s\n' "$tag"
+                return 0
+              fi
+              if [ "$ref_type" = "tag" ]; then
+                peeled_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$ref_sha" --jq '.object.sha' 2>/dev/null || true)
+                if [ "$peeled_sha" = "$CI_HEAD_SHA" ]; then
+                  printf '%s\n' "$tag"
+                  return 0
+                fi
+              fi
+            done < <(
+              gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags" \
+                --jq '.[] | [.ref, .object.type, .object.sha] | @tsv'
+            )
 
-          if [ "$ref_type" != "tag" ]; then
+            return 1
+          }
+
+          tag=$(resolve_tag_for_head || true)
+          if [ -z "$tag" ]; then
             echo "is_tag=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if [ -z "$ref_name" ]; then
-            echo "CI metadata did not include a tag name"
-            exit 1
-          fi
 
           echo "is_tag=true" >> "$GITHUB_OUTPUT"
-          echo "tag=$ref_name" >> "$GITHUB_OUTPUT"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$CI_HEAD_SHA" >> "$GITHUB_OUTPUT"
 
   build:
     needs: preflight

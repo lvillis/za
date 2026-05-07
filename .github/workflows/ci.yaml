@@ -43,19 +43,3 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-features --locked
-
-      - name: Record trigger metadata
-        shell: bash
-        run: |
-          {
-            echo "ref_type=${GITHUB_REF_TYPE}"
-            echo "ref_name=${GITHUB_REF_NAME}"
-            echo "sha=${GITHUB_SHA}"
-          } > ci-trigger.env
-
-      - name: Upload trigger metadata
-        uses: actions/upload-artifact@v5
-        with:
-          name: ci-trigger
-          path: ci-trigger.env
-          retention-days: 1
