@@ -1,8 +1,21 @@
+## [0.1.64] - 2026-05-07
+
+### 🚀 Features
+
+- *(codex)* Show Rust metadata and code stats in tmux status
+
+### 🐛 Bug Fixes
+
+- Ci
 ## [0.1.63] - 2026-05-07
 
 ### 🚀 Features
 
 - *(codex)* Show workspace metrics in tmux statusline
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.63
 ## [0.1.62] - 2026-05-05
 
 ### 🚀 Features
