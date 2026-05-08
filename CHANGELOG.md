@@ -1,8 +1,14 @@
+## [0.1.66] - 2026-05-08
+
+### 🚀 Features
+
+- *(codex)* Trim tmux statusline labels
 ## [0.1.65] - 2026-05-07
 
 ### ⚙️ Miscellaneous Tasks
 
 - *(ci)* Update
+- Release za version 0.1.65
 ## [0.1.64] - 2026-05-07
 
 ### 🚀 Features
