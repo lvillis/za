@@ -40,6 +40,9 @@ const JUST_GITHUB_TAG_PREFIX: &str = "";
 const OHA_GITHUB_OWNER: &str = "hatoo";
 const OHA_GITHUB_REPO: &str = "oha";
 const OHA_GITHUB_TAG_PREFIX: &str = "v";
+const ACTIONLINT_GITHUB_OWNER: &str = "rhysd";
+const ACTIONLINT_GITHUB_REPO: &str = "actionlint";
+const ACTIONLINT_GITHUB_TAG_PREFIX: &str = "v";
 const SCCACHE_GITHUB_OWNER: &str = "mozilla";
 const SCCACHE_GITHUB_REPO: &str = "sccache";
 const SCCACHE_GITHUB_TAG_PREFIX: &str = "v";
@@ -127,7 +130,7 @@ impl ToolPolicy {
     }
 }
 
-const TOOL_POLICIES: [ToolPolicy; 21] = [
+const TOOL_POLICIES: [ToolPolicy; 22] = [
     ToolPolicy {
         canonical_name: "za",
         aliases: &[],
@@ -344,6 +347,23 @@ const TOOL_POLICIES: [ToolPolicy; 21] = [
             repo: OHA_GITHUB_REPO,
             tag_prefix: OHA_GITHUB_TAG_PREFIX,
             expected_asset_name: Some(oha_expected_asset_name),
+            verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
+        }),
+        cargo_fallback_package: None,
+    },
+    ToolPolicy {
+        canonical_name: "actionlint",
+        aliases: &[],
+        source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
+        github_release: Some(GithubReleasePolicy {
+            project_label: "actionlint",
+            owner: ACTIONLINT_GITHUB_OWNER,
+            repo: ACTIONLINT_GITHUB_REPO,
+            tag_prefix: ACTIONLINT_GITHUB_TAG_PREFIX,
+            expected_asset_name: Some(actionlint_expected_asset_name),
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
@@ -583,6 +603,13 @@ fn oha_expected_asset_name(_version: &str) -> Result<String> {
     Ok(format!("oha-{}", oha_target()?))
 }
 
+fn actionlint_expected_asset_name(version: &str) -> Result<String> {
+    Ok(format!(
+        "actionlint_{version}_{}.tar.gz",
+        actionlint_target()?
+    ))
+}
+
 fn sccache_expected_asset_name(version: &str) -> Result<String> {
     Ok(format!(
         "sccache-v{version}-{}.tar.gz",
@@ -797,6 +824,20 @@ fn oha_target() -> Result<&'static str> {
         ("macos", "aarch64") => Ok("macos-arm64"),
         _ => bail!(
             "unsupported platform for oha release asset: {}-{}",
+            env::consts::ARCH,
+            env::consts::OS
+        ),
+    }
+}
+
+fn actionlint_target() -> Result<&'static str> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("linux_amd64"),
+        ("linux", "aarch64") => Ok("linux_arm64"),
+        ("macos", "x86_64") => Ok("darwin_amd64"),
+        ("macos", "aarch64") => Ok("darwin_arm64"),
+        _ => bail!(
+            "unsupported platform for actionlint release asset: {}-{}",
             env::consts::ARCH,
             env::consts::OS
         ),

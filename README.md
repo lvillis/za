@@ -90,6 +90,7 @@ za tool install tcping
 za tool install dust
 za tool install just
 za tool install oha
+za tool install actionlint
 za tool install starship
 za tool install ble.sh
 za tool install git-cliff
@@ -316,6 +317,7 @@ Current built-in tool policies:
 | `hyperfine` | - | GitHub Release (SHA-256 verify) |
 | `just` | - | GitHub Release (SHA-256 verify) |
 | `oha` | - | GitHub Release (SHA-256 verify) |
+| `actionlint` | - | GitHub Release (SHA-256 verify) |
 | `starship` | - | GitHub Release (SHA-256 verify) |
 | `ble.sh` | `blesh` | GitHub nightly rolling release (commit-tracked; SHA-256 unavailable) |
 | `git-cliff` | - | GitHub Release (SHA-256 verify) |
@@ -329,7 +331,7 @@ Current built-in tool policies:
 ```bash
 # install the latest release and make it active
 za tool install codex
-za tool install just bottom bpftop hyperfine starship ble.sh git-cliff cargo-release cargo-nextest cargo-fuzz cross
+za tool install just bottom bpftop hyperfine actionlint starship ble.sh git-cliff cargo-release cargo-nextest cargo-fuzz cross
 za tool install just starship ble.sh --verbose
 
 # install a specific version and make it active

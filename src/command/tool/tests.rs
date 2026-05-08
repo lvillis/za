@@ -428,6 +428,17 @@ fn tool_policy_matches_alias_and_canonical() {
     assert_eq!(dust.canonical_name, "dust");
     let oha = find_tool_policy("oha").expect("canonical policy");
     assert_eq!(oha.canonical_name, "oha");
+    let actionlint = find_tool_policy("actionlint").expect("canonical policy");
+    assert_eq!(actionlint.canonical_name, "actionlint");
+    assert_eq!(actionlint.cargo_fallback_package, None);
+    assert_eq!(actionlint.source_label, "GitHub Release (SHA-256 verified)");
+    assert_eq!(
+        actionlint
+            .github_release
+            .expect("github policy")
+            .verification,
+        GithubReleaseVerification::RequiredSha256Digest
+    );
     let sccache = find_tool_policy("sccache").expect("canonical policy");
     assert_eq!(sccache.canonical_name, "sccache");
     assert_eq!(sccache.cargo_fallback_package, None);
@@ -528,6 +539,7 @@ fn canonical_tool_name_resolves_aliases() {
     assert_eq!(canonical_tool_name("hyperfine"), "hyperfine");
     assert_eq!(canonical_tool_name("docker-compose"), "docker-compose");
     assert_eq!(canonical_tool_name("oha"), "oha");
+    assert_eq!(canonical_tool_name("actionlint"), "actionlint");
     assert_eq!(canonical_tool_name("sccache"), "sccache");
     assert_eq!(canonical_tool_name("starship"), "starship");
     assert_eq!(canonical_tool_name("git-cliff"), "git-cliff");
@@ -559,6 +571,7 @@ fn supported_tool_names_csv_contains_all_aliases() {
     assert!(csv.contains("dust"));
     assert!(csv.contains("just"));
     assert!(csv.contains("oha"));
+    assert!(csv.contains("actionlint"));
     assert!(csv.contains("sccache"));
     assert!(csv.contains("starship"));
     assert!(csv.contains("git-cliff"));
@@ -800,6 +813,27 @@ fn sccache_policy_expected_asset_name_matches_supported_tarball() {
     assert_eq!(
         asset_name,
         format!("sccache-v0.15.0-{expected_target}.tar.gz")
+    );
+}
+
+#[test]
+fn actionlint_policy_expected_asset_name_matches_supported_tarball() {
+    let policy = find_tool_policy("actionlint")
+        .expect("policy")
+        .github_release
+        .expect("github policy");
+    let asset_name =
+        (policy.expected_asset_name.expect("asset resolver"))("1.7.12").expect("asset name");
+    let expected_target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "linux_amd64",
+        ("linux", "aarch64") => "linux_arm64",
+        ("macos", "x86_64") => "darwin_amd64",
+        ("macos", "aarch64") => "darwin_arm64",
+        other => panic!("unsupported local test platform: {other:?}"),
+    };
+    assert_eq!(
+        asset_name,
+        format!("actionlint_1.7.12_{expected_target}.tar.gz")
     );
 }
 
