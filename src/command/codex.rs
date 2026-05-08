@@ -891,24 +891,27 @@ mod tests {
     fn tmux_codex_status_left_hides_internal_session_name() {
         let left = tmux_codex_status_left("ttd-pro-cli", Path::new("/opt/app/ttd-pro-cli"))
             .expect("must render status-left");
-        assert!(left.starts_with("[ttd-pro-cli] #("));
+        assert!(left.starts_with("#("));
         assert!(left.ends_with(" "));
         assert!(left.contains("codex-status"));
         assert!(left.contains("/opt/app/ttd-pro-cli"));
         assert!(left.contains(".sh"));
         assert!(left.contains(".loc"));
+        assert!(!left.starts_with("[ttd-pro-cli]"));
         assert!(!left.contains("za-codex"));
-        assert!(
-            tmux_codex_status_left_length("ttd-pro-cli").expect("must compute status-left length")
-                > "[ttd-pro-cli] ".len()
+        assert_eq!(
+            tmux_codex_status_left_length().expect("must compute status-left length"),
+            72
         );
     }
 
     #[test]
-    fn tmux_codex_status_left_escapes_tmux_format_marker() {
+    fn tmux_codex_status_left_omits_workspace_label() {
         let left =
             tmux_codex_status_left("repo#1", Path::new("/opt/app/repo#1")).expect("must render");
-        assert!(left.starts_with("[repo##1] #("));
+        assert!(left.starts_with("#("));
+        assert!(!left.starts_with("[repo#1]"));
+        assert!(!left.contains("repo##1"));
     }
 
     #[test]
@@ -945,7 +948,7 @@ mod tests {
         assert!(script.contains("ls-files -co --exclude-standard"));
         assert!(script.contains("cargo_metadata_value"));
         assert!(script.contains("workspace.package"));
-        assert!(script.contains("pkg v$pkg_version"));
+        assert!(script.contains("out=\"$pkg_version\""));
         assert!(script.contains("msrv $msrv"));
         assert!(script.contains("*.rs"));
         assert!(script.contains("*.ts"));

@@ -131,7 +131,7 @@ build_rust_metadata() {
   msrv=$(cargo_metadata_value rust-version 2>/dev/null || true)
   out=
   if [ -n "$pkg_version" ]; then
-    out="pkg v$pkg_version"
+    out="$pkg_version"
   fi
   if [ -n "$msrv" ]; then
     msrv=$(normalize_msrv "$msrv")
@@ -322,7 +322,7 @@ pub(super) fn tmux_apply_codex_session_style(
     tmux_set_session_option(
         session_name,
         "status-left-length",
-        &tmux_codex_status_left_length(workspace_label)?.to_string(),
+        &tmux_codex_status_left_length()?.to_string(),
     )?;
     tmux_set_session_option(
         session_name,
@@ -673,19 +673,15 @@ pub(super) fn tmux_codex_status_left(
 }
 
 fn tmux_codex_status_left_for_helper(
-    workspace_label: &str,
+    _workspace_label: &str,
     workspace_root: &Path,
     helper: &TmuxCodexStatusHelper,
 ) -> String {
-    let label = tmux_escape_format_literal(workspace_label);
-    format!(
-        "[{label}] {} ",
-        tmux_codex_status_for_helper(workspace_root, helper)
-    )
+    format!("{} ", tmux_codex_status_for_helper(workspace_root, helper))
 }
 
-pub(super) fn tmux_codex_status_left_length(workspace_label: &str) -> Result<usize> {
-    Ok(format!("[{workspace_label}] ").len() + TMUX_CODEX_STATUS_WIDTH)
+pub(super) fn tmux_codex_status_left_length() -> Result<usize> {
+    Ok(TMUX_CODEX_STATUS_WIDTH)
 }
 
 pub(super) fn tmux_codex_status_format() -> &'static str {
@@ -840,10 +836,6 @@ fn shell_escape_tmux_status_word(path: &Path) -> String {
         }
     }
     out
-}
-
-fn tmux_escape_format_literal(value: &str) -> String {
-    value.replace('#', "##")
 }
 
 pub(super) fn is_interactive_terminal() -> bool {
