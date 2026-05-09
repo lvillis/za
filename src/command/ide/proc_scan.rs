@@ -67,6 +67,8 @@ pub(super) fn collect_ide_sessions() -> Result<Vec<IdeSession>> {
         let uptime_secs = elapsed.max(0.0) as u64;
         let rss_pages = u64::try_from(stat.rss_pages.max(0)).unwrap_or_default();
         let remote_state = remote_state_by_pid.get(&pid).cloned().unwrap_or_default();
+        let heap_limit_bytes =
+            resolve_heap_limit_bytes(&executable, remote_state.ide_identity_string.as_deref());
         let remote_projects = remote_state.projects;
         let (project, project_real) =
             project_state::derive_project_identity(&project_arg, &remote_projects);
@@ -83,6 +85,7 @@ pub(super) fn collect_ide_sessions() -> Result<Vec<IdeSession>> {
             project_real,
             cpu_percent,
             rss_bytes: rss_pages.saturating_mul(page_size),
+            heap_limit_bytes,
             uptime_secs,
             child_count: 0,
             fsnotifier_children: 0,
@@ -285,6 +288,83 @@ fn normalize_non_empty(value: Option<String>) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+fn resolve_heap_limit_bytes(executable: &str, ide_identity: Option<&str>) -> Option<u64> {
+    let identity_dir = Path::new(ide_identity?);
+    let exe_name = Path::new(executable)
+        .file_name()
+        .and_then(|name| name.to_str())?
+        .to_ascii_lowercase();
+    let mut candidates = Vec::new();
+    if exe_name.ends_with("64") {
+        candidates.push(identity_dir.join(format!("{exe_name}.vmoptions")));
+    } else {
+        candidates.push(identity_dir.join(format!("{exe_name}64.vmoptions")));
+        candidates.push(identity_dir.join(format!("{exe_name}.vmoptions")));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for path in candidates {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        if let Some(bytes) = read_heap_limit_bytes_from_vmoptions(&path) {
+            return Some(bytes);
+        }
+    }
+
+    let mut fallback = fs::read_dir(identity_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "vmoptions"))
+        .collect::<Vec<_>>();
+    fallback.sort();
+    for path in fallback {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        if let Some(bytes) = read_heap_limit_bytes_from_vmoptions(&path) {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+fn read_heap_limit_bytes_from_vmoptions(path: &Path) -> Option<u64> {
+    let raw = fs::read_to_string(path).ok()?;
+    raw.lines().filter_map(parse_xmx_bytes).last()
+}
+
+pub(super) fn parse_xmx_bytes(line: &str) -> Option<u64> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let value = line.strip_prefix("-Xmx")?;
+    parse_jvm_size_bytes(value)
+}
+
+fn parse_jvm_size_bytes(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let digit_count = value.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digit_count == 0 {
+        return None;
+    }
+    let (digits, suffix) = value.split_at(digit_count);
+    let base = digits.parse::<u64>().ok()?;
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" => 1,
+        "k" => 1024,
+        "m" => 1024_u64.pow(2),
+        "g" => 1024_u64.pow(3),
+        _ => return None,
+    };
+    base.checked_mul(multiplier)
 }
 
 pub(super) fn parse_build_number_from_build_txt(raw: &str) -> Option<String> {

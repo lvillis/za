@@ -47,6 +47,7 @@ struct IdeSession {
     project_real: String,
     cpu_percent: f64,
     rss_bytes: u64,
+    heap_limit_bytes: Option<u64>,
     uptime_secs: u64,
     child_count: usize,
     fsnotifier_children: usize,
@@ -195,7 +196,16 @@ struct IdePsOutput {
     max_per_project: usize,
     orphan_ttl_minutes: u64,
     orphan_due: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    diagnostics: Vec<IdePsDiagnostic>,
     projects: Vec<IdeProjectRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct IdePsDiagnostic {
+    kind: String,
+    path: Option<String>,
+    detail: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -265,6 +275,9 @@ struct IdeFixOutput {
     ipc_socket_path: Option<String>,
     ipc_socket_existed: bool,
     ipc_socket_removed: bool,
+    station_socket_paths: Vec<String>,
+    station_socket_removed: Vec<String>,
+    station_socket_failures: Vec<IdeFixFailure>,
     semaphore_key: Option<String>,
     semaphore_ids: Vec<i32>,
     semaphore_removed: Vec<i32>,
@@ -329,6 +342,7 @@ struct IdeProjectRow {
     users_count: usize,
     cpu_percent: f64,
     rss_bytes: u64,
+    heap_limit_bytes: Option<u64>,
     uptime_secs: u64,
     child_count: usize,
     shell_children: usize,
@@ -1006,6 +1020,11 @@ fn run_ps(duplicates_only: bool, json: bool) -> Result<i32> {
     let orphan_due = sessions.iter().filter(|s| s.orphan_due).count();
     let mut project_rows = project_state::build_project_rows(&sessions, &opened_projects);
     sort_project_rows_for_ps(&mut project_rows);
+    let diagnostics = if !duplicates_only && project_rows.is_empty() {
+        collect_stale_jetbrains_ipc_diagnostics()
+    } else {
+        Vec::new()
+    };
     if json {
         let out = IdePsOutput {
             total: sessions.len(),
@@ -1014,6 +1033,7 @@ fn run_ps(duplicates_only: bool, json: bool) -> Result<i32> {
             max_per_project: policy.max_per_project,
             orphan_ttl_minutes: policy.orphan_ttl_minutes,
             orphan_due,
+            diagnostics,
             projects: project_rows,
         };
         println!(
@@ -1028,51 +1048,26 @@ fn run_ps(duplicates_only: bool, json: bool) -> Result<i32> {
             println!("No duplicate JetBrains remote IDE sessions.");
         } else {
             println!("No JetBrains remote IDE sessions are running.");
+            for line in render_ps_diagnostics(&diagnostics) {
+                println!("{line}");
+            }
         }
         return Ok(0);
     }
 
-    println!(
-        "{:<7} {:<12} {:<12} {:>5} {:>6} {:<10} {:<12} {:>5} {:>6} {:>6}  PROJECT",
-        "PID", "IDE", "VER", "CTRL", "IDLE", "STATE", "HEALTH", "SHELL", "FRESH", "CONF"
-    );
-    for row in &project_rows {
-        let version = truncate_end(&project_state::ide_project_row_version_label(row), 12);
-        let conn = if row.controller_connected { "yes" } else { "-" };
-        let idle = row
-            .seconds_since_last_controller_activity
-            .map(|secs| format!("{secs}s"))
-            .unwrap_or_else(|| "-".to_string());
-        let freshness = row
-            .remote_snapshot_age_secs
-            .map(|secs| format!("{secs}s"))
-            .unwrap_or_else(|| "-".to_string());
-        println!(
-            "{:<7} {:<12} {:<12} {:>5} {:>6} {:<10} {:<12} {:>5} {:>6} {:>6}  {}",
-            row.pid,
-            truncate_end(&row.ide, 12),
-            version,
-            conn,
-            idle,
-            truncate_end(&row.state, 10),
-            truncate_end(&row.health, 12),
-            row.shell_children,
-            freshness,
-            project_state::confidence_label(row.confidence),
-            row.project_path
-        );
+    for line in render_ps_project_rows(&project_rows) {
+        println!("{line}");
     }
-    println!();
-    println!("Total sessions: {}", sessions.len());
-    println!("Total projects: {}", project_rows.len());
-    println!(
-        "Over-limit groups (max_per_project={}): {duplicate_groups}",
-        policy.max_per_project
-    );
-    println!(
-        "Orphan due sessions (ttl={}m): {}",
-        policy.orphan_ttl_minutes, orphan_due
-    );
+    for line in render_ps_summary(
+        sessions.len(),
+        project_rows.len(),
+        duplicate_groups,
+        policy.max_per_project,
+        orphan_due,
+        policy.orphan_ttl_minutes,
+    ) {
+        println!("{line}");
+    }
     if orphan_due > 0 {
         println!(
             "Note: orphan means the backend was reparented to pid 1 and may no longer be attachable by Gateway/Toolbox."
@@ -1406,6 +1401,9 @@ fn run_fix(dry_run: bool, timeout_secs: u64, json: bool) -> Result<i32> {
     let ipc_socket_path = toolbox_ipc_socket_path();
     let ipc_socket_existed = ipc_socket_path.as_ref().is_some_and(|path| path.exists());
     let mut ipc_socket_removed = false;
+    let station_socket_paths = stale_jetbrains_station_socket_paths();
+    let mut station_socket_removed = Vec::new();
+    let mut station_socket_failures = Vec::new();
     let mut notes = Vec::new();
     if !dry_run && !active_toolbox.is_empty() {
         notes.push(format!(
@@ -1425,6 +1423,25 @@ fn run_fix(dry_run: bool, timeout_secs: u64, json: bool) -> Result<i32> {
                 path.display()
             )),
         }
+    }
+    if !station_socket_paths.is_empty() && active_toolbox.is_empty() {
+        for path in &station_socket_paths {
+            if dry_run {
+                continue;
+            }
+            match fs::remove_file(path) {
+                Ok(()) => station_socket_removed.push(path.display().to_string()),
+                Err(err) => station_socket_failures.push(IdeFixFailure {
+                    target: path.display().to_string(),
+                    error: err.to_string(),
+                }),
+            }
+        }
+    } else if !dry_run && !station_socket_paths.is_empty() && !active_toolbox.is_empty() {
+        notes.push(format!(
+            "Skipped station socket cleanup because Toolbox main process(es) still appear active: {:?}.",
+            active_toolbox
+        ));
     }
 
     let semaphore_key = discover_toolbox_ipc_key();
@@ -1471,6 +1488,12 @@ fn run_fix(dry_run: bool, timeout_secs: u64, json: bool) -> Result<i32> {
         ipc_socket_path: ipc_socket_path.map(|path| path.display().to_string()),
         ipc_socket_existed,
         ipc_socket_removed,
+        station_socket_paths: station_socket_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        station_socket_removed,
+        station_socket_failures,
         semaphore_key,
         semaphore_ids,
         semaphore_removed,
@@ -1657,13 +1680,148 @@ fn truncate_end(input: &str, max_chars: usize) -> String {
     out
 }
 
+fn format_optional_memory_bytes(bytes: Option<u64>) -> String {
+    bytes
+        .map(format_memory_bytes)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_memory_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        format!("{:.1}GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{}MiB", bytes.saturating_add(MIB / 2) / MIB)
+    } else if bytes >= KIB {
+        format!("{}KiB", bytes.saturating_add(KIB / 2) / KIB)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+fn render_ps_project_rows(rows: &[IdeProjectRow]) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{:<7} {:<12} {:<12} {:>7} {:>7} {:>5} {:>5} {:>6} {:<10} {:<12} {:>6} {:>6}  PROJECT",
+        "PID",
+        "IDE",
+        "VER",
+        "RSS",
+        "XMX",
+        "SHELL",
+        "CTRL",
+        "IDLE",
+        "STATE",
+        "HEALTH",
+        "FRESH",
+        "CONF"
+    )];
+    let mut last_pid = None;
+    for row in rows {
+        let show_process = last_pid != Some(row.pid);
+        last_pid = Some(row.pid);
+        lines.push(render_ps_project_row(row, show_process));
+    }
+    lines
+}
+
+fn render_ps_project_row(row: &IdeProjectRow, show_process: bool) -> String {
+    let version = truncate_end(&project_state::ide_project_row_version_label(row), 12);
+    let conn = if row.controller_connected { "yes" } else { "-" };
+    let idle = row
+        .seconds_since_last_controller_activity
+        .map(|secs| format!("{secs}s"))
+        .unwrap_or_else(|| "-".to_string());
+    let freshness = row
+        .remote_snapshot_age_secs
+        .map(|secs| format!("{secs}s"))
+        .unwrap_or_else(|| "-".to_string());
+    let (pid, ide, version, rss, xmx, shell) = if show_process {
+        (
+            row.pid.to_string(),
+            truncate_end(&row.ide, 12),
+            version,
+            format_memory_bytes(row.rss_bytes),
+            format_optional_memory_bytes(row.heap_limit_bytes),
+            row.shell_children.to_string(),
+        )
+    } else {
+        (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+    };
+    format!(
+        "{:<7} {:<12} {:<12} {:>7} {:>7} {:>5} {:>5} {:>6} {:<10} {:<12} {:>6} {:>6}  {}",
+        pid,
+        ide,
+        version,
+        rss,
+        xmx,
+        shell,
+        conn,
+        idle,
+        truncate_end(&row.state, 10),
+        truncate_end(&row.health, 12),
+        freshness,
+        project_state::confidence_label(row.confidence),
+        row.project_path
+    )
+}
+
+fn render_ps_summary(
+    total_sessions: usize,
+    total_projects: usize,
+    duplicate_groups: usize,
+    max_per_project: usize,
+    orphan_due: usize,
+    orphan_ttl_minutes: u64,
+) -> Vec<String> {
+    if duplicate_groups == 0 && orphan_due == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    lines.push(String::new());
+    lines.push(format!(
+        "summary: {total_sessions} session(s), {total_projects} project(s)"
+    ));
+    if duplicate_groups > 0 {
+        lines.push(format!(
+            "over-limit: {duplicate_groups} group(s), max_per_project={max_per_project}"
+        ));
+    }
+    if orphan_due > 0 {
+        lines.push(format!(
+            "orphan due: {orphan_due} session(s), ttl={orphan_ttl_minutes}m"
+        ));
+    }
+    lines
+}
+
 fn sort_project_rows_for_ps(rows: &mut [IdeProjectRow]) {
+    let mut rank_by_pid = HashMap::<i32, u8>::new();
+    for row in rows.iter() {
+        let rank = project_row_attention_rank(row);
+        rank_by_pid
+            .entry(row.pid)
+            .and_modify(|existing| *existing = (*existing).min(rank))
+            .or_insert(rank);
+    }
     rows.sort_by(|a, b| {
-        project_row_attention_rank(a)
-            .cmp(&project_row_attention_rank(b))
+        rank_by_pid
+            .get(&a.pid)
+            .copied()
+            .unwrap_or(u8::MAX)
+            .cmp(&rank_by_pid.get(&b.pid).copied().unwrap_or(u8::MAX))
+            .then_with(|| a.pid.cmp(&b.pid))
             .then_with(|| a.project_path.cmp(&b.project_path))
             .then_with(|| a.ide.cmp(&b.ide))
-            .then_with(|| a.pid.cmp(&b.pid))
     });
 }
 
@@ -1690,6 +1848,149 @@ fn project_row_attention_rank(row: &IdeProjectRow) -> u8 {
         return 6;
     }
     7
+}
+
+fn collect_stale_jetbrains_ipc_diagnostics() -> Vec<IdePsDiagnostic> {
+    let active_toolbox = collect_toolbox_main_processes().unwrap_or_default();
+    let toolbox_is_running = !active_toolbox.is_empty();
+    let mut diagnostics = Vec::new();
+
+    if let Some(path) = toolbox_ipc_socket_path()
+        && path.exists()
+        && !toolbox_is_running
+    {
+        diagnostics.push(IdePsDiagnostic {
+            kind: "toolbox ipc".to_string(),
+            path: Some(path.display().to_string()),
+            detail: "no Toolbox main process is running".to_string(),
+        });
+    }
+
+    if !toolbox_is_running {
+        for socket in stale_jetbrains_station_sockets() {
+            diagnostics.push(IdePsDiagnostic {
+                kind: socket.kind,
+                path: Some(socket.path.display().to_string()),
+                detail: socket.detail,
+            });
+        }
+    }
+
+    if !toolbox_is_running
+        && let Some(key) = discover_toolbox_ipc_key()
+        && let Ok(ids) = list_semaphore_ids_by_key(&key)
+        && !ids.is_empty()
+    {
+        diagnostics.push(IdePsDiagnostic {
+            kind: "semaphore".to_string(),
+            path: None,
+            detail: format!("{key} {ids:?} with no Toolbox main process running"),
+        });
+    }
+
+    diagnostics
+}
+
+#[derive(Debug, Clone)]
+struct StaleStationSocket {
+    kind: String,
+    path: PathBuf,
+    detail: String,
+}
+
+fn stale_jetbrains_station_socket_paths() -> Vec<PathBuf> {
+    stale_jetbrains_station_sockets()
+        .into_iter()
+        .map(|socket| socket.path)
+        .collect()
+}
+
+fn stale_jetbrains_station_sockets() -> Vec<StaleStationSocket> {
+    let Some(runtime_dir) = jetbrains_runtime_dir() else {
+        return Vec::new();
+    };
+    let mut sockets = Vec::new();
+    let station_socket = runtime_dir.join("jb.station.sock");
+    if station_socket.exists() {
+        sockets.push(StaleStationSocket {
+            kind: "station socket".to_string(),
+            path: station_socket,
+            detail: "no Toolbox main process is running".to_string(),
+        });
+    }
+
+    if let Ok(entries) = fs::read_dir(&runtime_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(pid) = parse_jetbrains_ide_station_socket_pid(name) else {
+                continue;
+            };
+            if !process_exists(pid) {
+                sockets.push(StaleStationSocket {
+                    kind: "ide socket".to_string(),
+                    path,
+                    detail: format!("pid {pid} is not running"),
+                });
+            }
+        }
+    }
+    sockets.sort_by(|a, b| a.path.cmp(&b.path));
+    sockets
+}
+
+fn render_ps_diagnostics(diagnostics: &[IdePsDiagnostic]) -> Vec<String> {
+    if diagnostics.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = vec![
+        String::new(),
+        "Stale JetBrains IPC artifacts found:".to_string(),
+    ];
+    for diagnostic in diagnostics {
+        match diagnostic.path.as_deref() {
+            Some(path) => lines.push(format!(
+                "  {}: {} ({})",
+                diagnostic.kind, path, diagnostic.detail
+            )),
+            None => lines.push(format!("  {}: {}", diagnostic.kind, diagnostic.detail)),
+        }
+    }
+    lines.push("Run `za ide fix` to clean stale Toolbox/IDE IPC state.".to_string());
+    lines
+}
+
+fn jetbrains_runtime_dir() -> Option<PathBuf> {
+    env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .or_else(|| current_effective_uid().map(|uid| PathBuf::from(format!("/run/user/{uid}"))))
+}
+
+fn current_effective_uid() -> Option<u32> {
+    let raw = fs::read_to_string(Path::new(PROC_ROOT).join("self/status")).ok()?;
+    for line in raw.lines() {
+        let Some(rest) = line.strip_prefix("Uid:") else {
+            continue;
+        };
+        let mut cols = rest.split_whitespace();
+        let _real = cols.next()?;
+        return cols.next()?.parse::<u32>().ok();
+    }
+    None
+}
+
+fn parse_jetbrains_ide_station_socket_pid(name: &str) -> Option<i32> {
+    name.strip_prefix("jb.station.ij.")?
+        .strip_suffix(".sock")?
+        .parse::<i32>()
+        .ok()
+}
+
+fn process_exists(pid: i32) -> bool {
+    Path::new(PROC_ROOT).join(pid.to_string()).exists()
 }
 
 fn parse_proc_pid_dir_name(name: &str) -> Option<i32> {
@@ -1859,6 +2160,7 @@ fn remove_semaphore(semid: i32) -> Result<()> {
 fn ide_fix_has_failures(output: &IdeFixOutput) -> bool {
     !output.orphan_backend_failures.is_empty()
         || !output.toolbox_failures.is_empty()
+        || !output.station_socket_failures.is_empty()
         || !output.semaphore_failures.is_empty()
 }
 
@@ -1870,6 +2172,7 @@ fn render_fix_lines(output: &IdeFixOutput) -> Vec<String> {
     } else if output.orphan_backend_pids.is_empty()
         && output.toolbox_pids.is_empty()
         && !output.ipc_socket_existed
+        && output.station_socket_paths.is_empty()
         && output.semaphore_ids.is_empty()
     {
         "clean"
@@ -1914,6 +2217,15 @@ fn render_fix_lines(output: &IdeFixOutput) -> Vec<String> {
         }
     ));
     lines.push(format!(
+        "station socket {}",
+        render_fix_path_action(
+            &output.station_socket_paths,
+            &output.station_socket_removed,
+            output.dry_run,
+            "remove"
+        )
+    ));
+    lines.push(format!(
         "semaphore      {}",
         match (
             &output.semaphore_key,
@@ -1935,6 +2247,7 @@ fn render_fix_lines(output: &IdeFixOutput) -> Vec<String> {
     ));
     if !output.orphan_backend_failures.is_empty()
         || !output.toolbox_failures.is_empty()
+        || !output.station_socket_failures.is_empty()
         || !output.semaphore_failures.is_empty()
         || !output.notes.is_empty()
     {
@@ -1945,6 +2258,9 @@ fn render_fix_lines(output: &IdeFixOutput) -> Vec<String> {
         for failure in &output.toolbox_failures {
             lines.push(format!("  - failed {}: {}", failure.target, failure.error));
         }
+        for failure in &output.station_socket_failures {
+            lines.push(format!("  - failed {}: {}", failure.target, failure.error));
+        }
         for failure in &output.semaphore_failures {
             lines.push(format!("  - failed {}: {}", failure.target, failure.error));
         }
@@ -1953,6 +2269,36 @@ fn render_fix_lines(output: &IdeFixOutput) -> Vec<String> {
         }
     }
     lines
+}
+
+fn render_fix_path_action(
+    targets: &[String],
+    removed: &[String],
+    dry_run: bool,
+    verb: &str,
+) -> String {
+    if targets.is_empty() {
+        return "none".to_string();
+    }
+    if dry_run {
+        return format!("would {verb} {}", targets.join(", "));
+    }
+    if removed.is_empty() {
+        return format!("present {}", targets.join(", "));
+    }
+    if removed.len() == targets.len() {
+        return format!("removed {}", removed.join(", "));
+    }
+    format!(
+        "partial removed {}; remaining {}",
+        removed.join(", "),
+        targets
+            .iter()
+            .filter(|target| !removed.contains(*target))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn render_fix_pid_action(targets: &[i32], stopped: &[i32], dry_run: bool, verb: &str) -> String {
@@ -1969,16 +2315,19 @@ fn render_fix_pid_action(targets: &[i32], stopped: &[i32], dry_run: bool, verb: 
 mod tests {
     use super::proc_scan::{
         extract_jetbrains_server_session, has_jetbrains_shell_integration,
-        parse_build_number_from_build_txt, parse_cmdline, parse_proc_stat_line,
+        parse_build_number_from_build_txt, parse_cmdline, parse_proc_stat_line, parse_xmx_bytes,
     };
     use super::{
-        ConfidenceLevel, IdeFixOutput, IdeProjectRow, IdeReconcileStrategy, IdeSession,
-        ProcessIdentity, expected_ide_agent_shim_content, ide_agent_bash_path_block,
-        ide_agent_shim_is_managed, normalize_ide_agent_name, parse_ipcs_semaphore_rows,
-        parse_toolbox_ipc_key_line, pick_keep_pid, pick_keep_pids, process_matches_identity,
-        project_row_attention_rank, read_process_start_ticks, remove_ide_agent_bash_block,
-        render_fix_lines, resolve_za_executable_from_path_env, shell_single_quote,
-        sort_project_rows_for_ps, upsert_ide_agent_bash_block,
+        ConfidenceLevel, IdeFixFailure, IdeFixOutput, IdeProjectRow, IdePsDiagnostic,
+        IdeReconcileStrategy, IdeSession, ProcessIdentity, expected_ide_agent_shim_content,
+        format_memory_bytes, ide_agent_bash_path_block, ide_agent_shim_is_managed,
+        normalize_ide_agent_name, parse_ipcs_semaphore_rows,
+        parse_jetbrains_ide_station_socket_pid, parse_toolbox_ipc_key_line, pick_keep_pid,
+        pick_keep_pids, process_matches_identity, project_row_attention_rank,
+        read_process_start_ticks, remove_ide_agent_bash_block, render_fix_lines,
+        render_ps_diagnostics, render_ps_project_rows, render_ps_summary,
+        resolve_za_executable_from_path_env, shell_single_quote, sort_project_rows_for_ps,
+        upsert_ide_agent_bash_block,
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -2051,6 +2400,22 @@ mod tests {
             parse_build_number_from_build_txt(raw).as_deref(),
             Some("253.31033.132")
         );
+    }
+
+    #[test]
+    fn parse_xmx_bytes_reads_jvm_heap_limit_units() {
+        assert_eq!(parse_xmx_bytes("-Xmx1963m"), Some(1963 * 1024 * 1024));
+        assert_eq!(parse_xmx_bytes("  -Xmx4g  "), Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(parse_xmx_bytes("# -Xmx4g"), None);
+        assert_eq!(parse_xmx_bytes("-Xms512m"), None);
+    }
+
+    #[test]
+    fn format_memory_bytes_uses_compact_binary_units() {
+        assert_eq!(format_memory_bytes(512), "512B");
+        assert_eq!(format_memory_bytes(1536), "2KiB");
+        assert_eq!(format_memory_bytes(1963 * 1024 * 1024), "1.9GiB");
+        assert_eq!(format_memory_bytes(4096 * 1024 * 1024), "4.0GiB");
     }
 
     #[test]
@@ -2158,6 +2523,7 @@ mod tests {
                 project_real: "/a".to_string(),
                 cpu_percent: 1.0,
                 rss_bytes: 1,
+                heap_limit_bytes: Some(2),
                 uptime_secs: 1,
                 child_count: 0,
                 fsnotifier_children: 0,
@@ -2187,6 +2553,7 @@ mod tests {
                 project_real: "/a".to_string(),
                 cpu_percent: 1.0,
                 rss_bytes: 1,
+                heap_limit_bytes: Some(2),
                 uptime_secs: 1,
                 child_count: 0,
                 fsnotifier_children: 0,
@@ -2257,6 +2624,41 @@ mod tests {
     }
 
     #[test]
+    fn render_ps_project_rows_groups_process_columns_by_pid() {
+        let mut first = sample_project_row();
+        first.pid = 4082669;
+        first.project_path = "/opt/app/rso".to_string();
+        first.state = "live".to_string();
+        first.orphan_due = false;
+        first.rss_bytes = 5_153_960_755;
+        first.heap_limit_bytes = Some(4 * 1024 * 1024 * 1024);
+        first.shell_children = 4;
+        let mut second = first.clone();
+        second.project_path = "/opt/app/za".to_string();
+
+        let lines = render_ps_project_rows(&[first, second]);
+        assert!(lines[0].contains("RSS"));
+        assert!(lines[0].contains("XMX"));
+        assert!(lines[1].starts_with("4082669"));
+        assert!(lines[1].contains("4.8GiB"));
+        assert!(lines[1].contains("4.0GiB"));
+        assert!(lines[2].starts_with("        "));
+        assert!(!lines[2].contains("4082669"));
+        assert!(!lines[2].contains("4.8GiB"));
+        assert!(lines[2].contains("/opt/app/za"));
+    }
+
+    #[test]
+    fn render_ps_summary_omits_clean_state() {
+        assert!(render_ps_summary(1, 2, 0, 1, 0, 30).is_empty());
+
+        let summary = render_ps_summary(2, 2, 1, 1, 1, 30).join("\n");
+        assert!(summary.contains("summary: 2 session(s), 2 project(s)"));
+        assert!(summary.contains("over-limit: 1 group(s), max_per_project=1"));
+        assert!(summary.contains("orphan due: 1 session(s), ttl=30m"));
+    }
+
+    #[test]
     fn parse_toolbox_ipc_key_line_converts_signed_decimal_to_hex() {
         assert_eq!(
             parse_toolbox_ipc_key_line("13:59:02 | Semaphore | ipc_key=-855630266").as_deref(),
@@ -2273,6 +2675,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_jetbrains_ide_station_socket_pid_extracts_pid() {
+        assert_eq!(
+            parse_jetbrains_ide_station_socket_pid("jb.station.ij.365582.sock"),
+            Some(365582)
+        );
+        assert_eq!(
+            parse_jetbrains_ide_station_socket_pid("jb.station.sock"),
+            None
+        );
+        assert_eq!(
+            parse_jetbrains_ide_station_socket_pid("jb.station.ij.bad.sock"),
+            None
+        );
+    }
+
+    #[test]
+    fn render_ps_diagnostics_suggests_ide_fix() {
+        let lines = render_ps_diagnostics(&[
+            IdePsDiagnostic {
+                kind: "station socket".to_string(),
+                path: Some("/run/user/0/jb.station.sock".to_string()),
+                detail: "no Toolbox main process is running".to_string(),
+            },
+            IdePsDiagnostic {
+                kind: "semaphore".to_string(),
+                path: None,
+                detail: "0xcd001e46 [1] with no Toolbox main process running".to_string(),
+            },
+        ]);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("Stale JetBrains IPC artifacts found:"));
+        assert!(rendered.contains("station socket: /run/user/0/jb.station.sock"));
+        assert!(rendered.contains("semaphore: 0xcd001e46 [1]"));
+        assert!(rendered.contains("Run `za ide fix`"));
+    }
+
+    #[test]
     fn render_fix_lines_mentions_socket_and_semaphore_plan() {
         let lines = render_fix_lines(&IdeFixOutput {
             dry_run: true,
@@ -2285,6 +2724,12 @@ mod tests {
             ipc_socket_path: Some("/root/.cache/JetBrains/Toolbox/ipc".to_string()),
             ipc_socket_existed: true,
             ipc_socket_removed: false,
+            station_socket_paths: vec![
+                "/run/user/0/jb.station.sock".to_string(),
+                "/run/user/0/jb.station.ij.365582.sock".to_string(),
+            ],
+            station_socket_removed: Vec::new(),
+            station_socket_failures: Vec::new(),
             semaphore_key: Some("0xcd001e46".to_string()),
             semaphore_ids: vec![1],
             semaphore_removed: Vec::new(),
@@ -2294,7 +2739,40 @@ mod tests {
         let rendered = lines.join("\n");
         assert!(rendered.contains("would stop [11]"));
         assert!(rendered.contains("would remove /root/.cache/JetBrains/Toolbox/ipc"));
+        assert!(rendered.contains("would remove /run/user/0/jb.station.sock"));
+        assert!(rendered.contains("jb.station.ij.365582.sock"));
         assert!(rendered.contains("would remove 0xcd001e46 [1]"));
+    }
+
+    #[test]
+    fn render_fix_lines_marks_station_socket_failures_partial() {
+        let lines = render_fix_lines(&IdeFixOutput {
+            dry_run: false,
+            orphan_backend_pids: Vec::new(),
+            orphan_backend_stopped: Vec::new(),
+            orphan_backend_failures: Vec::new(),
+            toolbox_pids: Vec::new(),
+            toolbox_stopped: Vec::new(),
+            toolbox_failures: Vec::new(),
+            ipc_socket_path: None,
+            ipc_socket_existed: false,
+            ipc_socket_removed: false,
+            station_socket_paths: vec!["/run/user/0/jb.station.sock".to_string()],
+            station_socket_removed: Vec::new(),
+            station_socket_failures: vec![IdeFixFailure {
+                target: "/run/user/0/jb.station.sock".to_string(),
+                error: "permission denied".to_string(),
+            }],
+            semaphore_key: None,
+            semaphore_ids: Vec::new(),
+            semaphore_removed: Vec::new(),
+            semaphore_failures: Vec::new(),
+            notes: Vec::new(),
+        });
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("status         partial"));
+        assert!(rendered.contains("station socket present /run/user/0/jb.station.sock"));
+        assert!(rendered.contains("failed /run/user/0/jb.station.sock: permission denied"));
     }
 
     struct TempDir {
@@ -2340,6 +2818,7 @@ mod tests {
             users_count: 0,
             cpu_percent: 0.0,
             rss_bytes: 0,
+            heap_limit_bytes: None,
             uptime_secs: 0,
             child_count: 0,
             shell_children: 0,
