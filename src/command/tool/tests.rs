@@ -1,8 +1,11 @@
-use super::integrations::{blesh_bash_init_bottom_block, blesh_bash_init_top_block};
+use super::integrations::{
+    blesh_bash_init_bottom_block, blesh_bash_init_top_block, ide_terminal_bash_helper_block,
+};
 use super::policy::GithubReleaseVerification;
 use super::{
     BLESH_BASH_INIT_BOTTOM_END_MARKER, BLESH_BASH_INIT_BOTTOM_START_MARKER,
-    BLESH_BASH_INIT_TOP_END_MARKER, BLESH_BASH_INIT_TOP_START_MARKER, InstallOutcome,
+    BLESH_BASH_INIT_TOP_END_MARKER, BLESH_BASH_INIT_TOP_START_MARKER,
+    IDE_TERMINAL_BASH_HELPER_END_MARKER, IDE_TERMINAL_BASH_HELPER_START_MARKER, InstallOutcome,
     InstallResult, LatestCheck, ManagedBlockPosition, ManagedFileChange,
     STARSHIP_BASH_INIT_END_MARKER, STARSHIP_BASH_INIT_START_MARKER, ToolBatchKind,
     ToolBatchSummary, ToolHome, ToolRef, ToolScope, ToolSpec, ToolUpdateChannel,
@@ -584,18 +587,24 @@ fn supported_tool_names_csv_contains_all_aliases() {
 }
 
 #[test]
-fn starship_bash_init_block_uses_jeditem_guard() {
+fn ide_terminal_bash_helper_supports_jetbrains_and_zed() {
+    let block = ide_terminal_bash_helper_block();
+    assert!(block.contains(r#"[ "${TERMINAL_EMULATOR-}" = "JetBrains-JediTerm" ]"#));
+    assert!(block.contains(r#"[ "${ZED_TERM-}" = "true" ] && [ "${TERM_PROGRAM-}" = "zed" ]"#));
+    assert!(block.contains("_za_is_supported_ide_terminal()"));
+}
+
+#[test]
+fn starship_bash_init_block_uses_supported_ide_terminal_helper() {
     let block = starship_bash_init_block();
-    assert!(block.contains(r#"if [ "${TERMINAL_EMULATOR-}" = "JetBrains-JediTerm" ]; then"#));
+    assert!(block.contains(r#"if _za_is_supported_ide_terminal; then"#));
     assert!(block.contains(r#"eval "$(starship init bash)""#));
 }
 
 #[test]
 fn blesh_bash_init_top_block_sets_jetbrains_compatibility_options() {
     let block = blesh_bash_init_top_block(std::path::Path::new("/tmp/blesh/ble.sh"));
-    assert!(block.contains(
-        r#"if [ "${TERMINAL_EMULATOR-}" = "JetBrains-JediTerm" ] && [[ $- == *i* ]]; then"#
-    ));
+    assert!(block.contains(r#"if _za_is_supported_ide_terminal && [[ $- == *i* ]]; then"#));
     assert!(block.contains(r#"if source -- "/tmp/blesh/ble.sh" --attach=none; then"#));
     assert!(block.contains("bleopt prompt_command_changes_layout=1"));
     assert!(block.contains("bleopt internal_suppress_bash_output="));
@@ -604,9 +613,7 @@ fn blesh_bash_init_top_block_sets_jetbrains_compatibility_options() {
 #[test]
 fn blesh_bash_init_bottom_block_uses_immediate_attach_compatibility_shim() {
     let block = blesh_bash_init_bottom_block();
-    assert!(block.contains(
-        r#"if [ "${TERMINAL_EMULATOR-}" = "JetBrains-JediTerm" ] && [[ ${BLE_VERSION-} ]]; then"#
-    ));
+    assert!(block.contains(r#"if _za_is_supported_ide_terminal && [[ ${BLE_VERSION-} ]]; then"#));
     assert!(block.contains("VSCODE_INJECTION=1 ble-attach"));
 }
 
@@ -645,8 +652,58 @@ fn starship_bash_init_managed_block_is_idempotent() {
     assert_eq!(first, ManagedFileChange::Created);
     assert_eq!(second, ManagedFileChange::Unchanged);
     assert!(content.contains("export PATH=/tmp"));
-    assert!(content.contains("JetBrains-JediTerm"));
+    assert!(content.contains("_za_is_supported_ide_terminal"));
     assert_eq!(content.matches(STARSHIP_BASH_INIT_START_MARKER).count(), 1);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn ide_terminal_helper_is_inserted_before_tool_blocks() {
+    let root = std::env::temp_dir().join(format!(
+        "za-test-ide-terminal-helper-order-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("create temp root");
+    let rc_path = root.join(".bashrc");
+    fs::write(&rc_path, "export PATH=/tmp\n").expect("write rc");
+
+    upsert_managed_block(
+        &rc_path,
+        IDE_TERMINAL_BASH_HELPER_START_MARKER,
+        IDE_TERMINAL_BASH_HELPER_END_MARKER,
+        ManagedBlockPosition::Top,
+        ide_terminal_bash_helper_block(),
+    )
+    .expect("insert helper");
+    upsert_managed_block(
+        &rc_path,
+        STARSHIP_BASH_INIT_START_MARKER,
+        STARSHIP_BASH_INIT_END_MARKER,
+        ManagedBlockPosition::BeforeMarker(BLESH_BASH_INIT_BOTTOM_START_MARKER),
+        starship_bash_init_block(),
+    )
+    .expect("insert starship");
+
+    let content = fs::read_to_string(&rc_path).expect("read rc");
+    let helper_index = content
+        .find(IDE_TERMINAL_BASH_HELPER_START_MARKER)
+        .expect("helper marker");
+    let starship_index = content
+        .find(STARSHIP_BASH_INIT_START_MARKER)
+        .expect("starship marker");
+
+    assert!(helper_index < starship_index);
+    assert_eq!(
+        content
+            .matches(IDE_TERMINAL_BASH_HELPER_START_MARKER)
+            .count(),
+        1
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

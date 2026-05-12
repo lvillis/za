@@ -26,6 +26,7 @@ pub(super) fn preview_post_activation_integrations(
 
 fn ensure_starship_bash_init(emit_stages: bool) -> Result<()> {
     let rc_path = resolve_home_dir()?.join(".bashrc");
+    let helper_change = ensure_ide_terminal_bash_helper(&rc_path)?;
     let change = upsert_managed_block(
         &rc_path,
         STARSHIP_BASH_INIT_START_MARKER,
@@ -38,8 +39,9 @@ fn ensure_starship_bash_init(emit_stages: bool) -> Result<()> {
         emit_stages,
         "next",
         format!(
-            "starship bash init {} in {}; open a new JetBrains bash shell or `source {}`",
+            "starship bash init {} helper={} in {}; open a new JetBrains/Zed bash shell or `source {}`",
             change.label(),
+            helper_change.label(),
             rc_path.display(),
             rc_path.display()
         ),
@@ -49,6 +51,7 @@ fn ensure_starship_bash_init(emit_stages: bool) -> Result<()> {
 
 fn preview_starship_bash_init(emit_stages: bool) -> Result<()> {
     let rc_path = resolve_home_dir()?.join(".bashrc");
+    let helper_change = preview_ide_terminal_bash_helper(&rc_path)?;
     let change = preview_managed_block(
         &rc_path,
         STARSHIP_BASH_INIT_START_MARKER,
@@ -60,8 +63,9 @@ fn preview_starship_bash_init(emit_stages: bool) -> Result<()> {
         emit_stages,
         "next",
         format!(
-            "starship bash init would be {} in {}",
+            "starship bash init would be {} helper={} in {}",
             change.label(),
+            helper_change.label(),
             rc_path.display()
         ),
     );
@@ -77,6 +81,7 @@ fn resolve_home_dir() -> Result<PathBuf> {
 fn ensure_blesh_bash_init(home: &ToolHome, tool: &ToolRef, emit_stages: bool) -> Result<()> {
     let rc_path = resolve_home_dir()?.join(".bashrc");
     let active_path = home.active_path(&tool.name);
+    let helper_change = ensure_ide_terminal_bash_helper(&rc_path)?;
     let top_change = upsert_managed_block(
         &rc_path,
         BLESH_BASH_INIT_TOP_START_MARKER,
@@ -102,9 +107,10 @@ fn ensure_blesh_bash_init(home: &ToolHome, tool: &ToolRef, emit_stages: bool) ->
         emit_stages,
         "next",
         format!(
-            "ble.sh bash init top={} bottom={} in {}; open a new JetBrains bash shell or `source {}`",
+            "ble.sh bash init top={} bottom={} helper={} in {}; open a new JetBrains/Zed bash shell or `source {}`",
             top_change.label(),
             bottom_change.label(),
+            helper_change.label(),
             rc_path.display(),
             rc_path.display()
         ),
@@ -115,6 +121,7 @@ fn ensure_blesh_bash_init(home: &ToolHome, tool: &ToolRef, emit_stages: bool) ->
 fn preview_blesh_bash_init(home: &ToolHome, tool: &ToolRef, emit_stages: bool) -> Result<()> {
     let rc_path = resolve_home_dir()?.join(".bashrc");
     let active_path = home.active_path(&tool.name);
+    let helper_change = preview_ide_terminal_bash_helper(&rc_path)?;
     let top_change = preview_managed_block(
         &rc_path,
         BLESH_BASH_INIT_TOP_START_MARKER,
@@ -133,9 +140,10 @@ fn preview_blesh_bash_init(home: &ToolHome, tool: &ToolRef, emit_stages: bool) -
         emit_stages,
         "next",
         format!(
-            "ble.sh bash init would set top={} bottom={} in {}",
+            "ble.sh bash init would set top={} bottom={} helper={} in {}",
             top_change.label(),
             bottom_change.label(),
+            helper_change.label(),
             rc_path.display()
         ),
     );
@@ -165,15 +173,49 @@ pub(super) fn cleanup_post_uninstall_integrations(_home: &ToolHome, name: &str) 
     Ok(())
 }
 
+fn ensure_ide_terminal_bash_helper(rc_path: &Path) -> Result<ManagedFileChange> {
+    upsert_managed_block(
+        rc_path,
+        IDE_TERMINAL_BASH_HELPER_START_MARKER,
+        IDE_TERMINAL_BASH_HELPER_END_MARKER,
+        ManagedBlockPosition::Top,
+        ide_terminal_bash_helper_block(),
+    )
+    .with_context(|| {
+        format!(
+            "configure IDE terminal bash helper in `{}`",
+            rc_path.display()
+        )
+    })
+}
+
+fn preview_ide_terminal_bash_helper(rc_path: &Path) -> Result<ManagedFileChange> {
+    preview_managed_block(
+        rc_path,
+        IDE_TERMINAL_BASH_HELPER_START_MARKER,
+        IDE_TERMINAL_BASH_HELPER_END_MARKER,
+        ManagedBlockPosition::Top,
+        ide_terminal_bash_helper_block(),
+    )
+}
+
+pub(crate) fn ide_terminal_bash_helper_block() -> &'static str {
+    r#"_za_is_supported_ide_terminal() {
+  [ "${TERMINAL_EMULATOR-}" = "JetBrains-JediTerm" ] && return 0
+  [ "${ZED_TERM-}" = "true" ] && [ "${TERM_PROGRAM-}" = "zed" ] && return 0
+  return 1
+}"#
+}
+
 pub(crate) fn starship_bash_init_block() -> &'static str {
-    r#"if [ "${TERMINAL_EMULATOR-}" = "JetBrains-JediTerm" ]; then
+    r#"if _za_is_supported_ide_terminal; then
   command -v starship >/dev/null 2>&1 && eval "$(starship init bash)"
 fi"#
 }
 
 pub(crate) fn blesh_bash_init_top_block(active_path: &Path) -> String {
     format!(
-        r#"if [ "${{TERMINAL_EMULATOR-}}" = "JetBrains-JediTerm" ] && [[ $- == *i* ]]; then
+        r#"if _za_is_supported_ide_terminal && [[ $- == *i* ]]; then
   if source -- "{}" --attach=none; then
     bleopt prompt_command_changes_layout=1
     bleopt internal_suppress_bash_output=
@@ -184,7 +226,7 @@ fi"#,
 }
 
 pub(crate) fn blesh_bash_init_bottom_block() -> &'static str {
-    r#"if [ "${TERMINAL_EMULATOR-}" = "JetBrains-JediTerm" ] && [[ ${BLE_VERSION-} ]]; then
+    r#"if _za_is_supported_ide_terminal && [[ ${BLE_VERSION-} ]]; then
   VSCODE_INJECTION=1 ble-attach
 fi"#
 }
