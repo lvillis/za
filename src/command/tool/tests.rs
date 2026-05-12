@@ -7,14 +7,14 @@ use super::{
     BLESH_BASH_INIT_TOP_END_MARKER, BLESH_BASH_INIT_TOP_START_MARKER,
     IDE_TERMINAL_BASH_HELPER_END_MARKER, IDE_TERMINAL_BASH_HELPER_START_MARKER, InstallOutcome,
     InstallResult, LatestCheck, ManagedBlockPosition, ManagedFileChange,
-    STARSHIP_BASH_INIT_END_MARKER, STARSHIP_BASH_INIT_START_MARKER, ToolBatchKind,
-    ToolBatchSummary, ToolHome, ToolRef, ToolScope, ToolSpec, ToolUpdateChannel,
+    STARSHIP_BASH_INIT_END_MARKER, STARSHIP_BASH_INIT_START_MARKER, TOOL_UPDATE_CACHE_TTL_SECS,
+    ToolBatchKind, ToolBatchSummary, ToolHome, ToolRef, ToolScope, ToolSpec, ToolUpdateChannel,
     canonical_tool_name, cleanup_legacy_current_dir_artifacts, collect_managed_tool_names,
     command_candidates, extract_version_from_text, find_tool_policy, latest_check_progress_message,
     list_update_status, load_sync_specs_from_manifest, normalize_version,
     prune_non_active_versions, render_batch_summary, render_compact_batch_result,
     resolve_update_channel_request, source, starship_bash_init_block, supported_tool_names_csv,
-    upsert_managed_block,
+    tool_update_cache_entry_is_fresh, upsert_managed_block,
 };
 use std::{fs, time::Duration};
 
@@ -250,6 +250,22 @@ fn list_update_status_marks_latest_and_outdated() {
         list_update_status("0.104.0", &LatestCheck::Error("boom".to_string())),
         "check-failed"
     );
+}
+
+#[test]
+fn tool_update_cache_freshness_rejects_stale_and_future_entries() {
+    let now = TOOL_UPDATE_CACHE_TTL_SECS + 100;
+
+    assert!(tool_update_cache_entry_is_fresh(now, now));
+    assert!(tool_update_cache_entry_is_fresh(
+        now - TOOL_UPDATE_CACHE_TTL_SECS,
+        now
+    ));
+    assert!(!tool_update_cache_entry_is_fresh(now + 1, now));
+    assert!(!tool_update_cache_entry_is_fresh(
+        now - TOOL_UPDATE_CACHE_TTL_SECS - 1,
+        now
+    ));
 }
 
 #[test]

@@ -228,9 +228,7 @@ impl ToolUpdateCacheState {
 
     fn get_latest_if_fresh(&mut self, key: &str, now_unix_secs: u64) -> Option<String> {
         if let Some(entry) = self.data.latest_versions.get(key) {
-            if now_unix_secs.saturating_sub(entry.fetched_at_unix_secs)
-                <= TOOL_UPDATE_CACHE_TTL_SECS
-            {
+            if tool_update_cache_entry_is_fresh(entry.fetched_at_unix_secs, now_unix_secs) {
                 return Some(entry.latest_version.clone());
             }
             self.data.latest_versions.remove(key);
@@ -272,6 +270,16 @@ impl ToolUpdateCacheState {
         self.dirty = false;
         Ok(())
     }
+}
+
+pub(super) fn tool_update_cache_entry_is_fresh(
+    fetched_at_unix_secs: u64,
+    now_unix_secs: u64,
+) -> bool {
+    if fetched_at_unix_secs > now_unix_secs {
+        return false;
+    }
+    now_unix_secs - fetched_at_unix_secs <= TOOL_UPDATE_CACHE_TTL_SECS
 }
 
 #[derive(Debug)]

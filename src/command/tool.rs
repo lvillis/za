@@ -42,7 +42,9 @@ use self::listing::{
     show_catalog, show_tool,
 };
 #[cfg(test)]
-use self::listing::{latest_check_progress_message, list_update_status};
+use self::listing::{
+    latest_check_progress_message, list_update_status, tool_update_cache_entry_is_fresh,
+};
 use self::policy::{
     GithubReleasePolicy, PackagePolicy, ToolLayout, ToolPolicy,
     canonical_tool_name as canonical_tool_name_impl, find_tool_policy, supported_tool_names_csv,
