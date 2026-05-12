@@ -1,8 +1,23 @@
+## [0.1.67] - 2026-05-12
+
+### 🚀 Features
+
+- *(tool)* Add actionlint release policy
+- *(ide)* Improve remote backend diagnostics
+- *(tool)* Support Zed bash integrations
+
+### 🐛 Bug Fixes
+
+- *(tool)* Reject future-dated latest cache entries
 ## [0.1.66] - 2026-05-08
 
 ### 🚀 Features
 
 - *(codex)* Trim tmux statusline labels
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.66
 ## [0.1.65] - 2026-05-07
 
 ### ⚙️ Miscellaneous Tasks
