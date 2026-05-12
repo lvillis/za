@@ -9,6 +9,10 @@
 ### 🐛 Bug Fixes
 
 - *(tool)* Reject future-dated latest cache entries
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.67
 ## [0.1.66] - 2026-05-08
 
 ### 🚀 Features
