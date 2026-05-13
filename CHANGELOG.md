@@ -1,3 +1,13 @@
+## [0.1.69] - 2026-05-13
+
+### 🐛 Bug Fixes
+
+- Ci
+## [0.1.68] - 2026-05-12
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.68
 ## [0.1.67] - 2026-05-12
 
 ### 🚀 Features
