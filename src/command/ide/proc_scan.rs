@@ -334,7 +334,7 @@ fn resolve_heap_limit_bytes(executable: &str, ide_identity: Option<&str>) -> Opt
 
 fn read_heap_limit_bytes_from_vmoptions(path: &Path) -> Option<u64> {
     let raw = fs::read_to_string(path).ok()?;
-    raw.lines().filter_map(parse_xmx_bytes).last()
+    raw.lines().filter_map(parse_xmx_bytes).next_back()
 }
 
 pub(super) fn parse_xmx_bytes(line: &str) -> Option<u64> {
