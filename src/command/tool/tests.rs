@@ -725,6 +725,113 @@ fn ide_terminal_helper_is_inserted_before_tool_blocks() {
 }
 
 #[test]
+fn blesh_top_block_is_inserted_after_ide_terminal_helper() {
+    let root = std::env::temp_dir().join(format!(
+        "za-test-blesh-after-helper-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("create temp root");
+    let rc_path = root.join(".bashrc");
+    fs::write(&rc_path, "export PATH=/tmp\n").expect("write rc");
+
+    upsert_managed_block(
+        &rc_path,
+        IDE_TERMINAL_BASH_HELPER_START_MARKER,
+        IDE_TERMINAL_BASH_HELPER_END_MARKER,
+        ManagedBlockPosition::Top,
+        ide_terminal_bash_helper_block(),
+    )
+    .expect("insert helper");
+    upsert_managed_block(
+        &rc_path,
+        BLESH_BASH_INIT_TOP_START_MARKER,
+        BLESH_BASH_INIT_TOP_END_MARKER,
+        ManagedBlockPosition::AfterMarker(IDE_TERMINAL_BASH_HELPER_END_MARKER),
+        &blesh_bash_init_top_block(std::path::Path::new("/tmp/blesh/ble.sh")),
+    )
+    .expect("insert ble top");
+
+    let content = fs::read_to_string(&rc_path).expect("read rc");
+    let helper_index = content
+        .find(IDE_TERMINAL_BASH_HELPER_START_MARKER)
+        .expect("helper marker");
+    let top_index = content
+        .find(BLESH_BASH_INIT_TOP_START_MARKER)
+        .expect("ble top marker");
+    let path_index = content.find("export PATH=/tmp").expect("path line");
+
+    assert!(helper_index < top_index);
+    assert!(top_index < path_index);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn blesh_top_block_update_repairs_legacy_order_before_helper() {
+    let root = std::env::temp_dir().join(format!(
+        "za-test-blesh-reorder-helper-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("create temp root");
+    let rc_path = root.join(".bashrc");
+    fs::write(
+        &rc_path,
+        format!(
+            r#"{top_start}
+legacy ble top
+{top_end}
+
+{helper_start}
+{helper_body}
+{helper_end}
+
+export PATH=/tmp
+"#,
+            top_start = BLESH_BASH_INIT_TOP_START_MARKER,
+            top_end = BLESH_BASH_INIT_TOP_END_MARKER,
+            helper_start = IDE_TERMINAL_BASH_HELPER_START_MARKER,
+            helper_body = ide_terminal_bash_helper_block(),
+            helper_end = IDE_TERMINAL_BASH_HELPER_END_MARKER,
+        ),
+    )
+    .expect("write rc");
+
+    let change = upsert_managed_block(
+        &rc_path,
+        BLESH_BASH_INIT_TOP_START_MARKER,
+        BLESH_BASH_INIT_TOP_END_MARKER,
+        ManagedBlockPosition::AfterMarker(IDE_TERMINAL_BASH_HELPER_END_MARKER),
+        &blesh_bash_init_top_block(std::path::Path::new("/tmp/blesh/ble.sh")),
+    )
+    .expect("update ble top");
+
+    let content = fs::read_to_string(&rc_path).expect("read rc");
+    let helper_index = content
+        .find(IDE_TERMINAL_BASH_HELPER_START_MARKER)
+        .expect("helper marker");
+    let top_index = content
+        .find(BLESH_BASH_INIT_TOP_START_MARKER)
+        .expect("ble top marker");
+    let path_index = content.find("export PATH=/tmp").expect("path line");
+
+    assert_eq!(change, ManagedFileChange::Updated);
+    assert!(helper_index < top_index);
+    assert!(top_index < path_index);
+    assert_eq!(content.matches(BLESH_BASH_INIT_TOP_START_MARKER).count(), 1);
+    assert!(content.contains(r#"source -- "/tmp/blesh/ble.sh" --attach=none"#));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn starship_bash_init_is_inserted_before_blesh_attach_block() {
     let root = std::env::temp_dir().join(format!(
         "za-test-starship-before-blesh-{}-{}",

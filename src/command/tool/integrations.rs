@@ -86,7 +86,7 @@ fn ensure_blesh_bash_init(home: &ToolHome, tool: &ToolRef, emit_stages: bool) ->
         &rc_path,
         BLESH_BASH_INIT_TOP_START_MARKER,
         BLESH_BASH_INIT_TOP_END_MARKER,
-        ManagedBlockPosition::Top,
+        ManagedBlockPosition::AfterMarker(IDE_TERMINAL_BASH_HELPER_END_MARKER),
         &blesh_bash_init_top_block(&active_path),
     )
     .with_context(|| format!("configure ble.sh bash prelude in `{}`", rc_path.display()))?;
@@ -126,7 +126,7 @@ fn preview_blesh_bash_init(home: &ToolHome, tool: &ToolRef, emit_stages: bool) -
         &rc_path,
         BLESH_BASH_INIT_TOP_START_MARKER,
         BLESH_BASH_INIT_TOP_END_MARKER,
-        ManagedBlockPosition::Top,
+        ManagedBlockPosition::AfterMarker(IDE_TERMINAL_BASH_HELPER_END_MARKER),
         &blesh_bash_init_top_block(&active_path),
     )?;
     let bottom_change = preview_managed_block(
@@ -338,9 +338,33 @@ fn insert_managed_block(content: &str, block: &str, position: ManagedBlockPositi
     match position {
         ManagedBlockPosition::Top => format!("{block}\n\n{}\n", content.trim()),
         ManagedBlockPosition::Bottom => format!("{}\n\n{block}\n", content.trim_end()),
+        ManagedBlockPosition::AfterMarker(marker) => {
+            insert_managed_block_after_marker(content, block, marker)
+        }
         ManagedBlockPosition::BeforeMarker(marker) => {
             insert_managed_block_before_marker(content, block, marker)
         }
+    }
+}
+
+fn insert_managed_block_after_marker(content: &str, block: &str, marker: &str) -> String {
+    let trimmed = content.trim_end();
+    let Some(marker_start) = trimmed.find(marker) else {
+        return format!("{block}\n\n{trimmed}\n");
+    };
+    let marker_end = marker_start + marker.len();
+    let line_end = trimmed[marker_end..]
+        .find('\n')
+        .map(|offset| marker_end + offset + 1)
+        .unwrap_or(trimmed.len());
+
+    let prefix = trimmed[..line_end].trim_end_matches('\n');
+    let suffix = trimmed[line_end..].trim_start_matches('\n');
+    match (prefix.is_empty(), suffix.is_empty()) {
+        (true, true) => format!("{block}\n"),
+        (true, false) => format!("{block}\n\n{suffix}\n"),
+        (false, true) => format!("{prefix}\n\n{block}\n"),
+        (false, false) => format!("{prefix}\n\n{block}\n\n{suffix}\n"),
     }
 }
 

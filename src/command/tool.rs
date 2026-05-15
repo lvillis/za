@@ -709,6 +709,7 @@ impl ManagedFileChange {
 enum ManagedBlockPosition {
     Top,
     Bottom,
+    AfterMarker(&'static str),
     BeforeMarker(&'static str),
 }
 
