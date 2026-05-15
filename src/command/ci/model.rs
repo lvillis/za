@@ -131,6 +131,36 @@ pub(crate) struct CommitCiInspectReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub(crate) struct WorkflowJobLogReport {
+    pub(crate) job: WorkflowJobReport,
+    pub(crate) lines: Vec<String>,
+    pub(crate) omitted_lines: usize,
+    pub(crate) matched_error_lines: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) log_query_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct WorkflowLogReport {
+    pub(crate) run: WorkflowRunReport,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) jobs: Vec<WorkflowJobLogReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) job_query_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CommitCiLogReport {
+    pub(crate) repo: String,
+    pub(crate) sha: Option<String>,
+    pub(crate) selected_recent: bool,
+    pub(crate) line_limit: usize,
+    pub(crate) state: CiState,
+    pub(crate) summary: CiSummary,
+    pub(crate) workflows: Vec<WorkflowLogReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct CommitCiReport {
     pub(crate) repo: String,
     pub(crate) branch: Option<String>,
@@ -375,6 +405,83 @@ pub(crate) fn build_inspect_report(
     }
 }
 
+pub(crate) fn build_log_report(
+    client: &GitHubClient,
+    slug: &RepoSlug,
+    report: &CommitCiReport,
+    selected_recent: bool,
+    line_limit: usize,
+) -> CommitCiLogReport {
+    let selected_runs = report
+        .runs
+        .iter()
+        .filter(|run| matches!(run.state, CiState::Failed | CiState::Cancelled))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut workflows = Vec::with_capacity(selected_runs.len());
+
+    for run in selected_runs {
+        match client.fetch_workflow_jobs(slug, run.id) {
+            Ok(jobs) => {
+                let mut jobs = jobs
+                    .into_iter()
+                    .map(workflow_job_report)
+                    .filter(|job| matches!(job.state, CiState::Failed | CiState::Cancelled))
+                    .map(|job| {
+                        let (lines, omitted_lines, matched_error_lines, log_query_error) =
+                            match client.fetch_workflow_job_log(slug, job.id) {
+                                Ok(log) => {
+                                    let (lines, omitted_lines, matched_error_lines) =
+                                        select_log_lines(&log, line_limit);
+                                    (lines, omitted_lines, matched_error_lines, None)
+                                }
+                                Err(err) => (Vec::new(), 0, false, Some(err.to_string())),
+                            };
+                        WorkflowJobLogReport {
+                            job,
+                            lines,
+                            omitted_lines,
+                            matched_error_lines,
+                            log_query_error,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                jobs.sort_by(|a, b| {
+                    review_detail_priority(a.job.state)
+                        .cmp(&review_detail_priority(b.job.state))
+                        .then_with(|| a.job.name.cmp(&b.job.name))
+                });
+                workflows.push(WorkflowLogReport {
+                    run,
+                    jobs,
+                    job_query_error: None,
+                });
+            }
+            Err(err) => workflows.push(WorkflowLogReport {
+                run,
+                jobs: Vec::new(),
+                job_query_error: Some(err.to_string()),
+            }),
+        }
+    }
+
+    workflows.sort_by(|a, b| {
+        review_detail_priority(a.run.state)
+            .cmp(&review_detail_priority(b.run.state))
+            .then_with(|| a.run.name.cmp(&b.run.name))
+    });
+
+    CommitCiLogReport {
+        repo: report.repo.clone(),
+        sha: report.sha.clone(),
+        selected_recent,
+        line_limit,
+        state: report.state,
+        summary: report.summary.clone(),
+        workflows,
+    }
+}
+
 pub(crate) fn workflow_run_report(run: GitHubWorkflowRun) -> WorkflowRunReport {
     WorkflowRunReport {
         id: run.id,
@@ -610,4 +717,108 @@ pub(crate) fn normalize_ref(value: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+pub(crate) fn tail_log_lines(log: &str, line_limit: usize) -> (Vec<String>, usize) {
+    let mut lines = log
+        .lines()
+        .map(|line| line.trim_end_matches('\r').to_string())
+        .collect::<Vec<_>>();
+    let omitted = lines.len().saturating_sub(line_limit);
+    if omitted > 0 {
+        lines = lines.split_off(omitted);
+    }
+    (lines, omitted)
+}
+
+pub(crate) fn select_log_lines(log: &str, line_limit: usize) -> (Vec<String>, usize, bool) {
+    let lines = log
+        .lines()
+        .map(|line| line.trim_end_matches('\r').to_string())
+        .collect::<Vec<_>>();
+    if line_limit == 0 {
+        return (Vec::new(), lines.len(), false);
+    }
+
+    let mut selected_indexes = BTreeSet::new();
+    let mut has_primary_error = false;
+    for (index, line) in lines.iter().enumerate() {
+        if is_primary_error_log_line(line) {
+            has_primary_error = true;
+            let end = (index + 4).min(lines.len());
+            for selected in index..end {
+                selected_indexes.insert(selected);
+            }
+            continue;
+        }
+        if is_exit_status_log_line(line) {
+            if has_primary_error {
+                selected_indexes.insert(index);
+            } else {
+                let start = index.saturating_sub(2);
+                for selected in start..=index {
+                    selected_indexes.insert(selected);
+                }
+            }
+        }
+    }
+
+    if selected_indexes.is_empty() {
+        let (lines, omitted) = tail_log_lines(log, line_limit);
+        return (lines, omitted, false);
+    }
+
+    let mut selected = selected_indexes
+        .into_iter()
+        .filter_map(|index| lines.get(index).cloned())
+        .filter(|line| !is_selected_log_noise(line))
+        .collect::<Vec<_>>();
+    if selected.len() > line_limit {
+        selected.truncate(line_limit);
+    }
+    let omitted = lines.len().saturating_sub(selected.len());
+    (selected, omitted, true)
+}
+
+fn is_primary_error_log_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("::error")
+        || lower.contains(" error:")
+        || lower.contains("error:")
+        || lower.contains("error[")
+        || lower.contains("failed")
+        || lower.contains("fatal:")
+        || lower.contains("panicked at")
+        || lower.contains("could not compile")
+}
+
+fn is_exit_status_log_line(line: &str) -> bool {
+    line.to_ascii_lowercase()
+        .contains("process completed with exit code")
+}
+
+fn is_selected_log_noise(line: &str) -> bool {
+    let line = strip_github_log_timestamp(line).trim();
+    line.is_empty()
+        || line.starts_with("##[group]")
+        || line.starts_with("##[endgroup]")
+        || line.eq_ignore_ascii_case("Post job cleanup.")
+        || line.eq_ignore_ascii_case("Cleaning up orphan processes")
+        || line.starts_with("[command]")
+}
+
+pub(crate) fn strip_github_log_timestamp(line: &str) -> &str {
+    let Some((prefix, rest)) = line.split_once("Z ") else {
+        return line;
+    };
+    if prefix.len() <= 35
+        && prefix.len() >= 20
+        && prefix.contains('T')
+        && prefix.as_bytes().get(4) == Some(&b'-')
+        && prefix.as_bytes().get(7) == Some(&b'-')
+    {
+        rest
+    } else {
+        line
+    }
 }

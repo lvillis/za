@@ -13,7 +13,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail};
 use humantime::parse_rfc3339_weak;
 use reqx::{
-    advanced::ClientProfile,
+    advanced::{ClientProfile, RedirectPolicy},
     blocking::{Client, ClientBuilder},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -66,6 +66,12 @@ pub fn run(cmd: Option<CiCommands>, json: bool, github_token: Option<String>) ->
             json,
             github_token,
         }) => run_inspect(all, json, github_token),
+        Some(CiCommands::Logs {
+            recent,
+            lines,
+            json,
+            github_token,
+        }) => run_logs(recent, lines, json, github_token),
     }
 }
 
@@ -159,6 +165,41 @@ impl GitHubClient {
         self.fetch_commit_report_for_sha(slug, branch, Some(latest_sha), CiSourceKind::Repo, None)
     }
 
+    fn fetch_latest_failed_commit_report_for_repo(
+        &self,
+        slug: &RepoSlug,
+    ) -> Result<CommitCiReport> {
+        let recent = self.fetch_recent_workflow_runs(slug)?;
+        let Some(run) = recent.into_iter().find(|run| {
+            matches!(
+                workflow_run_state(run.status.as_deref(), run.conclusion.as_deref()),
+                CiState::Failed | CiState::Cancelled
+            )
+        }) else {
+            return Ok(CommitCiReport {
+                repo: slug.as_str(),
+                branch: None,
+                sha: None,
+                state: CiState::NoRuns,
+                summary: CiSummary::default(),
+                latest_update_at: None,
+                source: CiSourceKind::Repo,
+                source_path: None,
+                runs: Vec::new(),
+            });
+        };
+        let branch = normalize_owned(run.head_branch.clone());
+        let sha = normalize_ref(&run.head_sha);
+        Ok(build_commit_report(
+            slug,
+            branch,
+            sha,
+            CiSourceKind::Repo,
+            None,
+            vec![run],
+        ))
+    }
+
     fn fetch_commit_report_for_sha(
         &self,
         slug: &RepoSlug,
@@ -227,6 +268,20 @@ impl GitHubClient {
             .map(|resp: WorkflowJobsResponse| resp.jobs)
     }
 
+    fn fetch_workflow_job_log(&self, slug: &RepoSlug, job_id: u64) -> Result<String> {
+        let path = format!(
+            "/repos/{}/{}/actions/jobs/{job_id}/logs",
+            slug.owner, slug.repo
+        );
+        self.api_get_text(&path).with_context(|| {
+            format!(
+                "query GitHub Actions log for {} job {}",
+                slug.as_str(),
+                job_id
+            )
+        })
+    }
+
     fn api_get_json<T>(&self, path: &str) -> Result<T>
     where
         T: DeserializeOwned,
@@ -282,6 +337,49 @@ impl GitHubClient {
             .with_context(|| format!("parse GitHub API JSON from `{path}`"))?;
         self.cache_put(&cache_key, &body)?;
         Ok(parsed)
+    }
+
+    fn api_get_text(&self, path: &str) -> Result<String> {
+        let mut req = self.http.get(path);
+        req = req
+            .try_header("user-agent", HTTP_USER_AGENT)
+            .context("set GitHub user-agent")?;
+        req = req
+            .try_header("accept", "application/vnd.github+json")
+            .context("set GitHub accept header")?;
+        req = req
+            .try_header("x-github-api-version", GITHUB_API_VERSION)
+            .context("set GitHub API version header")?;
+        if let Some(token) = self.github_token.as_deref() {
+            req = req
+                .try_header("authorization", &format!("Bearer {token}"))
+                .context("set GitHub authorization header")?;
+        }
+
+        let response = req
+            .send_response()
+            .with_context(|| format!("request GitHub API `{path}`"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = text_render::truncate_end(&response.text_lossy(), 200);
+            if status.as_u16() == 403 {
+                if self.github_token.is_none() {
+                    bail!(
+                        "GitHub API returned 403 for `{path}`; set GITHUB_TOKEN, GH_TOKEN, or `za config set github-token <token>`. body: {body}"
+                    );
+                }
+                bail!("GitHub API returned 403 for `{path}`. body: {body}");
+            }
+            if status.as_u16() == 404 {
+                bail!("GitHub API returned 404 for `{path}`. body: {body}");
+            }
+            bail!(
+                "GitHub API returned status {} for `{path}`. body: {}",
+                status,
+                body
+            );
+        }
+        Ok(response.text_lossy().to_string())
     }
 
     fn cache_key(&self, path: &str) -> String {
@@ -551,6 +649,47 @@ fn run_inspect(all: bool, json: bool, github_token: Option<String>) -> Result<i3
     Ok(exit_code_for_state(report.state))
 }
 
+fn run_logs(
+    recent: bool,
+    line_limit: usize,
+    json: bool,
+    github_token: Option<String>,
+) -> Result<i32> {
+    if line_limit == 0 {
+        bail!("`--lines` must be greater than 0");
+    }
+
+    let client = GitHubClient::new(github_token, CiCacheMode::ReadWrite)?;
+    let cwd = env::current_dir()?;
+    let ctx = resolve_local_repo_context(&cwd)?;
+    let report = if recent {
+        client.fetch_latest_failed_commit_report_for_repo(&ctx.slug)?
+    } else {
+        client.fetch_commit_report_for_sha(
+            &ctx.slug,
+            ctx.branch.clone(),
+            Some(ctx.sha.clone()),
+            CiSourceKind::CurrentRepo,
+            Some(ctx.repo_path.display().to_string()),
+        )?
+    };
+    let logs = build_log_report(&client, &ctx.slug, &report, recent, line_limit);
+    client.flush_cache()?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&logs).context("serialize ci logs output")?
+        );
+        return Ok(exit_code_for_state(logs.state));
+    }
+
+    for line in render_log_report_lines(&logs) {
+        println!("{line}");
+    }
+    Ok(exit_code_for_state(logs.state))
+}
+
 fn resolve_list_targets(
     group: Option<String>,
     repos: Vec<String>,
@@ -755,6 +894,7 @@ fn default_ci_manifest_path() -> Result<PathBuf> {
 fn build_http_client(base_url: &str) -> Result<Client> {
     let mut builder = Client::builder(base_url)
         .profile(ClientProfile::StandardSdk)
+        .redirect_policy(RedirectPolicy::follow())
         .client_name("za-ci");
     let scheme = base_url
         .split_once("://")
@@ -873,11 +1013,12 @@ fn split_no_proxy_rules(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CiManifest, CiSourceKind, CiState, CommitCiInspectReport, CommitCiReport,
-        WorkflowInspectReport, WorkflowJobReport, WorkflowRunReport, aggregate_commit_state,
-        latest_head_sha, parse_owner_repo, parse_repo_slug, render_board_output_lines,
-        render_commit_report_lines, render_inspect_report_lines, render_watch_update_lines,
-        workflow_run_state,
+        CiManifest, CiSourceKind, CiState, CommitCiInspectReport, CommitCiLogReport,
+        CommitCiReport, WorkflowInspectReport, WorkflowJobLogReport, WorkflowJobReport,
+        WorkflowLogReport, WorkflowRunReport, aggregate_commit_state, latest_head_sha,
+        parse_owner_repo, parse_repo_slug, render_board_output_lines, render_commit_report_lines,
+        render_inspect_report_lines, render_log_report_lines, render_watch_update_lines,
+        select_log_lines, strip_github_log_timestamp, tail_log_lines, workflow_run_state,
     };
 
     #[test]
@@ -1399,5 +1540,101 @@ repos = ["openai/codex", "/code/za"]
         assert!(output.contains("cargo test"));
         assert!(output.contains("actions/runs/1"));
         assert!(output.contains("job/11"));
+    }
+
+    #[test]
+    fn tail_log_lines_keeps_only_requested_suffix() {
+        let (lines, omitted) = tail_log_lines("one\ntwo\nthree\n", 2);
+        assert_eq!(omitted, 1);
+        assert_eq!(lines, vec!["two".to_string(), "three".to_string()]);
+    }
+
+    #[test]
+    fn select_log_lines_prefers_error_context_over_cleanup_tail() {
+        let raw = "\
+setup
+Run cargo build
+error: unexpected argument `build` found
+Usage: rustup-init [OPTIONS]
+Post job cleanup.
+Cleaning up orphan processes
+";
+        let (lines, omitted, matched_error_lines) = select_log_lines(raw, 3);
+        assert!(matched_error_lines);
+        assert_eq!(omitted, 4);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("unexpected argument"))
+        );
+        assert!(!lines.iter().any(|line| line.contains("Post job cleanup")));
+        assert!(!lines.iter().any(|line| line.contains("orphan processes")));
+    }
+
+    #[test]
+    fn strip_github_log_timestamp_removes_actions_prefix_for_text_rendering() {
+        assert_eq!(
+            strip_github_log_timestamp("2026-05-15T08:29:02.6669970Z error: failed"),
+            "error: failed"
+        );
+        assert_eq!(strip_github_log_timestamp("plain error"), "plain error");
+    }
+
+    #[test]
+    fn render_log_report_lines_show_failed_job_tail() {
+        let report = CommitCiLogReport {
+            repo: "lvillis/za".to_string(),
+            sha: Some("15ff429123456789".to_string()),
+            selected_recent: false,
+            line_limit: 2,
+            state: CiState::Failed,
+            summary: super::CiSummary {
+                failed: 1,
+                ..Default::default()
+            },
+            workflows: vec![WorkflowLogReport {
+                run: WorkflowRunReport {
+                    id: 1,
+                    name: "release".to_string(),
+                    event: Some("push".to_string()),
+                    state: CiState::Failed,
+                    status: Some("completed".to_string()),
+                    conclusion: Some("failure".to_string()),
+                    run_attempt: Some(1),
+                    updated_at: Some("2026-03-09T00:00:00Z".to_string()),
+                    html_url: Some("https://github.com/lvillis/za/actions/runs/1".to_string()),
+                },
+                jobs: vec![WorkflowJobLogReport {
+                    job: WorkflowJobReport {
+                        id: 11,
+                        name: "preflight".to_string(),
+                        state: CiState::Failed,
+                        status: Some("completed".to_string()),
+                        conclusion: Some("failure".to_string()),
+                        html_url: Some(
+                            "https://github.com/lvillis/za/actions/runs/1/job/11".to_string(),
+                        ),
+                        attention_steps: vec!["build".to_string()],
+                    },
+                    lines: vec![
+                        "failed to run git".to_string(),
+                        "fatal: not a git repository".to_string(),
+                    ],
+                    omitted_lines: 4,
+                    matched_error_lines: true,
+                    log_query_error: None,
+                }],
+                job_query_error: None,
+            }],
+        };
+
+        let output = render_log_report_lines(&report).join("\n");
+        assert!(output.contains("FAIL"));
+        assert!(output.contains("1 job log"));
+        assert!(output.contains("release"));
+        assert!(output.contains("preflight"));
+        assert!(output.contains("4 other lines omitted"));
+        assert!(output.contains("failed to run git"));
+        assert!(output.contains("fatal: not a git repository"));
     }
 }

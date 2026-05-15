@@ -136,6 +136,7 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: false
           workspaces: ". -> target"
 
       - name: Setup native compilation
@@ -165,7 +166,7 @@ jobs:
           if [ "${{ matrix.use-cross }}" = "true" ]; then
             cross build --release --locked --target ${{ matrix.target }}
           else
-            cargo build --release --locked --target ${{ matrix.target }}
+            rustup run stable cargo build --release --locked --target ${{ matrix.target }}
           fi
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             echo "BIN_NAME=${{ env.PROJECT }}.exe" >> "$GITHUB_ENV"

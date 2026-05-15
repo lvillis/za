@@ -917,6 +917,21 @@ pub enum CiCommands {
         #[arg(long, value_name = "TOKEN")]
         github_token: Option<String>,
     },
+    /// Show failure-focused GitHub Actions job logs for the current commit
+    Logs {
+        /// Inspect the latest failed workflow run in this repo instead of the current commit.
+        #[arg(long)]
+        recent: bool,
+        /// Number of selected log lines to show per failed job.
+        #[arg(long, default_value_t = 120, value_name = "N")]
+        lines: usize,
+        /// Print JSON output for scripting.
+        #[arg(long)]
+        json: bool,
+        /// Optional GitHub token override for this run.
+        #[arg(long, value_name = "TOKEN")]
+        github_token: Option<String>,
+    },
 }
 
 /// `za gh` sub-commands
@@ -1805,6 +1820,30 @@ mod tests {
                 assert!(repo.is_empty());
                 assert!(file.is_none());
             }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn gh_ci_logs_parses_recent_lines_and_json_flags() {
+        let cli = Cli::try_parse_from([
+            "za", "gh", "ci", "logs", "--recent", "--lines", "40", "--json",
+        ])
+        .expect("must parse");
+        match cli.cmd {
+            Commands::Gh {
+                cmd:
+                    GhCommands::Ci {
+                        cmd:
+                            Some(CiCommands::Logs {
+                                recent: true,
+                                lines: 40,
+                                json: true,
+                                github_token: None,
+                            }),
+                        ..
+                    },
+            } => {}
             _ => panic!("unexpected command"),
         }
     }

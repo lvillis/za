@@ -321,6 +321,119 @@ pub(crate) fn render_inspect_report_lines(report: &CommitCiInspectReport) -> Vec
     lines
 }
 
+pub(crate) fn render_log_report_lines(report: &CommitCiLogReport) -> Vec<String> {
+    let sha = report
+        .sha
+        .as_deref()
+        .map(short_sha)
+        .unwrap_or_else(|| "-".to_string());
+    let job_count = report
+        .workflows
+        .iter()
+        .map(|workflow| workflow.jobs.len())
+        .sum::<usize>();
+    let mut lines = vec![format!(
+        "{} {}  {}  {} {}",
+        style_ci_badge(report.state, 5),
+        tty_style::header(&report.repo),
+        tty_style::dim(sha),
+        tty_style::header(job_count.to_string()),
+        tty_style::dim(if job_count == 1 {
+            "job log"
+        } else {
+            "job logs"
+        })
+    )];
+
+    if report.workflows.is_empty() {
+        lines.push(tty_style::dim(if report.selected_recent {
+            "No recent failed or cancelled workflow runs found."
+        } else {
+            "No failed or cancelled workflow logs for this commit."
+        }));
+        return lines;
+    }
+
+    lines.push(tty_style::header("logs"));
+    for workflow in &report.workflows {
+        lines.push(format!(
+            "  {} {}",
+            style_ci_badge(workflow.run.state, 5),
+            style_ci_subject(
+                &text_render::truncate_end(&workflow.run.name, 92),
+                workflow.run.state
+            )
+        ));
+        if let Some(url) = &workflow.run.html_url {
+            lines.push(format!(
+                "    {} {}",
+                tty_style::dim("url"),
+                tty_style::dim(url)
+            ));
+        }
+        if let Some(err) = &workflow.job_query_error {
+            lines.push(format!(
+                "    {} {}",
+                tty_style::warning("jobs"),
+                text_render::truncate_end(err, 120)
+            ));
+            continue;
+        }
+        if workflow.jobs.is_empty() {
+            lines.push(format!(
+                "    {} {}",
+                tty_style::dim("jobs"),
+                tty_style::dim("no failed or cancelled jobs")
+            ));
+            continue;
+        }
+        for job in &workflow.jobs {
+            lines.push(format!(
+                "    {} {}",
+                style_ci_badge(job.job.state, 5),
+                style_ci_subject(&text_render::truncate_end(&job.job.name, 88), job.job.state)
+            ));
+            if let Some(url) = &job.job.html_url {
+                lines.push(format!(
+                    "      {} {}",
+                    tty_style::dim("url"),
+                    tty_style::dim(url)
+                ));
+            }
+            if let Some(err) = &job.log_query_error {
+                lines.push(format!(
+                    "      {} {}",
+                    tty_style::warning("log"),
+                    text_render::truncate_end(err, 120)
+                ));
+                continue;
+            }
+            if job.omitted_lines > 0 {
+                let omitted_label = if job.matched_error_lines {
+                    "other"
+                } else {
+                    "earlier"
+                };
+                lines.push(format!(
+                    "      {} {} {} line{} omitted",
+                    tty_style::dim("..."),
+                    job.omitted_lines,
+                    omitted_label,
+                    text_render::pluralize(job.omitted_lines, "", "s")
+                ));
+            }
+            for log_line in &job.lines {
+                lines.push(format!(
+                    "      | {}",
+                    text_render::truncate_end(strip_github_log_timestamp(log_line), 180)
+                ));
+            }
+        }
+    }
+
+    lines
+}
+
 pub(crate) fn ordered_review_runs(runs: &[WorkflowRunReport]) -> Vec<&WorkflowRunReport> {
     let mut runs = runs.iter().collect::<Vec<_>>();
     runs.sort_by(|a, b| {
