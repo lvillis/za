@@ -1,9 +1,18 @@
+## [0.1.71] - 2026-05-15
+
+### 🐛 Bug Fixes
+
+- Ci
 ## [0.1.70] - 2026-05-15
 
 ### 🐛 Bug Fixes
 
 - *(tool)* Keep IDE terminal helper before ble.sh init
 - *(tool)* Suggest closest supported tool name
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.70
 ## [0.1.69] - 2026-05-13
 
 ### 🐛 Bug Fixes
