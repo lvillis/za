@@ -144,7 +144,6 @@ jobs:
         run: |
           rustup target add ${{ matrix.target }}
           rustup target list --installed
-          echo "CARGO=cargo" >> "$GITHUB_ENV"
 
       - name: Setup cross compilation
         if: ${{ matrix.use-cross == true }}
@@ -157,15 +156,17 @@ jobs:
           curl -LSf --retry 3 --retry-delay 2 --retry-connrefused -o cross.tar.gz \
             https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-musl.tar.gz
           tar xf cross.tar.gz
-          echo "CARGO=cross" >> "$GITHUB_ENV"
           echo "RUSTFLAGS=--cfg ${{ env.PROJECT }}" >> "$GITHUB_ENV"
           echo "TARGET_DIR=./target/${{ matrix.target }}" >> "$GITHUB_ENV"
 
       - name: Build
         shell: bash
         run: |
-          : "${CARGO:=cargo}"
-          $CARGO build --release --locked --target ${{ matrix.target }}
+          if [ "${{ matrix.use-cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             echo "BIN_NAME=${{ env.PROJECT }}.exe" >> "$GITHUB_ENV"
           else
