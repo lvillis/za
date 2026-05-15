@@ -54,12 +54,14 @@ pub(super) struct CodexStopOutput {
     pub(super) stopped: bool,
     pub(super) metadata_removed: bool,
     pub(super) tmux_available: bool,
+    pub(super) empty_tmux_server_stopped: bool,
     pub(super) note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub(super) struct CodexStopAllOutput {
     pub(super) tmux_available: bool,
+    pub(super) empty_tmux_server_stopped: bool,
     pub(super) sessions: Vec<CodexStopOutput>,
 }
 

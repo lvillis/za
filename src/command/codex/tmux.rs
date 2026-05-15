@@ -21,6 +21,8 @@ const TMUX_CODEX_LOC_CACHE_TTL_SECS: &str = "60";
 const TMUX_CODEX_STATUS_DIR: &str = "codex-status";
 const TMUX_CODEX_STATUS_WIDTH: usize = 72;
 const TMUX_CODEX_PRIMARY_WINDOW_NAME: &str = "work";
+const TMUX_CODEX_SERVER_BOOTSTRAP_PREFIX: &str = "codex-server-bootstrap";
+const TMUX_CODEX_SERVER_BOOTSTRAP_COMMAND: &str = "sleep 60";
 const TMUX_CODEX_STATUS_HELPER_SCRIPT: &str = r#"#!/bin/sh
 root=$1
 cache=$2
@@ -518,6 +520,7 @@ pub(super) fn tmux_panes_include_listener_endpoint(output: &str, endpoint: &str)
 }
 
 pub(super) fn tmux_new_session(session_name: &str, cwd: &Path, command: &str) -> Result<()> {
+    let bootstrap_session = tmux_start_neutral_server_if_needed()?;
     let output = Command::new("tmux")
         .arg("new-session")
         .arg("-d")
@@ -529,13 +532,62 @@ pub(super) fn tmux_new_session(session_name: &str, cwd: &Path, command: &str) ->
         .output()
         .with_context(|| format!("create tmux session `{session_name}`"))?;
     if !output.status.success() {
+        tmux_cleanup_bootstrap_session(bootstrap_session.as_deref());
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = tmux_kill_server_if_empty();
         bail!(
             "Could not start Codex session `{session_name}`: {}",
             tmux_failure_detail(&stderr)
         );
     }
+    tmux_cleanup_bootstrap_session(bootstrap_session.as_deref());
     Ok(())
+}
+
+fn tmux_start_neutral_server_if_needed() -> Result<Option<String>> {
+    if !list_tmux_sessions()?.is_empty() {
+        return Ok(None);
+    }
+
+    tmux_kill_server_if_empty()?;
+
+    let session_name = tmux_neutral_server_bootstrap_session_name();
+    let output = Command::new("tmux")
+        .arg("new-session")
+        .arg("-d")
+        .arg("-s")
+        .arg(&session_name)
+        .arg("-c")
+        .arg(env::temp_dir())
+        .arg(TMUX_CODEX_SERVER_BOOTSTRAP_COMMAND)
+        .output()
+        .context("start neutral tmux server")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "Could not start neutral tmux server: {}",
+            tmux_failure_detail(&stderr)
+        );
+    }
+    Ok(Some(session_name))
+}
+
+fn tmux_neutral_server_bootstrap_session_name() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    format!(
+        "{}-{}-{now}",
+        TMUX_CODEX_SERVER_BOOTSTRAP_PREFIX,
+        process::id()
+    )
+}
+
+fn tmux_cleanup_bootstrap_session(session_name: Option<&str>) {
+    if let Some(session_name) = session_name {
+        let _ = tmux_kill_session(session_name);
+    }
 }
 
 pub(super) fn tmux_new_window(
@@ -586,6 +638,29 @@ pub(super) fn tmux_kill_session(session_name: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub(super) fn tmux_kill_server_if_empty() -> Result<bool> {
+    if !list_tmux_sessions()?.is_empty() {
+        return Ok(false);
+    }
+
+    let output = Command::new("tmux")
+        .arg("kill-server")
+        .output()
+        .context("stop empty tmux server")?;
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if is_tmux_no_server(&stderr) {
+        return Ok(false);
+    }
+    bail!(
+        "Could not stop empty tmux server: {}",
+        tmux_failure_detail(&stderr)
+    )
 }
 
 pub(super) fn maybe_attach_or_report(

@@ -338,6 +338,7 @@ fn run_stop(json: bool, all: bool) -> Result<i32> {
             if session_running {
                 tmux_kill_session(&ctx.session_name)?;
             }
+            let empty_tmux_server_stopped = tmux_kill_server_if_empty()?;
             remove_session_record(&ctx.metadata_path)?;
             CodexStopOutput {
                 session_name: ctx.session_name,
@@ -345,6 +346,7 @@ fn run_stop(json: bool, all: bool) -> Result<i32> {
                 stopped: session_running,
                 metadata_removed: metadata_present,
                 tmux_available: true,
+                empty_tmux_server_stopped,
                 note: (!session_running).then_some("no running tmux session was found".to_string()),
             }
         }
@@ -356,6 +358,7 @@ fn run_stop(json: bool, all: bool) -> Result<i32> {
                 stopped: false,
                 metadata_removed: metadata_present,
                 tmux_available: false,
+                empty_tmux_server_stopped: false,
                 note: Some(
                     "`tmux` is not installed; removed local session metadata only".to_string(),
                 ),
@@ -389,17 +392,26 @@ fn run_stop_all(json: bool) -> Result<i32> {
         .collect::<BTreeMap<_, _>>();
     let target_names = stop_target_session_names(&record_by_name, &tmux_sessions);
     if target_names.is_empty() {
+        let empty_tmux_server_stopped = if tmux_available {
+            tmux_kill_server_if_empty()?
+        } else {
+            false
+        };
         if json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&CodexStopAllOutput {
                     tmux_available,
+                    empty_tmux_server_stopped,
                     sessions: Vec::new(),
                 })
                 .context("serialize codex stop --all output")?
             );
         } else {
-            println!("{}", render_stop_all_empty_message(tmux_available));
+            println!(
+                "{}",
+                render_stop_all_empty_message(tmux_available, empty_tmux_server_stopped)
+            );
         }
         return Ok(0);
     }
@@ -430,6 +442,7 @@ fn run_stop_all(json: bool) -> Result<i32> {
                 stopped: session_running,
                 metadata_removed,
                 tmux_available: true,
+                empty_tmux_server_stopped: false,
                 note: (!session_running).then_some("no running tmux session was found".to_string()),
             }
         } else {
@@ -439,6 +452,7 @@ fn run_stop_all(json: bool) -> Result<i32> {
                 stopped: false,
                 metadata_removed,
                 tmux_available: false,
+                empty_tmux_server_stopped: false,
                 note: Some(
                     "`tmux` is not installed; removed local session metadata only".to_string(),
                 ),
@@ -447,11 +461,18 @@ fn run_stop_all(json: bool) -> Result<i32> {
         outputs.push(output);
     }
 
+    let empty_tmux_server_stopped = if tmux_available {
+        tmux_kill_server_if_empty()?
+    } else {
+        false
+    };
+
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&CodexStopAllOutput {
                 tmux_available,
+                empty_tmux_server_stopped,
                 sessions: outputs,
             })
             .context("serialize codex stop --all output")?
@@ -459,6 +480,9 @@ fn run_stop_all(json: bool) -> Result<i32> {
     } else {
         for output in &outputs {
             println!("{}", render_stop_message(output));
+        }
+        if empty_tmux_server_stopped {
+            println!("Removed empty tmux server.");
         }
     }
     Ok(0)
@@ -591,7 +615,10 @@ fn no_managed_sessions_message(tmux_available: bool, all: bool) -> String {
     "No Codex session for the current workspace. (`tmux` is unavailable, so only local records were checked.) Use `za codex ps -a` to show sessions from other workspaces.".to_string()
 }
 
-fn render_stop_all_empty_message(tmux_available: bool) -> String {
+fn render_stop_all_empty_message(tmux_available: bool, empty_tmux_server_stopped: bool) -> String {
+    if empty_tmux_server_stopped {
+        return "All Codex sessions are already stopped; removed empty tmux server.".to_string();
+    }
     if tmux_available {
         return "All Codex sessions are already stopped.".to_string();
     }
@@ -612,8 +639,16 @@ fn stop_target_session_names(
 }
 
 fn render_stop_message(output: &CodexStopOutput) -> String {
+    let empty_server_suffix = if output.empty_tmux_server_stopped {
+        " Removed empty tmux server."
+    } else {
+        ""
+    };
     if output.stopped {
-        return format!("Stopped Codex session `{}`.", output.session_name);
+        return format!(
+            "Stopped Codex session `{}`.{}",
+            output.session_name, empty_server_suffix
+        );
     }
     if !output.tmux_available {
         if output.metadata_removed {
@@ -629,11 +664,11 @@ fn render_stop_message(output: &CodexStopOutput) -> String {
     }
     if output.metadata_removed {
         return format!(
-            "Codex session `{}` is stopped; cleaned local record.",
-            output.session_name
+            "Codex session `{}` is stopped; cleaned local record.{}",
+            output.session_name, empty_server_suffix
         );
     }
-    "Codex session is already stopped.".to_string()
+    format!("Codex session is already stopped.{empty_server_suffix}")
 }
 
 fn next_exec_window_name() -> String {
@@ -989,11 +1024,15 @@ mod tests {
     #[test]
     fn stop_all_empty_message_is_idempotent() {
         assert_eq!(
-            render_stop_all_empty_message(true),
+            render_stop_all_empty_message(true, false),
             "All Codex sessions are already stopped."
         );
         assert_eq!(
-            render_stop_all_empty_message(false),
+            render_stop_all_empty_message(true, true),
+            "All Codex sessions are already stopped; removed empty tmux server."
+        );
+        assert_eq!(
+            render_stop_all_empty_message(false, false),
             "All Codex sessions are already stopped. (`tmux` is unavailable, so only local records were checked.)"
         );
     }
@@ -1014,6 +1053,7 @@ mod tests {
             stopped: false,
             metadata_removed: true,
             tmux_available: false,
+            empty_tmux_server_stopped: false,
             note: Some("`tmux` is not installed; removed local session metadata only".to_string()),
         });
         assert_eq!(
@@ -1030,11 +1070,29 @@ mod tests {
             stopped: false,
             metadata_removed: true,
             tmux_available: true,
+            empty_tmux_server_stopped: false,
             note: Some("no running tmux session was found".to_string()),
         });
         assert_eq!(
             message,
             "Codex session `za-codex-tier-rs-b2e778148163` is stopped; cleaned local record."
+        );
+    }
+
+    #[test]
+    fn render_stop_message_reports_empty_tmux_server_cleanup() {
+        let message = render_stop_message(&CodexStopOutput {
+            session_name: "za-codex-tier-rs-b2e778148163".to_string(),
+            workspace_root: "/opt/app/tier-rs".to_string(),
+            stopped: false,
+            metadata_removed: true,
+            tmux_available: true,
+            empty_tmux_server_stopped: true,
+            note: Some("no running tmux session was found".to_string()),
+        });
+        assert_eq!(
+            message,
+            "Codex session `za-codex-tier-rs-b2e778148163` is stopped; cleaned local record. Removed empty tmux server."
         );
     }
 
@@ -1046,6 +1104,7 @@ mod tests {
             stopped: false,
             metadata_removed: false,
             tmux_available: true,
+            empty_tmux_server_stopped: false,
             note: None,
         });
         assert_eq!(message, "Codex session is already stopped.");
