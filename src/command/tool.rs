@@ -1516,6 +1516,58 @@ pub(crate) fn canonical_tool_name(name: &str) -> String {
     canonical_tool_name_impl(name)
 }
 
+fn canonical_supported_tool_name(name: &str) -> Result<String> {
+    find_tool_policy(name)
+        .map(|policy| policy.canonical_name.to_string())
+        .ok_or_else(|| anyhow!(unsupported_tool_message(name)))
+}
+
+fn unsupported_tool_message(name: &str) -> String {
+    match closest_supported_tool_name(name) {
+        Some(suggestion) => format!("unsupported tool `{name}`; did you mean `{suggestion}`?"),
+        None => format!("unsupported tool `{name}`; run `za tool ls --supported` to list tools"),
+    }
+}
+
+fn closest_supported_tool_name(name: &str) -> Option<&'static str> {
+    let needle = name.to_ascii_lowercase();
+    let mut best = None::<(&'static str, usize)>;
+
+    for policy in tool_policies() {
+        for candidate in policy.supported_names() {
+            let distance = levenshtein_ascii(&needle, &candidate.to_ascii_lowercase());
+            if best.is_none_or(|(_, best_distance)| distance < best_distance) {
+                best = Some((candidate, distance));
+            }
+        }
+    }
+
+    let threshold = match needle.len() {
+        0..=4 => 1,
+        5..=8 => 2,
+        _ => 3,
+    };
+    best.and_then(|(candidate, distance)| (distance <= threshold).then_some(candidate))
+}
+
+fn levenshtein_ascii(left: &str, right: &str) -> usize {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let mut prev = (0..=right.len()).collect::<Vec<_>>();
+    let mut curr = vec![0; right.len() + 1];
+
+    for (i, left_byte) in left.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, right_byte) in right.iter().enumerate() {
+            let cost = usize::from(left_byte != right_byte);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    prev[right.len()]
+}
+
 fn tool_layout_for_name(name: &str) -> ToolLayout {
     find_tool_policy(name)
         .map(|policy| policy.layout)

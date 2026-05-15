@@ -11,10 +11,11 @@ use super::{
     ToolBatchKind, ToolBatchSummary, ToolHome, ToolRef, ToolScope, ToolSpec, ToolUpdateChannel,
     canonical_tool_name, cleanup_legacy_current_dir_artifacts, collect_managed_tool_names,
     command_candidates, extract_version_from_text, find_tool_policy, latest_check_progress_message,
-    list_update_status, load_sync_specs_from_manifest, normalize_version,
-    prune_non_active_versions, render_batch_summary, render_compact_batch_result,
-    resolve_update_channel_request, source, starship_bash_init_block, supported_tool_names_csv,
-    tool_update_cache_entry_is_fresh, upsert_managed_block,
+    list_update_status, load_sync_specs_from_manifest, normalize_requested_tool_names,
+    normalize_version, prune_non_active_versions, render_batch_summary,
+    render_compact_batch_result, resolve_update_channel_request, source, starship_bash_init_block,
+    supported_tool_names_csv, tool_update_cache_entry_is_fresh, unsupported_tool_message,
+    upsert_managed_block,
 };
 use std::{fs, time::Duration};
 
@@ -600,6 +601,26 @@ fn supported_tool_names_csv_contains_all_aliases() {
     assert!(csv.contains("cross"));
     assert!(csv.contains("ble.sh"));
     assert!(csv.contains("blesh"));
+}
+
+#[test]
+fn unsupported_tool_message_suggests_nearest_supported_name() {
+    let message = unsupported_tool_message("startship");
+
+    assert!(message.contains("unsupported tool `startship`"));
+    assert!(message.contains("did you mean `starship`?"));
+    assert!(!message.contains("supported tools:"));
+}
+
+#[test]
+fn normalize_requested_tool_names_rejects_unknown_names_with_suggestion() {
+    let err = normalize_requested_tool_names(&["startship".to_string()])
+        .expect_err("unknown tool must fail");
+
+    let message = err.to_string();
+    assert!(message.contains("unsupported tool `startship`"));
+    assert!(message.contains("did you mean `starship`?"));
+    assert!(!message.contains("supported tools:"));
 }
 
 #[test]

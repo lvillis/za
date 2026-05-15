@@ -148,10 +148,7 @@ pub(super) fn resolve_requested_version(
     }
 
     let Some(policy) = find_tool_policy(name) else {
-        bail!(
-            "latest version resolution is not defined for `{name}`. supported tools: {}",
-            supported_tool_names_csv()
-        );
+        bail!("{}", unsupported_tool_message(name));
     };
     let Some(release) = policy.github_release else {
         bail!("latest version resolution is not defined for `{name}`");
@@ -166,11 +163,7 @@ pub(super) fn resolve_install_source(
     ensure_not_interrupted()?;
 
     let Some(policy) = find_tool_policy(&tool.name) else {
-        bail!(
-            "unsupported tool `{}`: no built-in source policy. currently supported: {}",
-            tool.name,
-            supported_tool_names_csv()
-        );
+        bail!("{}", unsupported_tool_message(&tool.name));
     };
 
     let mut errors = Vec::new();
@@ -202,11 +195,7 @@ pub(super) fn preview_install_source(
     ensure_not_interrupted()?;
 
     let Some(policy) = find_tool_policy(&tool.name) else {
-        bail!(
-            "unsupported tool `{}`: no built-in source policy. currently supported: {}",
-            tool.name,
-            supported_tool_names_csv()
-        );
+        bail!("{}", unsupported_tool_message(&tool.name));
     };
 
     let mut errors = Vec::new();

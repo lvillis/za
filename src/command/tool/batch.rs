@@ -506,7 +506,7 @@ pub(super) fn normalize_requested_tool_names(names: &[String]) -> Result<Vec<Str
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for name in names {
-        let canonical = canonical_tool_name(&ToolSpec::from_args(name, None)?.name);
+        let canonical = canonical_supported_tool_name(&ToolSpec::from_args(name, None)?.name)?;
         if seen.insert(canonical.clone()) {
             out.push(canonical);
         }
@@ -562,7 +562,8 @@ pub(crate) fn load_sync_specs_from_manifest(file: &Path) -> Result<Vec<String>> 
 
         let mut parsed = ToolSpec::parse(trimmed)
             .with_context(|| format!("parse sync spec `{trimmed}` in {}", file.display()))?;
-        parsed.name = canonical_tool_name(&parsed.name);
+        parsed.name = canonical_supported_tool_name(&parsed.name)
+            .with_context(|| format!("validate sync spec `{trimmed}` in {}", file.display()))?;
 
         let spec = match parsed.version {
             Some(version) => format!("{}:{}", parsed.name, version),
