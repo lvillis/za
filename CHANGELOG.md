@@ -1,8 +1,17 @@
+## [0.1.73] - 2026-05-15
+
+### 🐛 Bug Fixes
+
+- *(codex)* Prevent stale tmux server state from exposing workspace args
 ## [0.1.72] - 2026-05-15
 
 ### 🚀 Features
 
 - Add GitHub Actions failure log lookup
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.72
 ## [0.1.71] - 2026-05-15
 
 ### 🐛 Bug Fixes
