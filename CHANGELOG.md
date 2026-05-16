@@ -1,8 +1,22 @@
+## [0.1.74] - 2026-05-16
+
+### 🚀 Features
+
+- *(deps)* Surface dependency update plans in audits
+
+### 🐛 Bug Fixes
+
+- *(command)* Harden state persistence and session cleanup
+- Harden temp cleanup and IDE directory scans
 ## [0.1.73] - 2026-05-15
 
 ### 🐛 Bug Fixes
 
 - *(codex)* Prevent stale tmux server state from exposing workspace args
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.73
 ## [0.1.72] - 2026-05-15
 
 ### 🚀 Features
