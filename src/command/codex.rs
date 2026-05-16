@@ -7,7 +7,7 @@ mod top;
 use self::session_state::*;
 use self::tmux::*;
 use self::top::*;
-use crate::cli::CodexCommands;
+use crate::{cli::CodexCommands, command::write_file_atomically};
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -338,8 +338,8 @@ fn run_stop(json: bool, all: bool) -> Result<i32> {
             if session_running {
                 tmux_kill_session(&ctx.session_name)?;
             }
-            let empty_tmux_server_stopped = tmux_kill_server_if_empty()?;
             remove_session_record(&ctx.metadata_path)?;
+            let empty_tmux_server_stopped = tmux_kill_server_if_empty()?;
             CodexStopOutput {
                 session_name: ctx.session_name,
                 workspace_root: ctx.workspace_root.display().to_string(),
@@ -419,44 +419,34 @@ fn run_stop_all(json: bool) -> Result<i32> {
     let mut outputs = Vec::with_capacity(target_names.len());
     for session_name in target_names {
         let record = record_by_name.get(&session_name);
-        let metadata_removed = if let Some(record) = record {
-            let metadata_path = session_record_metadata_path(record)?;
-            let metadata_present = metadata_path.exists();
-            remove_session_record(&metadata_path)?;
-            metadata_present
-        } else {
-            false
-        };
+        let metadata_path = record.map(session_record_metadata_path).transpose()?;
+        let metadata_present = metadata_path
+            .as_ref()
+            .is_some_and(|metadata_path| metadata_path.exists());
         let workspace_root = record
             .map(|record| record.workspace_root.clone())
             .unwrap_or_else(|| "<unknown workspace>".to_string());
 
-        let output = if tmux_available {
-            let session_running = tmux_sessions.contains_key(&session_name);
-            if session_running {
-                tmux_kill_session(&session_name)?;
-            }
-            CodexStopOutput {
-                session_name,
-                workspace_root,
-                stopped: session_running,
-                metadata_removed,
-                tmux_available: true,
-                empty_tmux_server_stopped: false,
-                note: (!session_running).then_some("no running tmux session was found".to_string()),
-            }
-        } else {
-            CodexStopOutput {
-                session_name,
-                workspace_root,
-                stopped: false,
-                metadata_removed,
-                tmux_available: false,
-                empty_tmux_server_stopped: false,
-                note: Some(
-                    "`tmux` is not installed; removed local session metadata only".to_string(),
-                ),
-            }
+        let session_running = tmux_available && tmux_sessions.contains_key(&session_name);
+        if session_running {
+            tmux_kill_session(&session_name)?;
+        }
+        if let Some(metadata_path) = metadata_path.as_ref() {
+            remove_session_record(metadata_path)?;
+        }
+
+        let output = CodexStopOutput {
+            session_name,
+            workspace_root,
+            stopped: session_running,
+            metadata_removed: metadata_present,
+            tmux_available,
+            empty_tmux_server_stopped: false,
+            note: if tmux_available {
+                (!session_running).then_some("no running tmux session was found".to_string())
+            } else {
+                Some("`tmux` is not installed; removed local session metadata only".to_string())
+            },
         };
         outputs.push(output);
     }

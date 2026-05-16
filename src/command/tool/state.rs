@@ -29,7 +29,7 @@ pub(super) fn write_manifest(
         fs::create_dir_all(parent)?;
     }
     let content = serde_json::to_vec_pretty(&manifest).context("serialize tool manifest")?;
-    fs::write(&manifest_path, content)
+    write_file_atomically(&manifest_path, content)
         .with_context(|| format!("write manifest {}", manifest_path.display()))?;
     Ok(())
 }
@@ -316,18 +316,37 @@ pub(super) fn print_active_managed_path(home: &ToolHome, tool: &str) -> Result<(
 
 pub(super) fn activate_tool(home: &ToolHome, tool: &ToolRef) -> Result<()> {
     let previous_active = read_current_version(home, &tool.name)?;
-    sync_active_entry(home, tool)?;
+    if let Err(err) = sync_active_entry(home, tool) {
+        return rollback_active_entry_after_error(
+            home,
+            &tool.name,
+            previous_active.as_deref(),
+            err.context("activate tool entry"),
+        );
+    }
 
     if let Err(err) = set_current_version(home, tool) {
-        let restore_res = restore_active_entry(home, &tool.name, previous_active.as_deref());
-        let err = err.context("persist active tool version");
-        if let Err(restore_err) = restore_res {
-            return Err(err.context(format!("rollback active entry failed: {restore_err}")));
-        }
-        return Err(err);
+        return rollback_active_entry_after_error(
+            home,
+            &tool.name,
+            previous_active.as_deref(),
+            err.context("persist active tool version"),
+        );
     }
 
     Ok(())
+}
+
+fn rollback_active_entry_after_error(
+    home: &ToolHome,
+    name: &str,
+    previous_version: Option<&str>,
+    err: anyhow::Error,
+) -> Result<()> {
+    if let Err(restore_err) = restore_active_entry(home, name, previous_version) {
+        return Err(err.context(format!("rollback active entry failed: {restore_err}")));
+    }
+    Err(err)
 }
 
 fn restore_active_entry(home: &ToolHome, name: &str, previous_version: Option<&str>) -> Result<()> {
@@ -353,22 +372,8 @@ fn restore_active_entry(home: &ToolHome, name: &str, previous_version: Option<&s
 fn set_current_version(home: &ToolHome, tool: &ToolRef) -> Result<()> {
     fs::create_dir_all(&home.current_dir)?;
     let p = home.current_file(&tool.name);
-    let tmp = p.with_extension(format!("tmp-current-{}", std::process::id()));
-    let mut f = File::create(&tmp).with_context(|| format!("write {}", tmp.display()))?;
-    writeln!(f, "{}", tool.version)?;
-    f.flush()
-        .with_context(|| format!("flush {}", tmp.display()))?;
-    if let Err(err) = fs::rename(&tmp, &p) {
-        let _ = remove_file_if_exists(&tmp);
-        return Err(err).with_context(|| {
-            format!(
-                "replace current version {} -> {}",
-                p.display(),
-                tmp.display()
-            )
-        });
-    }
-    Ok(())
+    write_file_atomically(&p, format!("{}\n", tool.version))
+        .with_context(|| format!("write current version {}", p.display()))
 }
 
 fn sync_active_entry(home: &ToolHome, tool: &ToolRef) -> Result<()> {
@@ -379,6 +384,9 @@ fn sync_active_entry(home: &ToolHome, tool: &ToolRef) -> Result<()> {
 
     match tool_layout_for_name(&tool.name) {
         ToolLayout::Binary => {
+            if !is_executable_file(&src) {
+                bail!("tool version is not an executable file: {}", src.display());
+            }
             let dst = home.bin_path(&tool.name);
             if let Err(err) = link_executable(&src, &dst) {
                 copy_executable(&src, &dst).with_context(|| {
@@ -457,7 +465,22 @@ fn link_directory(src: &Path, dst: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn link_directory(src: &Path, dst: &Path) -> Result<()> {
-    copy_dir_recursive(src, dst)
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = dst.with_extension(format!("tmp-link-{}", std::process::id()));
+    remove_path_if_exists(&tmp)?;
+    if let Err(err) = copy_dir_recursive(src, &tmp) {
+        let _ = remove_path_if_exists(&tmp);
+        return Err(err);
+    }
+    remove_path_if_exists(dst)?;
+    if let Err(err) = fs::rename(&tmp, dst) {
+        let _ = remove_path_if_exists(&tmp);
+        return Err(err)
+            .with_context(|| format!("activate package {} -> {}", tmp.display(), dst.display()));
+    }
+    Ok(())
 }
 
 pub(super) fn remove_file_if_exists(path: &Path) -> Result<()> {

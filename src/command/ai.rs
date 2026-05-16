@@ -1,6 +1,6 @@
 mod analytics;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use humantime::format_rfc3339_seconds;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -11,9 +11,6 @@ use std::{
     process::Command,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 use crate::cli::{AiCommands, AiGitCommands, AiGitStatusArgs, AiShell};
 
@@ -746,12 +743,19 @@ fn write_codex_bash_env_script(ctx: &AiSessionContext) -> Result<PathBuf> {
         "codex-{}.bash",
         workspace_script_id(&ctx.workspace)
     ));
-    fs::write(&path, render_codex_bash_env_script(ctx))
-        .with_context(|| format!("write AI bash env script {}", path.display()))?;
     #[cfg(unix)]
     {
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("set AI bash env script permissions {}", path.display()))?;
+        crate::command::write_file_atomically_with_mode(
+            &path,
+            render_codex_bash_env_script(ctx),
+            0o600,
+        )
+        .with_context(|| format!("write AI bash env script {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        crate::command::write_file_atomically(&path, render_codex_bash_env_script(ctx))
+            .with_context(|| format!("write AI bash env script {}", path.display()))?;
     }
     Ok(path)
 }
@@ -774,7 +778,11 @@ fn ensure_ai_runtime_dir() -> Result<PathBuf> {
         }
     }
 
-    let (dir, error) = last_error.expect("AI runtime dir candidates must not be empty");
+    let Some((dir, error)) = last_error else {
+        return Err(anyhow!(
+            "no AI shell runtime directory candidates were available"
+        ));
+    };
     Err(error).with_context(|| format!("create AI shell runtime dir {}", dir.display()))
 }
 
@@ -838,10 +846,11 @@ fn graph_bar(value: u64, max_value: u64, width: usize) -> String {
 }
 
 fn unix_timestamp_ms() -> u64 {
-    SystemTime::now()
+    let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system time must be after unix epoch")
-        .as_millis() as u64
+        .unwrap_or_default()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 fn workspace_script_id(workspace: &str) -> String {

@@ -6,7 +6,7 @@ mod toolbox_status;
 
 use crate::{
     cli::{IdeAgentCommands, IdeCommands, IdeReconcileStrategy},
-    command::{paths, za_config},
+    command::{paths, write_file_atomically, za_config},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -411,7 +411,7 @@ fn run_agent_install(agent: &str, force: bool) -> Result<i32> {
             shim_path.display()
         );
     }
-    fs::write(&shim_path, expected_shim)
+    write_file_atomically(&shim_path, expected_shim)
         .with_context(|| format!("write JetBrains agent shim `{}`", shim_path.display()))?;
     #[cfg(unix)]
     {
@@ -926,7 +926,7 @@ fn upsert_ide_agent_bash_block(target_path: &Path, shim_dir: &Path) -> Result<bo
     if updated == existing {
         return Ok(false);
     }
-    fs::write(target_path, updated)
+    write_file_atomically(target_path, updated)
         .with_context(|| format!("write `{}`", target_path.display()))?;
     Ok(true)
 }
@@ -939,7 +939,7 @@ fn remove_ide_agent_bash_block(target_path: &Path) -> Result<bool> {
     };
     let (updated, removed) = remove_ide_agent_bash_block_from_content(&existing, target_path)?;
     if removed {
-        fs::write(target_path, updated)
+        write_file_atomically(target_path, updated)
             .with_context(|| format!("write `{}`", target_path.display()))?;
     }
     Ok(removed)

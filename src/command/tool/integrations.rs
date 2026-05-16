@@ -241,7 +241,7 @@ pub(crate) fn upsert_managed_block(
     let (updated, change) =
         compute_upsert_managed_block(target_path, start_marker, end_marker, position, body)?;
     if !matches!(change, ManagedFileChange::Unchanged) {
-        fs::write(target_path, updated)
+        write_file_atomically(target_path, updated)
             .with_context(|| format!("write `{}`", target_path.display()))?;
     }
     Ok(change)
@@ -294,7 +294,7 @@ fn remove_managed_block(target_path: &Path, start_marker: &str, end_marker: &str
     let (updated, removed) =
         remove_managed_block_from_content(&existing, target_path, start_marker, end_marker)?;
     if removed {
-        fs::write(target_path, updated)
+        write_file_atomically(target_path, updated)
             .with_context(|| format!("write `{}`", target_path.display()))?;
     }
     Ok(removed)

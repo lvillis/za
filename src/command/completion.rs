@@ -1,5 +1,5 @@
 use crate::cli::{CompletionCommands, CompletionShell};
-use crate::command::style as tty_style;
+use crate::command::{style as tty_style, write_file_atomically};
 use anyhow::{Context, Result, anyhow};
 use shellcomp::{
     ActivationMode, ActivationPolicy, Availability, Error as ShellcompError, FailureReport,
@@ -418,7 +418,7 @@ fn remove_managed_block(
         (false, true) => format!("{prefix}\n"),
         (false, false) => format!("{prefix}\n\n{suffix}\n"),
     };
-    fs::write(target_path, updated)
+    write_file_atomically(target_path, updated)
         .with_context(|| format!("write `{}`", target_path.display()))?;
     Ok(FileChange::Removed)
 }

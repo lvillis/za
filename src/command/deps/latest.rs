@@ -128,7 +128,7 @@ pub(super) fn run_latest(opts: DepsLatestOptions) -> Result<()> {
         }
     }
 
-    let _ = api.flush_cache();
+    api.flush_cache().context("flush dependency latest cache")?;
     Ok(())
 }
 

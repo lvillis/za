@@ -4,10 +4,7 @@ use reqx::{
     blocking::{Client, ClientBuilder},
     prelude::RetryPolicy,
 };
-use std::{
-    fs::{File, OpenOptions},
-    sync::atomic::AtomicU64,
-};
+use std::fs::{File, OpenOptions};
 
 pub(super) struct ApiClient {
     crates_http: Client,
@@ -71,8 +68,6 @@ const HTTPS_PROXY_ENV_KEYS: [&str; 6] = [
 ];
 const HTTP_PROXY_ENV_KEYS: [&str; 4] = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
 
-static CACHE_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
-
 impl DepsCacheState {
     fn load() -> Self {
         let Some(path) = deps_cache_path() else {
@@ -119,14 +114,8 @@ impl DepsCacheState {
         self.data.schema_version = DEPS_CACHE_SCHEMA_VERSION;
         let content =
             serde_json::to_vec_pretty(&self.data).context("serialize dependency cache")?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create cache directory {}", parent.display()))?;
-        }
-        let tmp = unique_cache_temp_path(&path);
-        fs::write(&tmp, content).with_context(|| format!("write {}", tmp.display()))?;
-        fs::rename(&tmp, &path)
-            .with_context(|| format!("replace cache {} -> {}", path.display(), tmp.display()))?;
+        write_file_atomically(&path, content)
+            .with_context(|| format!("write dependency cache {}", path.display()))?;
         self.dirty = false;
         Ok(())
     }
@@ -493,11 +482,6 @@ impl ApiClient {
         let err = last_err.unwrap_or_else(|| anyhow!("unknown retry failure"));
         Err(err).with_context(|| format!("{op_name} failed after {HTTP_MAX_ATTEMPTS} attempts"))
     }
-}
-
-fn unique_cache_temp_path(path: &Path) -> PathBuf {
-    let nonce = CACHE_TEMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    path.with_extension(format!("tmp-{}-{nonce}", std::process::id()))
 }
 
 fn normalize_optional_string(input: Option<String>) -> Option<String> {

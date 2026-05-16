@@ -255,18 +255,10 @@ impl ToolUpdateCacheState {
         let Some(path) = self.path.as_ref() else {
             return Ok(());
         };
-        let Some(parent) = path.parent() else {
-            return Ok(());
-        };
 
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create tool cache directory {}", parent.display()))?;
         let json = serde_json::to_vec_pretty(&self.data).context("serialize tool update cache")?;
-        let tmp = path.with_extension(format!("tmp-tool-cache-{}", std::process::id()));
-        fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
-        fs::rename(&tmp, path).with_context(|| {
-            format!("replace tool cache {} -> {}", path.display(), tmp.display())
-        })?;
+        write_file_atomically(path, json)
+            .with_context(|| format!("write tool update cache {}", path.display()))?;
         self.dirty = false;
         Ok(())
     }

@@ -112,7 +112,7 @@ fn resolve_managed_active(
         return Ok(None);
     }
 
-    let executable = store_dir.join(name).join(version).join(name);
+    let executable = crate::command::tool::managed_executable_path(name, version, store_dir);
     if !is_executable_file(&executable) {
         bail!(
             "active `{name}` version `{version}` points to missing executable `{}`; repair with `za tool update {name}`",
@@ -233,7 +233,7 @@ fn non_empty_env_value<'a>(vars: &'a HashMap<String, String>, key: &str) -> Opti
 
 #[cfg(test)]
 mod tests {
-    use super::{normalized_proxy_env, resolve_executable_path};
+    use super::{normalized_proxy_env, resolve_executable_path, resolve_managed_active};
     use crate::command::za_config::RunProxyOverrides;
     use anyhow::Result;
     use std::{
@@ -397,6 +397,35 @@ mod tests {
 
         assert_eq!(resolved, path);
         let _ = fs::remove_file(&resolved);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_managed_active_supports_package_layout() -> Result<()> {
+        let root = temp_executable_path("managed-package-root");
+        let store = root.join("store");
+        let current = root.join("current");
+        let entry = store
+            .join("ble.sh")
+            .join("nightly-test")
+            .join("payload")
+            .join("ble.sh");
+
+        fs::create_dir_all(entry.parent().expect("entry parent"))?;
+        fs::write(&entry, "#!/usr/bin/env bash\n")?;
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&entry)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&entry, perms)?;
+        }
+        fs::create_dir_all(&current)?;
+        fs::write(current.join("ble.sh"), "nightly-test\n")?;
+
+        let resolved = resolve_managed_active("ble.sh", &store, &current)?;
+
+        assert_eq!(resolved.as_deref(), Some(entry.as_path()));
+        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 

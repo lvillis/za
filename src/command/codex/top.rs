@@ -401,7 +401,7 @@ fn write_top_listener_state(path: &Path, state: &TopListenerState) -> Result<()>
         fs::create_dir_all(parent)
             .with_context(|| format!("create listener state directory {}", parent.display()))?;
     }
-    fs::write(
+    write_file_atomically(
         path,
         serde_json::to_vec_pretty(state).context("serialize codex top listener state")?,
     )

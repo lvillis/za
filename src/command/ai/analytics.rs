@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, anyhow};
 use graviola::hashing::{Hash, HashContext, Sha256};
-use serde_json::Deserializer;
 use sqlx::{
     Connection, Row, SqliteConnection,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
@@ -331,10 +330,18 @@ fn read_legacy_records(path: &Path) -> Result<Vec<super::AiAnalyticsRecord>> {
         .with_context(|| format!("read legacy ai analytics log {}", path.display()))?;
     let mut records = Vec::new();
 
-    for record in Deserializer::from_str(&contents)
-        .into_iter::<super::AiAnalyticsRecord>()
-        .flatten()
-    {
+    for (line_index, line) in contents.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str::<super::AiAnalyticsRecord>(line).with_context(|| {
+            format!(
+                "parse legacy ai analytics log {} line {}",
+                path.display(),
+                line_index + 1
+            )
+        })?;
         records.push(record);
     }
 
@@ -481,7 +488,7 @@ fn u64_from_i64(value: i64, field: &str) -> Result<u64> {
 mod tests {
     use super::{
         append_record_with_paths, load_records_with_paths, mark_legacy_log_migrated,
-        record_fingerprint,
+        read_legacy_records, record_fingerprint,
     };
     use crate::command::ai::AiAnalyticsRecord;
     use std::{fs, path::PathBuf};
@@ -567,5 +574,27 @@ mod tests {
         mark_legacy_log_migrated(&path).expect("mark migrated");
         assert!(!path.exists());
         assert!(path.with_file_name("analytics.jsonl.migrated").exists());
+    }
+
+    #[test]
+    fn legacy_jsonl_reports_malformed_line() {
+        let dir = temp_dir("malformed");
+        let path = dir.join("analytics.jsonl");
+        let record = sample_record("git status", 1_700_000_000_000);
+        fs::write(
+            &path,
+            format!(
+                "{}\nnot-json\n",
+                serde_json::to_string(&record).expect("serialize record")
+            ),
+        )
+        .expect("write legacy log");
+
+        let error = read_legacy_records(&path).expect_err("malformed jsonl must fail");
+
+        assert!(
+            format!("{error:#}").contains("line 2"),
+            "error should include the malformed line number: {error:#}"
+        );
     }
 }

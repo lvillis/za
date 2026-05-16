@@ -7,7 +7,7 @@ mod model;
 #[path = "deps/render.rs"]
 mod render;
 
-use crate::command::{render as text_render, style as tty_style, za_config};
+use crate::command::{render as text_render, style as tty_style, write_file_atomically, za_config};
 use anyhow::{Context, Result, anyhow, bail};
 use humantime::format_rfc3339_seconds;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -110,7 +110,7 @@ pub fn run(opts: DepsRunOptions) -> Result<()> {
         write_json_report(path, &manifest_path, &summary, &records)?;
     }
 
-    let _ = api.flush_cache();
+    api.flush_cache().context("flush dependency audit cache")?;
 
     if fail_on_high && summary.high > 0 {
         bail!("dependency audit found {} high-risk entries", summary.high);

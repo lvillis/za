@@ -1231,6 +1231,65 @@ fn prune_non_active_versions_keeps_only_target_version() {
 }
 
 #[test]
+fn activate_tool_rejects_non_executable_binary_payload() {
+    let root = std::env::temp_dir().join(format!(
+        "za-test-activate-broken-binary-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let home = ToolHome {
+        scope: ToolScope::User,
+        store_dir: root.join("store"),
+        current_dir: root.join("current"),
+        bin_dir: root.join("bin"),
+    };
+    let previous = ToolRef {
+        name: "rg".to_string(),
+        version: "14.1.0".to_string(),
+    };
+    let broken = ToolRef {
+        name: "rg".to_string(),
+        version: "99.0.0".to_string(),
+    };
+
+    fs::create_dir_all(home.install_path(&previous).parent().expect("parent"))
+        .expect("create previous dir");
+    fs::write(home.install_path(&previous), "#!/bin/sh\n").expect("write previous binary");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(
+            home.install_path(&previous),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod previous binary");
+    }
+    super::state::activate_tool(&home, &previous).expect("activate previous version");
+
+    fs::create_dir_all(home.install_path(&broken)).expect("create broken payload directory");
+    let err = super::state::activate_tool(&home, &broken).expect_err("reject directory payload");
+
+    assert!(
+        format!("{err:#}").contains("not an executable file"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(home.current_file("rg")).expect("read current version"),
+        "14.1.0\n"
+    );
+    assert!(
+        home.active_path("rg").exists(),
+        "previous active entry should remain available"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn collect_managed_tool_names_ignores_legacy_current_artifacts() {
     let root = std::env::temp_dir().join(format!(
         "za-test-current-artifacts-{}-{}",

@@ -54,7 +54,7 @@ use self::source::{resolve_install_source, resolve_requested_version};
 use self::{batch::*, integrations::*, state::*};
 use crate::{
     cli::ToolCommands,
-    command::{render as text_render, style as tty_style, za_config},
+    command::{render as text_render, style as tty_style, write_file_atomically, za_config},
 };
 
 const HTTP_TIMEOUT_SECS: u64 = 300;
@@ -1514,6 +1514,17 @@ fn normalize_version(version: &str) -> String {
 
 pub(crate) fn canonical_tool_name(name: &str) -> String {
     canonical_tool_name_impl(name)
+}
+
+pub(crate) fn managed_executable_path(name: &str, version: &str, store_dir: &Path) -> PathBuf {
+    match package_policy_for_name(name) {
+        Some(package) => store_dir
+            .join(name)
+            .join(version)
+            .join("payload")
+            .join(package.entry_relpath),
+        None => store_dir.join(name).join(version).join(name),
+    }
 }
 
 fn canonical_supported_tool_name(name: &str) -> Result<String> {

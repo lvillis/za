@@ -6,7 +6,7 @@ mod render;
 use crate::{
     cli::CiCommands,
     command::{
-        render as text_render, style as tty_style,
+        render as text_render, style as tty_style, write_file_atomically,
         za_config::{self, ProxyScope},
     },
 };
@@ -124,8 +124,7 @@ impl GitHubClient {
         let mut cache = cache
             .lock()
             .map_err(|_| anyhow!("ci cache lock poisoned"))?;
-        let _ = cache.save_if_dirty();
-        Ok(())
+        cache.save_if_dirty()
     }
 
     fn fetch_commit_report_for_local_path(
@@ -460,16 +459,10 @@ impl CiApiCacheState {
         let Some(path) = self.path.clone() else {
             return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create CI cache directory {}", parent.display()))?;
-        }
         self.data.schema_version = CI_CACHE_SCHEMA_VERSION;
         let raw = serde_json::to_vec_pretty(&self.data).context("serialize CI cache")?;
-        let tmp = path.with_extension(format!("tmp-ci-cache-{}", std::process::id()));
-        fs::write(&tmp, raw).with_context(|| format!("write {}", tmp.display()))?;
-        fs::rename(&tmp, &path)
-            .with_context(|| format!("replace ci cache {} -> {}", path.display(), tmp.display()))?;
+        write_file_atomically(&path, raw)
+            .with_context(|| format!("write CI cache {}", path.display()))?;
         self.dirty = false;
         Ok(())
     }

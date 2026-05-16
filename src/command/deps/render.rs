@@ -269,13 +269,7 @@ pub(super) fn write_json_report(
         dependencies: records.to_vec(),
     };
     let json = serde_json::to_vec_pretty(&report).context("serialize dependency report JSON")?;
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create report directory {}", parent.display()))?;
-    }
-    fs::write(&path, json).with_context(|| format!("write {}", path.display()))?;
+    write_file_atomically(&path, json).with_context(|| format!("write {}", path.display()))?;
     println!("JSON report written: {}", path.display());
     Ok(())
 }

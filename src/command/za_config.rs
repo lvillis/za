@@ -1161,25 +1161,17 @@ fn read_config(path: &Path) -> Result<ZaConfig> {
 }
 
 fn write_config(path: &Path, cfg: &ZaConfig) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create config directory {}", parent.display()))?;
-    }
-
-    let tmp = path.with_extension("tmp");
     let data = toml::to_string_pretty(cfg).context("serialize TOML config")?;
-    fs::write(&tmp, data).with_context(|| format!("write temp config {}", tmp.display()))?;
-
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&tmp, perms)
-            .with_context(|| format!("set permissions for {}", tmp.display()))?;
+        crate::command::write_file_atomically_with_mode(path, data, 0o600)
+            .with_context(|| format!("write config {}", path.display()))?;
     }
-
-    fs::rename(&tmp, path)
-        .with_context(|| format!("replace config {} with {}", path.display(), tmp.display()))?;
+    #[cfg(not(unix))]
+    {
+        crate::command::write_file_atomically(path, data)
+            .with_context(|| format!("write config {}", path.display()))?;
+    }
     Ok(())
 }
 

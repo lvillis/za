@@ -827,12 +827,14 @@ fn write_tmux_codex_status_helper(helper: &TmuxCodexStatusHelper) -> Result<()> 
             parent.display()
         )
     })?;
-    fs::write(&helper.script_path, TMUX_CODEX_STATUS_HELPER_SCRIPT).with_context(|| {
-        format!(
-            "write Codex tmux status helper {}",
-            helper.script_path.display()
-        )
-    })?;
+    write_file_atomically(&helper.script_path, TMUX_CODEX_STATUS_HELPER_SCRIPT).with_context(
+        || {
+            format!(
+                "write Codex tmux status helper {}",
+                helper.script_path.display()
+            )
+        },
+    )?;
     #[cfg(unix)]
     {
         let mut permissions = fs::metadata(&helper.script_path)

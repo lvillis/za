@@ -270,7 +270,7 @@ pub(super) fn persist_session_record(
         launcher_args: launcher_args.to_vec(),
     };
 
-    fs::write(
+    write_file_atomically(
         &ctx.metadata_path,
         serde_json::to_vec_pretty(&record).context("serialize codex session metadata")?,
     )
@@ -602,7 +602,7 @@ fn persist_codex_ps_cache(paths: &[PathBuf], cache: &CodexPsCache) -> Result<()>
             ));
             continue;
         }
-        match fs::write(path, &bytes) {
+        match write_file_atomically(path, &bytes) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 last_err = Some(anyhow!("write Codex ps cache {}: {}", path.display(), err));
