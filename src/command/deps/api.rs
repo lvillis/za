@@ -179,6 +179,9 @@ impl ApiClient {
             kinds: spec.kinds,
             optional: spec.optional,
             latest_version: None,
+            update_plan: None,
+            suggested_requirement: None,
+            update_note: None,
             latest_version_license: None,
             latest_version_rust_version: None,
             latest_version_yanked: None,
@@ -197,7 +200,12 @@ impl ApiClient {
 
         match self.fetch_crate(&spec.name) {
             Ok(crate_resp) => {
+                let (update_plan, suggested_requirement, update_note) =
+                    model::build_manifest_update_plan(&spec.requirement, &crate_resp.max_version);
                 record.latest_version = Some(crate_resp.max_version.clone());
+                record.update_plan = Some(update_plan);
+                record.suggested_requirement = suggested_requirement;
+                record.update_note = update_note;
                 record.latest_version_license = crate_resp.latest_version_license.clone();
                 record.latest_version_rust_version = crate_resp.latest_version_rust_version.clone();
                 record.latest_version_yanked = crate_resp.latest_version_yanked;

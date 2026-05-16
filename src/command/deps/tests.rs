@@ -4,8 +4,8 @@ use super::latest::{
 use super::render::{render_latest_lines, render_latest_toml, render_report_lines};
 use super::{
     AuditSummary, CargoDependency, CargoMetadata, CargoPackage, CargoResolve, CargoResolveDepKind,
-    CargoResolveNode, CargoResolveNodeDep, DepAuditRecord, RiskLevel, collect_dependency_specs,
-    derive_auto_jobs,
+    CargoResolveNode, CargoResolveNodeDep, DepAuditRecord, DependencyUpdatePlan, RiskLevel,
+    collect_dependency_specs, derive_auto_jobs,
 };
 use std::path::Path;
 
@@ -89,11 +89,44 @@ fn render_report_lines_default_focuses_on_attention() {
     assert!(output.contains("openssl-probe"));
     assert!(output.contains("mystery-crate"));
     assert!(!output.contains("\nbaseline\n"));
-    assert!(
-        output.contains("low-risk entry is hidden")
-            || output.contains("low-risk entries are hidden")
-    );
+    assert!(output.contains("1 baseline entry hidden; use `--verbose` to show all"));
+    assert!(!output.contains("plan"));
     assert!(!output.contains("\nLOW"));
+}
+
+#[test]
+fn render_report_lines_default_surfaces_low_risk_version_updates() {
+    let manifest = Path::new("/tmp/work/Cargo.toml");
+    let summary = AuditSummary {
+        high: 0,
+        medium: 0,
+        low: 2,
+        unknown: 0,
+    };
+    let mut bumped = sample_record("reqx", RiskLevel::Low, &[]);
+    bumped.latest_version = Some("0.1.31".to_string());
+    bumped.update_plan = Some(DependencyUpdatePlan::Bump);
+    bumped.suggested_requirement = Some("0.1.31".to_string());
+    bumped.update_note = Some("same release line; refresh manifest requirement".to_string());
+    let records = vec![
+        bumped,
+        sample_record(
+            "bytes",
+            RiskLevel::Low,
+            &["small community size (stars=120)"],
+        ),
+    ];
+
+    let lines = render_report_lines(manifest, &summary, &records, false);
+    let output = lines.join("\n");
+    assert!(output.contains("OK     Cargo.toml  2 deps  2 low · 1 update"));
+    assert!(output.contains("\nattention\n"));
+    assert!(output.contains("reqx"));
+    assert!(output.contains("bump"));
+    assert!(output.contains("same-line"));
+    assert!(!output.contains("same release line; refresh manifest requirement"));
+    assert!(!output.contains("bytes"));
+    assert!(output.contains("1 baseline entry hidden; use `--verbose` to show all"));
 }
 
 #[test]
@@ -268,6 +301,9 @@ fn sample_record(name: &str, risk: RiskLevel, notes: &[&str]) -> DepAuditRecord 
         kinds: "normal".to_string(),
         optional: false,
         latest_version: Some("1.0.0".to_string()),
+        update_plan: Some(DependencyUpdatePlan::Keep),
+        suggested_requirement: None,
+        update_note: Some("current requirement already accepts latest".to_string()),
         latest_version_license: Some("MIT".to_string()),
         latest_version_rust_version: Some("1.70".to_string()),
         latest_version_yanked: Some(false),

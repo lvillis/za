@@ -321,17 +321,6 @@ fn build_latest_suggestion(
     query: &LatestQuery,
     latest_version: &str,
 ) -> (Option<LatestSuggestionKind>, Option<String>, Option<String>) {
-    let latest = match Version::parse(latest_version) {
-        Ok(version) => version,
-        Err(_) => {
-            return (
-                Some(LatestSuggestionKind::Review),
-                Some(latest_version.to_string()),
-                Some("latest version format needs manual review".to_string()),
-            );
-        }
-    };
-
     if matches!(query.source, LatestQuerySource::Args) {
         return (
             Some(LatestSuggestionKind::Add),
@@ -341,76 +330,20 @@ fn build_latest_suggestion(
     }
 
     let raw_requirement = query.requirement.as_deref().unwrap_or("-").trim();
-    if raw_requirement.is_empty() || raw_requirement == "-" {
-        return (
-            Some(LatestSuggestionKind::Add),
-            Some(latest_version.to_string()),
-            Some("dependency has no explicit manifest requirement".to_string()),
-        );
-    }
-    if raw_requirement.contains('|') || raw_requirement.contains("workspace") {
-        return (
-            Some(LatestSuggestionKind::Review),
-            Some(latest_version.to_string()),
-            Some("complex manifest requirement; review manually".to_string()),
-        );
-    }
-
-    let requirement = match VersionReq::parse(raw_requirement) {
-        Ok(requirement) => requirement,
-        Err(_) => {
-            return (
-                Some(LatestSuggestionKind::Review),
-                Some(latest_version.to_string()),
-                Some("manifest requirement is not a plain semver range".to_string()),
-            );
-        }
-    };
-
-    if requirement.matches(&latest) {
-        return (
-            Some(LatestSuggestionKind::Keep),
-            None,
-            Some("current requirement already accepts latest".to_string()),
-        );
-    }
-
-    if requirement_series(&requirement) == Some(version_series(&latest)) {
-        return (
-            Some(LatestSuggestionKind::Bump),
-            Some(latest_version.to_string()),
-            Some("same release line; refresh manifest requirement".to_string()),
-        );
-    }
-
+    let (plan, suggested_requirement, note) =
+        model::build_manifest_update_plan(raw_requirement, latest_version);
     (
-        Some(LatestSuggestionKind::Review),
-        Some(latest_version.to_string()),
-        Some("major or nontrivial upgrade; review compatibility".to_string()),
+        Some(latest_suggestion_from_update_plan(plan)),
+        suggested_requirement,
+        note,
     )
 }
 
-fn version_series(version: &Version) -> (u64, Option<u64>) {
-    if version.major == 0 {
-        (0, Some(version.minor))
-    } else {
-        (version.major, None)
+fn latest_suggestion_from_update_plan(plan: model::DependencyUpdatePlan) -> LatestSuggestionKind {
+    match plan {
+        model::DependencyUpdatePlan::Add => LatestSuggestionKind::Add,
+        model::DependencyUpdatePlan::Keep => LatestSuggestionKind::Keep,
+        model::DependencyUpdatePlan::Bump => LatestSuggestionKind::Bump,
+        model::DependencyUpdatePlan::Review => LatestSuggestionKind::Review,
     }
-}
-
-fn requirement_series(requirement: &VersionReq) -> Option<(u64, Option<u64>)> {
-    let mut detected = None::<(u64, Option<u64>)>;
-    for comparator in &requirement.comparators {
-        let series = if comparator.major == 0 {
-            (0, comparator.minor)
-        } else {
-            (comparator.major, None)
-        };
-        match detected {
-            Some(existing) if existing != series => return None,
-            Some(_) => {}
-            None => detected = Some(series),
-        }
-    }
-    detected
 }

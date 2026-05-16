@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::time::SystemTime;
@@ -62,6 +63,9 @@ pub(super) struct DepAuditRecord {
     pub(super) kinds: String,
     pub(super) optional: bool,
     pub(super) latest_version: Option<String>,
+    pub(super) update_plan: Option<DependencyUpdatePlan>,
+    pub(super) suggested_requirement: Option<String>,
+    pub(super) update_note: Option<String>,
     pub(super) latest_version_license: Option<String>,
     pub(super) latest_version_rust_version: Option<String>,
     pub(super) latest_version_yanked: Option<bool>,
@@ -78,6 +82,30 @@ pub(super) struct DepAuditRecord {
     pub(super) notes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DependencyUpdatePlan {
+    Add,
+    Keep,
+    Bump,
+    Review,
+}
+
+impl DependencyUpdatePlan {
+    pub(super) fn needs_attention(self) -> bool {
+        !matches!(self, Self::Keep)
+    }
+
+    pub(super) fn weight(self) -> u8 {
+        match self {
+            Self::Review => 3,
+            Self::Bump => 2,
+            Self::Add => 1,
+            Self::Keep => 0,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(super) struct AuditReport {
     pub(super) generated_at: String,
@@ -89,24 +117,27 @@ pub(super) struct AuditReport {
 pub(super) fn classify_risk(record: &mut DepAuditRecord) {
     let mut risk = RiskLevel::Low;
     let mut reasons = Vec::new();
+    let crate_metadata_available = record.latest_version.is_some();
     let github_expected = record
         .repository
         .as_deref()
         .and_then(github_repo_from_url)
         .is_some();
 
-    if record.latest_version_yanked == Some(true) {
-        elevate(&mut risk, RiskLevel::High);
-        reasons.push("latest published crate version is yanked".to_string());
-    }
+    if crate_metadata_available {
+        if record.latest_version_yanked == Some(true) {
+            elevate(&mut risk, RiskLevel::High);
+            reasons.push("latest published crate version is yanked".to_string());
+        }
 
-    if record.latest_version_license.is_none() {
-        elevate(&mut risk, RiskLevel::Medium);
-        reasons.push("license metadata missing on latest crate release".to_string());
-    }
+        if record.latest_version_license.is_none() {
+            elevate(&mut risk, RiskLevel::Medium);
+            reasons.push("license metadata missing on latest crate release".to_string());
+        }
 
-    if record.latest_version_rust_version.is_none() {
-        reasons.push("MSRV not declared on latest crate release".to_string());
+        if record.latest_version_rust_version.is_none() {
+            reasons.push("MSRV not declared on latest crate release".to_string());
+        }
     }
 
     if record.github_archived == Some(true) {
@@ -159,21 +190,119 @@ pub(super) fn classify_risk(record: &mut DepAuditRecord) {
         reasons.push("GitHub signals unavailable (set GITHUB_TOKEN for stable quota)".to_string());
     }
 
-    if record.latest_release_at.is_none() && record.github_pushed_at.is_none() {
+    if crate_metadata_available
+        && record.latest_release_at.is_none()
+        && record.github_pushed_at.is_none()
+    {
         if matches!(risk, RiskLevel::Low) {
             risk = RiskLevel::Unknown;
         }
         reasons.push("insufficient maintenance signals".to_string());
     }
 
+    if !crate_metadata_available && matches!(risk, RiskLevel::Low) {
+        risk = RiskLevel::Unknown;
+    }
+
     record.risk = risk;
     record.notes.splice(0..0, reasons);
+}
+
+pub(super) fn build_manifest_update_plan(
+    raw_requirement: &str,
+    latest_version: &str,
+) -> (DependencyUpdatePlan, Option<String>, Option<String>) {
+    let latest = match Version::parse(latest_version) {
+        Ok(version) => version,
+        Err(_) => {
+            return (
+                DependencyUpdatePlan::Review,
+                Some(latest_version.to_string()),
+                Some("latest version format needs manual review".to_string()),
+            );
+        }
+    };
+
+    let raw_requirement = raw_requirement.trim();
+    if raw_requirement.is_empty() || raw_requirement == "-" {
+        return (
+            DependencyUpdatePlan::Add,
+            Some(latest_version.to_string()),
+            Some("dependency has no explicit manifest requirement".to_string()),
+        );
+    }
+
+    if raw_requirement.contains('|') || raw_requirement.contains("workspace") {
+        return (
+            DependencyUpdatePlan::Review,
+            Some(latest_version.to_string()),
+            Some("complex manifest requirement; review manually".to_string()),
+        );
+    }
+
+    let requirement = match VersionReq::parse(raw_requirement) {
+        Ok(requirement) => requirement,
+        Err(_) => {
+            return (
+                DependencyUpdatePlan::Review,
+                Some(latest_version.to_string()),
+                Some("manifest requirement is not a plain semver range".to_string()),
+            );
+        }
+    };
+
+    if requirement.matches(&latest) {
+        return (
+            DependencyUpdatePlan::Keep,
+            None,
+            Some("current requirement already accepts latest".to_string()),
+        );
+    }
+
+    if requirement_series(&requirement) == Some(version_series(&latest)) {
+        return (
+            DependencyUpdatePlan::Bump,
+            Some(latest_version.to_string()),
+            Some("same release line; refresh manifest requirement".to_string()),
+        );
+    }
+
+    (
+        DependencyUpdatePlan::Review,
+        Some(latest_version.to_string()),
+        Some("major or nontrivial upgrade; review compatibility".to_string()),
+    )
 }
 
 pub(super) fn elevate(current: &mut RiskLevel, next: RiskLevel) {
     if next.weight() > current.weight() {
         *current = next;
     }
+}
+
+fn version_series(version: &Version) -> (u64, Option<u64>) {
+    if version.major == 0 {
+        (0, Some(version.minor))
+    } else {
+        (version.major, None)
+    }
+}
+
+fn requirement_series(requirement: &VersionReq) -> Option<(u64, Option<u64>)> {
+    let mut detected = None::<(u64, Option<u64>)>;
+    for comparator in &requirement.comparators {
+        let series = if comparator.major == 0 {
+            (0, comparator.minor)
+        } else {
+            (comparator.major, None)
+        };
+        match detected {
+            Some(existing) if existing != series => return None,
+            Some(_) => {}
+            None => detected = Some(series),
+        }
+    }
+    detected
 }
 
 pub(super) fn age_days_from_now(rfc3339: &str) -> Option<u64> {
@@ -244,7 +373,8 @@ impl GitHubCacheEntry {
 #[cfg(test)]
 mod tests {
     use super::{
-        DepAuditRecord, RiskLevel, classify_risk, elevate, github_repo_from_url, parse_owner_repo,
+        DepAuditRecord, DependencyUpdatePlan, RiskLevel, build_manifest_update_plan, classify_risk,
+        elevate, github_repo_from_url, parse_owner_repo,
     };
 
     fn base_record() -> DepAuditRecord {
@@ -254,6 +384,9 @@ mod tests {
             kinds: "normal".to_string(),
             optional: false,
             latest_version: Some("1.2.3".to_string()),
+            update_plan: Some(DependencyUpdatePlan::Keep),
+            suggested_requirement: None,
+            update_note: Some("current requirement already accepts latest".to_string()),
             latest_version_license: Some("MIT".to_string()),
             latest_version_rust_version: Some("1.70".to_string()),
             latest_version_yanked: Some(false),
@@ -301,6 +434,42 @@ mod tests {
     }
 
     #[test]
+    fn build_manifest_update_plan_keeps_matching_requirement() {
+        let (plan, suggestion, note) = build_manifest_update_plan("^1", "1.2.3");
+
+        assert_eq!(plan, DependencyUpdatePlan::Keep);
+        assert_eq!(suggestion, None);
+        assert_eq!(
+            note.as_deref(),
+            Some("current requirement already accepts latest")
+        );
+    }
+
+    #[test]
+    fn build_manifest_update_plan_bumps_same_series() {
+        let (plan, suggestion, note) = build_manifest_update_plan("=0.1.29", "0.1.31");
+
+        assert_eq!(plan, DependencyUpdatePlan::Bump);
+        assert_eq!(suggestion.as_deref(), Some("0.1.31"));
+        assert_eq!(
+            note.as_deref(),
+            Some("same release line; refresh manifest requirement")
+        );
+    }
+
+    #[test]
+    fn build_manifest_update_plan_reviews_major_change() {
+        let (plan, suggestion, note) = build_manifest_update_plan("^1", "2.0.0");
+
+        assert_eq!(plan, DependencyUpdatePlan::Review);
+        assert_eq!(suggestion.as_deref(), Some("2.0.0"));
+        assert_eq!(
+            note.as_deref(),
+            Some("major or nontrivial upgrade; review compatibility")
+        );
+    }
+
+    #[test]
     fn classify_risk_marks_yanked_latest_as_high() {
         let mut record = base_record();
         record.latest_version_yanked = Some(true);
@@ -329,6 +498,40 @@ mod tests {
                 .notes
                 .iter()
                 .any(|note| note.contains("license metadata missing"))
+        );
+    }
+
+    #[test]
+    fn classify_risk_keeps_missing_crate_metadata_as_unknown() {
+        let mut record = base_record();
+        record.latest_version = None;
+        record.latest_version_license = None;
+        record.latest_version_rust_version = None;
+        record.latest_release_at = None;
+        record
+            .notes
+            .push("crates.io query failed: timeout".to_string());
+
+        classify_risk(&mut record);
+
+        assert_eq!(record.risk, RiskLevel::Unknown);
+        assert!(
+            !record
+                .notes
+                .iter()
+                .any(|note| note.contains("license metadata missing"))
+        );
+        assert!(
+            !record
+                .notes
+                .iter()
+                .any(|note| note.contains("MSRV not declared"))
+        );
+        assert!(
+            record
+                .notes
+                .iter()
+                .any(|note| note.contains("crates.io query failed"))
         );
     }
 }

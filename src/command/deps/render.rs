@@ -1,6 +1,7 @@
 use super::latest::{
     LatestQuerySource, LatestRecord, LatestStatus, LatestSuggestionKind, LatestSummary,
 };
+use super::model::DependencyUpdatePlan;
 use super::*;
 
 pub(super) fn build_summary(records: &[DepAuditRecord]) -> AuditSummary {
@@ -36,15 +37,16 @@ pub(super) fn render_report_lines(
     let mut lines = vec![render_report_summary_line(
         manifest_path,
         summary,
+        records,
         records.len(),
     )];
     let attention = records
         .iter()
-        .filter(|record| record.risk != RiskLevel::Low)
+        .filter(|record| record_needs_attention(record))
         .collect::<Vec<_>>();
-    let low = records
+    let baseline = records
         .iter()
-        .filter(|record| record.risk == RiskLevel::Low)
+        .filter(|record| !record_needs_attention(record))
         .collect::<Vec<_>>();
 
     if !attention.is_empty() {
@@ -54,10 +56,10 @@ pub(super) fn render_report_lines(
     }
 
     if verbose {
-        if !low.is_empty() {
+        if !baseline.is_empty() {
             lines.push(String::new());
             lines.push(tty_style::header("baseline"));
-            lines.extend(render_record_table(&low));
+            lines.extend(render_record_table(&baseline));
         }
         lines.push(String::new());
         lines.push(format!(
@@ -65,22 +67,34 @@ pub(super) fn render_report_lines(
             tty_style::dim("manifest"),
             manifest_path.display()
         ));
-    } else if !low.is_empty() {
+    } else if !baseline.is_empty() {
         lines.push(String::new());
         lines.push(format!(
-            "{}       {} low-risk entr{} hidden; rerun with `za deps --verbose` for the full inventory",
-            tty_style::dim("low"),
-            low.len(),
-            if low.len() == 1 { "y is" } else { "ies are" }
+            "{} baseline {} hidden; use `--verbose` to show all",
+            baseline.len(),
+            entry_label(baseline.len()),
         ));
     }
 
     lines
 }
 
+fn plural_suffix(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+fn entry_label(count: usize) -> &'static str {
+    if count == 1 { "entry" } else { "entries" }
+}
+
+fn count_label(count: usize, noun: &str) -> String {
+    format!("{} {}{}", count, noun, plural_suffix(count))
+}
+
 fn render_report_summary_line(
     manifest_path: &Path,
     summary: &AuditSummary,
+    records: &[DepAuditRecord],
     total: usize,
 ) -> String {
     let manifest = manifest_path
@@ -95,7 +109,7 @@ fn render_report_summary_line(
         tty_style::header(manifest),
         tty_style::header(total.to_string()),
         tty_style::dim("deps"),
-        render_summary_counts(summary)
+        render_summary_counts(summary, records)
     )
 }
 
@@ -111,7 +125,7 @@ fn report_verdict(summary: &AuditSummary) -> &'static str {
     }
 }
 
-fn render_summary_counts(summary: &AuditSummary) -> String {
+fn render_summary_counts(summary: &AuditSummary, records: &[DepAuditRecord]) -> String {
     let mut parts = Vec::new();
     if summary.high > 0 {
         parts.push(tty_style::error(format!("{} high", summary.high)));
@@ -124,6 +138,13 @@ fn render_summary_counts(summary: &AuditSummary) -> String {
     }
     if summary.low > 0 {
         parts.push(tty_style::dim(format!("{} low", summary.low)));
+    }
+    let (bump_count, review_count) = version_attention_counts(records);
+    if bump_count > 0 {
+        parts.push(tty_style::active(count_label(bump_count, "update")));
+    }
+    if review_count > 0 {
+        parts.push(tty_style::warning(count_label(review_count, "review")));
     }
     if parts.is_empty() {
         tty_style::dim("no findings")
@@ -141,13 +162,40 @@ fn render_record_table(records: &[&DepAuditRecord]) -> Vec<String> {
         |record| record.latest_version.as_deref().unwrap_or("-"),
         14,
     );
+    let show_plan = records.iter().any(|record| {
+        record
+            .update_plan
+            .is_some_and(DependencyUpdatePlan::needs_attention)
+    });
+    let plan_width = if show_plan {
+        records
+            .iter()
+            .filter(|record| {
+                record
+                    .update_plan
+                    .is_some_and(DependencyUpdatePlan::needs_attention)
+            })
+            .map(|record| update_plan_label(record.update_plan).chars().count())
+            .max()
+            .unwrap_or(4)
+            .clamp(4, 8)
+    } else {
+        0
+    };
     let kinds_width = column_width(records, "kinds", |record| &record.kinds, 12);
 
     let mut lines = Vec::with_capacity(records.len() + 1);
-    lines.push(tty_style::dim(format!(
-        "{:<5}  {:<name_width$}  {:<req_width$}  {:<latest_width$}  {:<kinds_width$}  note",
-        "risk", "name", "req", "latest", "kinds",
-    )));
+    if show_plan {
+        lines.push(tty_style::dim(format!(
+            "{:<5}  {:<name_width$}  {:<req_width$}  {:<latest_width$}  {:<plan_width$}  {:<kinds_width$}  note",
+            "risk", "name", "req", "latest", "plan", "kinds",
+        )));
+    } else {
+        lines.push(tty_style::dim(format!(
+            "{:<5}  {:<name_width$}  {:<req_width$}  {:<latest_width$}  {:<kinds_width$}  note",
+            "risk", "name", "req", "latest", "kinds",
+        )));
+    }
 
     for record in records {
         let risk = style_record_risk(
@@ -174,15 +222,32 @@ fn render_record_table(records: &[&DepAuditRecord]) -> Vec<String> {
             "{:<kinds_width$}",
             text_render::truncate_end(&record.kinds, kinds_width)
         ));
-        lines.push(format!(
-            "{}  {}  {}  {}  {}  {}",
-            risk,
-            name,
-            requirement,
-            latest,
-            kinds,
-            summarize_record_note(record),
-        ));
+        if show_plan {
+            let plan = style_update_plan_cell(
+                record.update_plan.filter(|plan| plan.needs_attention()),
+                plan_width,
+            );
+            lines.push(format!(
+                "{}  {}  {}  {}  {}  {}  {}",
+                risk,
+                name,
+                requirement,
+                latest,
+                plan,
+                kinds,
+                summarize_record_note(record),
+            ));
+        } else {
+            lines.push(format!(
+                "{}  {}  {}  {}  {}  {}",
+                risk,
+                name,
+                requirement,
+                latest,
+                kinds,
+                summarize_record_note(record),
+            ));
+        }
     }
 
     lines
@@ -215,11 +280,133 @@ fn record_risk_label(risk: RiskLevel) -> &'static str {
     }
 }
 
+fn record_needs_attention(record: &DepAuditRecord) -> bool {
+    record.risk != RiskLevel::Low
+        || record
+            .update_plan
+            .is_some_and(DependencyUpdatePlan::needs_attention)
+}
+
+fn version_attention_counts(records: &[DepAuditRecord]) -> (usize, usize) {
+    let mut bump_count = 0;
+    let mut review_count = 0;
+    for record in records {
+        match record.update_plan {
+            Some(DependencyUpdatePlan::Add | DependencyUpdatePlan::Bump) => bump_count += 1,
+            Some(DependencyUpdatePlan::Review) => review_count += 1,
+            Some(DependencyUpdatePlan::Keep) | None => {}
+        }
+    }
+    (bump_count, review_count)
+}
+
 fn summarize_record_note(record: &DepAuditRecord) -> String {
-    if record.notes.is_empty() {
+    let mut notes = Vec::<String>::new();
+    if record
+        .update_plan
+        .is_some_and(DependencyUpdatePlan::needs_attention)
+        && let Some(note) = record.update_note.as_deref()
+    {
+        push_compact_note(&mut notes, compact_update_note(note));
+    }
+    for note in &record.notes {
+        push_compact_note(&mut notes, compact_record_note(note));
+    }
+
+    if notes.is_empty() {
         return tty_style::dim("-");
     }
-    text_render::truncate_end(&record.notes.join("; "), 96)
+    let extra = notes.len().saturating_sub(4);
+    let mut displayed = notes.into_iter().take(4).collect::<Vec<_>>();
+    if extra > 0 {
+        displayed.push(format!("+{extra}"));
+    }
+    displayed.join(",")
+}
+
+fn push_compact_note(notes: &mut Vec<String>, note: impl Into<String>) {
+    let note = note.into();
+    if !notes.iter().any(|existing| existing == &note) {
+        notes.push(note);
+    }
+}
+
+fn compact_update_note(note: &str) -> String {
+    match note {
+        "latest version format needs manual review" => "bad-latest".to_string(),
+        "dependency has no explicit manifest requirement" => "no-req".to_string(),
+        "complex manifest requirement; review manually" => "complex-req".to_string(),
+        "manifest requirement is not a plain semver range" => "non-semver-req".to_string(),
+        "same release line; refresh manifest requirement" => "same-line".to_string(),
+        "major or nontrivial upgrade; review compatibility" => "major".to_string(),
+        _ => text_render::truncate_end(note, 24),
+    }
+}
+
+fn compact_record_note(note: &str) -> String {
+    if note == "latest published crate version is yanked" {
+        return "yanked".to_string();
+    }
+    if note == "license metadata missing on latest crate release" {
+        return "no-license".to_string();
+    }
+    if note == "MSRV not declared on latest crate release" {
+        return "no-msrv".to_string();
+    }
+    if note == "GitHub repo is archived" {
+        return "archived".to_string();
+    }
+    if note == "repository is not a GitHub repo URL" {
+        return "non-github".to_string();
+    }
+    if note == "repository URL missing" {
+        return "no-repo".to_string();
+    }
+    if note == "insufficient maintenance signals" {
+        return "no-signals".to_string();
+    }
+    if note.starts_with("GitHub signals unavailable") {
+        return "github?".to_string();
+    }
+    if note.starts_with("crates.io query failed:") {
+        return "crates.io?".to_string();
+    }
+    if note.starts_with("GitHub query failed:") {
+        return "github?".to_string();
+    }
+    if let Some(days) = extract_days(note, "latest crate release is stale (") {
+        return format!("release-stale:{days}d");
+    }
+    if let Some(days) = extract_days(note, "crate release not recent (") {
+        return format!("release-old:{days}d");
+    }
+    if let Some(days) = extract_days(note, "GitHub repo activity is stale (") {
+        return format!("repo-stale:{days}d");
+    }
+    if let Some(days) = extract_days(note, "GitHub activity older than 1 year (") {
+        return format!("repo-old:{days}d");
+    }
+    if let Some(stars) = extract_parenthesized_value(note, "low community signal (stars=") {
+        return format!("low-stars:{stars}");
+    }
+    if let Some(stars) = extract_parenthesized_value(note, "small community size (stars=") {
+        return format!("small-stars:{stars}");
+    }
+    if let Some(std_alt) = note.strip_prefix("std alternative available: ") {
+        return format!("std:{std_alt}");
+    }
+    text_render::truncate_end(note, 24)
+}
+
+fn extract_days(note: &str, prefix: &str) -> Option<String> {
+    extract_parenthesized_value(note, prefix)
+        .map(|value| value.trim_end_matches(" days").to_string())
+}
+
+fn extract_parenthesized_value(note: &str, prefix: &str) -> Option<String> {
+    note.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(')'))
+        .map(str::to_string)
 }
 
 fn style_dep_name_cell(value: &str, width: usize) -> String {
@@ -232,6 +419,25 @@ fn style_dep_latest_cell(value: &str, width: usize, has_latest: bool) -> String 
         tty_style::active(padded)
     } else {
         tty_style::dim(padded)
+    }
+}
+
+fn update_plan_label(plan: Option<DependencyUpdatePlan>) -> &'static str {
+    match plan {
+        Some(DependencyUpdatePlan::Add) => "add",
+        Some(DependencyUpdatePlan::Keep) => "keep",
+        Some(DependencyUpdatePlan::Bump) => "bump",
+        Some(DependencyUpdatePlan::Review) => "review",
+        None => "-",
+    }
+}
+
+fn style_update_plan_cell(plan: Option<DependencyUpdatePlan>, width: usize) -> String {
+    let padded = format!("{:<width$}", update_plan_label(plan));
+    match plan {
+        Some(DependencyUpdatePlan::Add | DependencyUpdatePlan::Bump) => tty_style::active(padded),
+        Some(DependencyUpdatePlan::Review) => tty_style::warning(padded),
+        Some(DependencyUpdatePlan::Keep) | None => tty_style::dim(padded),
     }
 }
 

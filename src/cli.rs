@@ -47,7 +47,7 @@ pub enum Commands {
         #[arg(long, value_name = "REF")]
         r#ref: Option<String>,
     },
-    /// Audit Rust dependency risk and maintenance signals
+    /// Audit Rust dependency updates, risk, and maintenance signals
     Deps {
         #[command(flatten)]
         audit: DepsAuditArgs,

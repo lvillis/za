@@ -1,4 +1,4 @@
-//! Dependency governance and maintenance audit for Rust projects.
+//! Dependency governance, version drift, and maintenance audit for Rust projects.
 
 mod api;
 #[path = "deps/latest.rs"]
@@ -11,7 +11,6 @@ use crate::command::{render as text_render, style as tty_style, write_file_atomi
 use anyhow::{Context, Result, anyhow, bail};
 use humantime::format_rfc3339_seconds;
 use indicatif::{ProgressBar, ProgressStyle};
-use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -30,8 +29,8 @@ use std::{
 use self::api::ApiClient;
 use self::model::{
     AuditReport, AuditSummary, DepAuditRecord, DependencySpec, DependencySpecBuilder,
-    GitHubCacheEntry, RiskLevel, age_days_from_now, classify_risk, github_repo_from_url,
-    std_alternative,
+    DependencyUpdatePlan, GitHubCacheEntry, RiskLevel, age_days_from_now, classify_risk,
+    github_repo_from_url, std_alternative,
 };
 use self::render::{build_summary, print_report, write_json_report};
 
@@ -535,8 +534,13 @@ fn sort_records(records: &mut [DepAuditRecord]) {
         b.risk
             .weight()
             .cmp(&a.risk.weight())
+            .then_with(|| update_plan_weight(b).cmp(&update_plan_weight(a)))
             .then_with(|| a.name.cmp(&b.name))
     });
+}
+
+fn update_plan_weight(record: &DepAuditRecord) -> u8 {
+    record.update_plan.map_or(0, DependencyUpdatePlan::weight)
 }
 
 #[derive(Debug, Deserialize)]
