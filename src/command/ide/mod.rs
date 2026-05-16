@@ -1920,7 +1920,10 @@ fn stale_jetbrains_station_sockets() -> Vec<StaleStationSocket> {
     }
 
     if let Ok(entries) = fs::read_dir(&runtime_dir) {
-        for entry in entries.flatten() {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                continue;
+            };
             let path = entry.path();
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
@@ -2068,7 +2071,10 @@ fn discover_toolbox_ipc_key() -> Option<String> {
             Ok(entries) => entries,
             Err(_) => continue,
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                continue;
+            };
             let path = entry.path();
             if !path.is_file() {
                 continue;

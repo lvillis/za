@@ -314,12 +314,16 @@ fn resolve_heap_limit_bytes(executable: &str, ide_identity: Option<&str>) -> Opt
         }
     }
 
-    let mut fallback = fs::read_dir(identity_dir)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "vmoptions"))
-        .collect::<Vec<_>>();
+    let mut fallback = Vec::new();
+    for entry in fs::read_dir(identity_dir).ok()? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "vmoptions") {
+            fallback.push(path);
+        }
+    }
     fallback.sort();
     for path in fallback {
         if !seen.insert(path.clone()) {

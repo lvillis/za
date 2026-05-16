@@ -126,7 +126,10 @@ fn load_toolbox_status_session_state_by_pid(
     };
     let mut out = HashMap::new();
     let mut seen_endpoints = HashSet::new();
-    for identity_entry in identity_entries.flatten() {
+    for identity_entry in identity_entries {
+        let Ok(identity_entry) = identity_entry else {
+            continue;
+        };
         let identity_dir = identity_entry.path();
         if !identity_dir.is_dir() {
             continue;
@@ -139,7 +142,10 @@ fn load_toolbox_status_session_state_by_pid(
             Ok(entries) => entries,
             Err(_) => continue,
         };
-        for vmoptions_entry in vmoptions_entries.flatten() {
+        for vmoptions_entry in vmoptions_entries {
+            let Ok(vmoptions_entry) = vmoptions_entry else {
+                continue;
+            };
             let vmoptions_path = vmoptions_entry.path();
             if !vmoptions_path.is_file() {
                 continue;

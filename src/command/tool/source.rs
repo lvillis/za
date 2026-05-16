@@ -74,7 +74,10 @@ pub(super) fn cleanup_stale_temp_dirs() -> usize {
         .map(|dirs| dirs.clone())
         .unwrap_or_default();
     let mut removed = 0usize;
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
@@ -112,18 +115,26 @@ fn matched_temp_prefix(name: &str) -> Option<&'static str> {
 
 fn parse_temp_dir_pid(name: &str, prefix: &str) -> Option<u32> {
     let rest = name.strip_prefix(prefix)?.strip_prefix('-')?;
-    let (_, pid) = rest.rsplit_once('-')?;
+    let parts = rest.split('-').collect::<Vec<_>>();
+    let pid = match parts.as_slice() {
+        [nonce, pid] if nonce.parse::<u64>().is_ok() => pid,
+        [nonce, millis, pid] if nonce.parse::<u64>().is_ok() && millis.parse::<u128>().is_ok() => {
+            pid
+        }
+        _ => return None,
+    };
     pid.parse::<u32>().ok()
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn process_is_alive(pid: u32) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn process_is_alive(_pid: u32) -> bool {
-    false
+    // Be conservative where PID liveness cannot be checked without platform APIs.
+    true
 }
 
 fn register_temp_dir(path: &Path) {
@@ -1865,8 +1876,8 @@ mod tests {
         DownloadExtractionMode, DownloadRange, GithubRelease, ParallelDownloadPlan,
         TEMP_DIR_PREFIX_DOWNLOAD, build_parallel_download_plan, download_from_url,
         latest_prerelease_version_for_channel, matched_temp_prefix, parse_content_range_total,
-        parse_temp_dir_pid, prerelease_channel_matches, retry_transient_http_operation,
-        split_download_ranges,
+        parse_temp_dir_pid, prerelease_channel_matches, process_is_alive,
+        retry_transient_http_operation, split_download_ranges,
     };
     use crate::command::za_config;
     use semver::Version;
@@ -1929,6 +1940,15 @@ mod tests {
 
     #[test]
     fn parse_temp_dir_pid_accepts_expected_layout() {
+        let name = "za-tool-download-1-123456789-4242";
+        assert_eq!(
+            parse_temp_dir_pid(name, TEMP_DIR_PREFIX_DOWNLOAD),
+            Some(4242)
+        );
+    }
+
+    #[test]
+    fn parse_temp_dir_pid_accepts_legacy_layout() {
         let name = "za-tool-download-123456789-4242";
         assert_eq!(
             parse_temp_dir_pid(name, TEMP_DIR_PREFIX_DOWNLOAD),
@@ -1946,6 +1966,21 @@ mod tests {
             parse_temp_dir_pid("za-tool-download-abc-xyz", "za-tool-download"),
             None
         );
+        assert_eq!(
+            parse_temp_dir_pid("za-tool-download-other-123", "za-tool-download"),
+            None
+        );
+        assert_eq!(
+            parse_temp_dir_pid("za-tool-download-1-other-123", "za-tool-download"),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_is_alive_detects_current_process_on_linux() {
+        assert!(process_is_alive(std::process::id()));
+        assert!(!process_is_alive(0));
     }
 
     #[test]

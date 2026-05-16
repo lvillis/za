@@ -39,7 +39,10 @@ fn load_recent_remote_session_state_by_pid() -> HashMap<i32, RemoteSessionState>
         Err(_) => return HashMap::new(),
     };
     let mut grouped: HashMap<i32, RemoteSessionStateBuilder> = HashMap::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -420,7 +423,10 @@ pub(super) fn load_opened_projects_index() -> OpenedProjectsIndex {
         Err(_) => return OpenedProjectsIndex::default(),
     };
     let mut by_identity = HashMap::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
         let identity_dir = entry.path();
         if !identity_dir.is_dir() {
             continue;
