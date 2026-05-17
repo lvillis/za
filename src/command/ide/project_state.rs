@@ -240,10 +240,8 @@ fn build_remote_project_row(
         seconds_since_last_controller_activity: project.seconds_since_last_controller_activity,
         date_last_opened_ms: project.date_last_opened_ms,
         project_opened_age_secs: project_opened_age_secs(now_ms, project.date_last_opened_ms),
-        state: project_state_label(
-            session.orphan_due,
-            session.over_limit,
-            session.ide_station_socket_live,
+        state: project_state_label_for_session(
+            session,
             project_snapshot_age_secs,
             project.connected,
         ),
@@ -328,6 +326,29 @@ fn build_non_remote_project_row(session: &IdeSession, project_path: String) -> I
         over_limit: session.over_limit,
         orphan_due: session.orphan_due,
     }
+}
+
+fn project_state_label_for_session(
+    session: &IdeSession,
+    remote_snapshot_age_secs: Option<u64>,
+    controller_connected: bool,
+) -> String {
+    if matches!(session.provider, IdeProvider::Zed) {
+        return zed_project_state_label(
+            session.orphan_due,
+            session.over_limit,
+            session.ide_station_socket_live,
+            remote_snapshot_age_secs,
+            controller_connected,
+        );
+    }
+    project_state_label(
+        session.orphan_due,
+        session.over_limit,
+        session.ide_station_socket_live,
+        remote_snapshot_age_secs,
+        controller_connected,
+    )
 }
 
 fn stale_remote_projects_for_display<'a>(
@@ -671,6 +692,31 @@ fn project_state_label(
         return "detached".to_string();
     }
     "live".to_string()
+}
+
+fn zed_project_state_label(
+    orphan_due: bool,
+    over_limit: bool,
+    ide_station_socket_live: bool,
+    remote_snapshot_age_secs: Option<u64>,
+    controller_connected: bool,
+) -> String {
+    if orphan_due {
+        return "orphan".to_string();
+    }
+    if over_limit {
+        return "duplicate".to_string();
+    }
+    if !ide_station_socket_live {
+        return "no-socket".to_string();
+    }
+    if controller_connected {
+        return "live".to_string();
+    }
+    if remote_snapshot_age_secs.is_none() {
+        return "unknown".to_string();
+    }
+    "detached".to_string()
 }
 
 fn infer_confidence(
