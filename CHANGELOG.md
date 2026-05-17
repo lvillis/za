@@ -1,3 +1,8 @@
+## [0.1.75] - 2026-05-17
+
+### 🚀 Features
+
+- *(ide)* Show Zed remote sessions in ps
 ## [0.1.74] - 2026-05-16
 
 ### 🚀 Features
@@ -8,6 +13,10 @@
 
 - *(command)* Harden state persistence and session cleanup
 - Harden temp cleanup and IDE directory scans
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.74
 ## [0.1.73] - 2026-05-15
 
 ### 🐛 Bug Fixes
