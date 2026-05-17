@@ -1,8 +1,18 @@
+## [0.1.76] - 2026-05-17
+
+### 🐛 Bug Fixes
+
+- Ci
+- *(ide)* Treat connected Zed sessions as live
 ## [0.1.75] - 2026-05-17
 
 ### 🚀 Features
 
 - *(ide)* Show Zed remote sessions in ps
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.75
 ## [0.1.74] - 2026-05-16
 
 ### 🚀 Features
