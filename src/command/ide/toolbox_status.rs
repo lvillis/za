@@ -1,5 +1,5 @@
 use super::{
-    RemoteProjectState, RemoteSessionState,
+    RemoteProjectSource, RemoteProjectState, RemoteSessionState,
     project_state::{current_unix_millis, jetbrains_config_dir, normalize_project_path},
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -244,6 +244,7 @@ fn map_toolbox_status_to_state(
         };
         projects.push(RemoteProjectState {
             project_path: normalize_project_path(path),
+            source: RemoteProjectSource::Native,
             connected: true,
             seconds_since_last_controller_activity: ide_status.seconds_since_last_user_activity,
             date_last_opened_ms: None,

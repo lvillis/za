@@ -1,8 +1,9 @@
-//! JetBrains remote IDE process management.
+//! Remote IDE process inspection and JetBrains remote IDE process management.
 
 mod proc_scan;
 mod project_state;
 mod toolbox_status;
+mod zed_rpc;
 
 use crate::{
     cli::{IdeAgentCommands, IdeCommands, IdeReconcileStrategy},
@@ -34,8 +35,25 @@ const IDE_AGENT_BASH_START_MARKER: &str = "# >>> za ide agent shims (bash) >>>";
 const IDE_AGENT_BASH_END_MARKER: &str = "# <<< za ide agent shims (bash) <<<";
 const IDE_AGENT_SHIM_MANAGED_MARKER: &str = "# za-managed: ide-agent-shim v1";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum IdeProvider {
+    JetBrains,
+    Zed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum RemoteProjectSource {
+    Native,
+    Rpc,
+    Log,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct IdeSession {
+    provider: IdeProvider,
     pid: i32,
     ppid: i32,
     uid: u32,
@@ -61,6 +79,8 @@ struct IdeSession {
     remote_snapshot_millis: u128,
     remote_snapshot_age_secs: Option<u64>,
     ide_station_socket_live: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_rpc_responsive: Option<bool>,
     duplicate_group_size: usize,
     over_limit: bool,
     orphan: bool,
@@ -99,6 +119,7 @@ struct ChildProc {
 #[derive(Debug, Clone, Serialize)]
 struct RemoteProjectState {
     project_path: String,
+    source: RemoteProjectSource,
     connected: bool,
     seconds_since_last_controller_activity: Option<u64>,
     date_last_opened_ms: Option<u64>,
@@ -324,6 +345,7 @@ enum ConfidenceLevel {
 
 #[derive(Debug, Clone, Serialize)]
 struct IdeProjectRow {
+    provider: IdeProvider,
     pid: i32,
     ide: String,
     ide_version: Option<String>,
@@ -348,6 +370,9 @@ struct IdeProjectRow {
     shell_children: usize,
     remote_snapshot_age_secs: Option<u64>,
     ide_station_socket_live: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_rpc_responsive: Option<bool>,
+    project_source: RemoteProjectSource,
     confidence: ConfidenceLevel,
     duplicate_group_size: usize,
     over_limit: bool,
@@ -1047,7 +1072,7 @@ fn run_ps(duplicates_only: bool, json: bool) -> Result<i32> {
         if duplicates_only {
             println!("No duplicate JetBrains remote IDE sessions.");
         } else {
-            println!("No JetBrains remote IDE sessions are running.");
+            println!("No supported remote IDE sessions are running.");
             for line in render_ps_diagnostics(&diagnostics) {
                 println!("{line}");
             }
@@ -1080,7 +1105,7 @@ fn run_ps(duplicates_only: bool, json: bool) -> Result<i32> {
 }
 
 fn run_stop(pid: i32, timeout_secs: u64, json: bool) -> Result<i32> {
-    let sessions = collect_ide_sessions()?;
+    let sessions = collect_jetbrains_sessions()?;
     let session = sessions
         .iter()
         .find(|s| s.pid == pid)
@@ -1134,7 +1159,7 @@ fn run_reconcile(
     json: bool,
 ) -> Result<i32> {
     let policy = za_config::load_ide_jetbrains_policy()?;
-    let mut sessions = collect_ide_sessions()?;
+    let mut sessions = collect_jetbrains_sessions()?;
     let start_ticks_by_pid = sessions
         .iter()
         .map(|session| (session.pid, session.start_ticks))
@@ -1334,7 +1359,7 @@ fn run_reconcile(
 
 fn run_fix(dry_run: bool, timeout_secs: u64, json: bool) -> Result<i32> {
     let policy = za_config::load_ide_jetbrains_policy()?;
-    let mut sessions = collect_ide_sessions()?;
+    let mut sessions = collect_jetbrains_sessions()?;
     annotate_group_state(
         &mut sessions,
         policy.max_per_project,
@@ -1519,6 +1544,10 @@ fn collect_ide_sessions() -> Result<Vec<IdeSession>> {
     proc_scan::collect_ide_sessions()
 }
 
+fn collect_jetbrains_sessions() -> Result<Vec<IdeSession>> {
+    proc_scan::collect_jetbrains_sessions()
+}
+
 fn annotate_group_state(
     sessions: &mut [IdeSession],
     max_per_project: usize,
@@ -1531,22 +1560,31 @@ fn annotate_group_state(
     for session in sessions.iter_mut() {
         let group_count = counts.get(&group_key(session)).copied().unwrap_or(1);
         session.duplicate_group_size = group_count;
-        session.over_limit = group_count > max_per_project;
+        session.over_limit =
+            matches!(session.provider, IdeProvider::JetBrains) && group_count > max_per_project;
         let ttl_secs = orphan_ttl_minutes.saturating_mul(60);
-        session.orphan_due = session.orphan && session.uptime_secs >= ttl_secs;
+        session.orphan_due = matches!(session.provider, IdeProvider::JetBrains)
+            && session.orphan
+            && session.uptime_secs >= ttl_secs;
     }
 }
 
 fn over_limit_group_count(sessions: &[IdeSession], max_per_project: usize) -> usize {
     let mut counts: HashMap<String, usize> = HashMap::new();
-    for session in sessions {
+    for session in sessions
+        .iter()
+        .filter(|session| matches!(session.provider, IdeProvider::JetBrains))
+    {
         *counts.entry(group_key(session)).or_default() += 1;
     }
     counts.values().filter(|v| **v > max_per_project).count()
 }
 
 fn group_key(session: &IdeSession) -> String {
-    format!("{}:{}:{}", session.uid, session.ide, session.project_real)
+    format!(
+        "{}:{:?}:{}:{}",
+        session.uid, session.provider, session.ide, session.project_real
+    )
 }
 
 fn pick_keep_pid(sessions: &[IdeSession], strategy: IdeReconcileStrategy) -> i32 {
@@ -1708,9 +1746,9 @@ fn render_ps_project_rows(rows: &[IdeProjectRow]) -> Vec<String> {
         "IDE",
         "VER",
         "RSS",
-        "XMX",
-        "SHELL",
-        "CTRL",
+        "LIMIT",
+        "TERM",
+        "LINK",
         "IDLE",
         "STATE",
         "HEALTH",
@@ -1728,7 +1766,7 @@ fn render_ps_project_rows(rows: &[IdeProjectRow]) -> Vec<String> {
 
 fn render_ps_project_row(row: &IdeProjectRow, show_process: bool) -> String {
     let version = truncate_end(&project_state::ide_project_row_version_label(row), 12);
-    let conn = if row.controller_connected { "yes" } else { "-" };
+    let link = if row.controller_connected { "yes" } else { "-" };
     let idle = row
         .seconds_since_last_controller_activity
         .map(|secs| format!("{secs}s"))
@@ -1737,7 +1775,7 @@ fn render_ps_project_row(row: &IdeProjectRow, show_process: bool) -> String {
         .remote_snapshot_age_secs
         .map(|secs| format!("{secs}s"))
         .unwrap_or_else(|| "-".to_string());
-    let (pid, ide, version, rss, xmx, shell) = if show_process {
+    let (pid, ide, version, rss, resource_limit, terminal_count) = if show_process {
         (
             row.pid.to_string(),
             truncate_end(&row.ide, 12),
@@ -1762,9 +1800,9 @@ fn render_ps_project_row(row: &IdeProjectRow, show_process: bool) -> String {
         ide,
         version,
         rss,
-        xmx,
-        shell,
-        conn,
+        resource_limit,
+        terminal_count,
+        link,
         idle,
         truncate_end(&row.state, 10),
         truncate_end(&row.health, 12),
@@ -2324,10 +2362,10 @@ mod tests {
         parse_build_number_from_build_txt, parse_cmdline, parse_proc_stat_line, parse_xmx_bytes,
     };
     use super::{
-        ConfidenceLevel, IdeFixFailure, IdeFixOutput, IdeProjectRow, IdePsDiagnostic,
-        IdeReconcileStrategy, IdeSession, ProcessIdentity, expected_ide_agent_shim_content,
-        format_memory_bytes, ide_agent_bash_path_block, ide_agent_shim_is_managed,
-        normalize_ide_agent_name, parse_ipcs_semaphore_rows,
+        ConfidenceLevel, IdeFixFailure, IdeFixOutput, IdeProjectRow, IdeProvider, IdePsDiagnostic,
+        IdeReconcileStrategy, IdeSession, ProcessIdentity, RemoteProjectSource,
+        expected_ide_agent_shim_content, format_memory_bytes, ide_agent_bash_path_block,
+        ide_agent_shim_is_managed, normalize_ide_agent_name, parse_ipcs_semaphore_rows,
         parse_jetbrains_ide_station_socket_pid, parse_toolbox_ipc_key_line, pick_keep_pid,
         pick_keep_pids, process_matches_identity, project_row_attention_rank,
         read_process_start_ticks, remove_ide_agent_bash_block, render_fix_lines,
@@ -2518,6 +2556,7 @@ mod tests {
     fn pick_keep_pid_respects_strategy() {
         let sessions = vec![
             IdeSession {
+                provider: IdeProvider::JetBrains,
                 pid: 100,
                 ppid: 1,
                 uid: 0,
@@ -2541,6 +2580,7 @@ mod tests {
                 remote_snapshot_millis: 0,
                 remote_snapshot_age_secs: None,
                 ide_station_socket_live: false,
+                remote_rpc_responsive: None,
                 duplicate_group_size: 2,
                 over_limit: true,
                 orphan: true,
@@ -2548,6 +2588,7 @@ mod tests {
                 start_ticks: 1000,
             },
             IdeSession {
+                provider: IdeProvider::JetBrains,
                 pid: 200,
                 ppid: 1,
                 uid: 0,
@@ -2571,6 +2612,7 @@ mod tests {
                 remote_snapshot_millis: 0,
                 remote_snapshot_age_secs: None,
                 ide_station_socket_live: false,
+                remote_rpc_responsive: None,
                 duplicate_group_size: 2,
                 over_limit: true,
                 orphan: true,
@@ -2644,7 +2686,9 @@ mod tests {
 
         let lines = render_ps_project_rows(&[first, second]);
         assert!(lines[0].contains("RSS"));
-        assert!(lines[0].contains("XMX"));
+        assert!(lines[0].contains("LIMIT"));
+        assert!(lines[0].contains("TERM"));
+        assert!(lines[0].contains("LINK"));
         assert!(lines[1].starts_with("4082669"));
         assert!(lines[1].contains("4.8GiB"));
         assert!(lines[1].contains("4.0GiB"));
@@ -2806,6 +2850,7 @@ mod tests {
 
     fn sample_project_row() -> IdeProjectRow {
         IdeProjectRow {
+            provider: IdeProvider::JetBrains,
             pid: 100,
             ide: "rustrover".to_string(),
             ide_version: Some("2026.1".to_string()),
@@ -2830,6 +2875,8 @@ mod tests {
             shell_children: 0,
             remote_snapshot_age_secs: Some(0),
             ide_station_socket_live: true,
+            remote_rpc_responsive: None,
+            project_source: RemoteProjectSource::Native,
             confidence: ConfidenceLevel::High,
             duplicate_group_size: 1,
             over_limit: false,

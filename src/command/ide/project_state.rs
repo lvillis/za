@@ -1,8 +1,9 @@
 use super::{
-    ConfidenceLevel, IdeProjectRow, IdeSession, OpenedProjectsIndex, OpenedProjectsState,
-    PROJECT_DISCONNECTED_GRACE_SECS, PROJECT_OPEN_SIGNAL_WORKSPACE_WINDOW_SECS,
-    PROJECT_REMOTE_LIVE_MAX_AGE_SECS, PROJECT_SNAPSHOT_MAX_AGE_SECS, RecentProjectEntry,
-    RemoteDevRecentSnapshot, RemoteProjectState, RemoteSessionState, RemoteSessionStateBuilder,
+    ConfidenceLevel, IdeProjectRow, IdeProvider, IdeSession, OpenedProjectsIndex,
+    OpenedProjectsState, PROJECT_DISCONNECTED_GRACE_SECS,
+    PROJECT_OPEN_SIGNAL_WORKSPACE_WINDOW_SECS, PROJECT_REMOTE_LIVE_MAX_AGE_SECS,
+    PROJECT_SNAPSHOT_MAX_AGE_SECS, RecentProjectEntry, RemoteDevRecentSnapshot,
+    RemoteProjectSource, RemoteProjectState, RemoteSessionState, RemoteSessionStateBuilder,
     toolbox_status,
 };
 use regex::Regex;
@@ -71,6 +72,7 @@ fn load_recent_remote_session_state_by_pid() -> HashMap<i32, RemoteSessionState>
             };
             let incoming = RemoteProjectState {
                 project_path: project_path.clone(),
+                source: RemoteProjectSource::Native,
                 connected: project.controller_connected,
                 seconds_since_last_controller_activity: project
                     .seconds_since_last_controller_activity,
@@ -171,8 +173,11 @@ pub(super) fn build_project_rows(
     let now_ms = current_unix_millis();
     let mut rows = Vec::new();
     for session in sessions {
-        let opened_state =
-            opened_projects_for_session(opened_projects, session.remote_ide_identity.as_deref());
+        let opened_state = if matches!(session.provider, IdeProvider::JetBrains) {
+            opened_projects_for_session(opened_projects, session.remote_ide_identity.as_deref())
+        } else {
+            None
+        };
         let tracked_paths = tracked_project_paths(opened_state);
         let recent_projects = recent_remote_projects(session, now_ms, tracked_paths.as_ref());
         if recent_projects.is_empty() {
@@ -187,6 +192,7 @@ pub(super) fn build_project_rows(
             let project_snapshot_age_secs = snapshot_age_secs(now_ms, project.snapshot_millis);
             seen.insert(project.project_path.clone());
             rows.push(IdeProjectRow {
+                provider: session.provider,
                 pid: session.pid,
                 ide: session.ide.clone(),
                 ide_version: session.ide_version.clone(),
@@ -225,6 +231,8 @@ pub(super) fn build_project_rows(
                 shell_children: session.shell_children,
                 remote_snapshot_age_secs: project_snapshot_age_secs,
                 ide_station_socket_live: session.ide_station_socket_live,
+                remote_rpc_responsive: session.remote_rpc_responsive,
+                project_source: project.source,
                 confidence: infer_confidence(
                     session.ide_station_socket_live,
                     project_snapshot_age_secs,
@@ -259,6 +267,7 @@ pub(super) fn build_project_rows(
 
 fn build_non_remote_project_row(session: &IdeSession, project_path: String) -> IdeProjectRow {
     IdeProjectRow {
+        provider: session.provider,
         pid: session.pid,
         ide: session.ide.clone(),
         ide_version: session.ide_version.clone(),
@@ -293,6 +302,8 @@ fn build_non_remote_project_row(session: &IdeSession, project_path: String) -> I
         shell_children: session.shell_children,
         remote_snapshot_age_secs: session.remote_snapshot_age_secs,
         ide_station_socket_live: session.ide_station_socket_live,
+        remote_rpc_responsive: session.remote_rpc_responsive,
+        project_source: RemoteProjectSource::Unknown,
         confidence: infer_confidence(
             session.ide_station_socket_live,
             session.remote_snapshot_age_secs,
