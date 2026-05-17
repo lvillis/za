@@ -5,7 +5,7 @@ use super::{
 use super::{project_state, zed_rpc};
 use anyhow::{Context, Result, anyhow, bail};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     env, fs,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -78,7 +78,8 @@ fn collect_proc_snapshot() -> Result<ProcScanSnapshot> {
         };
         child_map.entry(stat.ppid).or_default().push(ChildProc {
             comm: comm.clone(),
-            shell_integration: has_jetbrains_shell_integration(&args),
+            jetbrains_terminal: has_jetbrains_shell_integration(&args),
+            zed_terminal: is_shell_comm(&comm) && has_zed_terminal_environment(&proc_dir),
         });
         processes.push(ProcessRecord {
             pid,
@@ -148,6 +149,7 @@ fn collect_jetbrains_sessions_from_snapshot(snapshot: &ProcScanSnapshot) -> Vec<
                 remote_state.freshest_snapshot_millis,
             ),
             ide_station_socket_live: ide_station_socket_exists(uid, process.pid),
+            link_pid: None,
             remote_rpc_responsive: None,
             duplicate_group_size: 1,
             over_limit: false,
@@ -195,11 +197,13 @@ struct ZedRunSession {
 
 fn collect_zed_sessions_from_snapshot(snapshot: &ProcScanSnapshot) -> Vec<IdeSession> {
     let mut sessions = Vec::new();
-    let occupied_workspaces = snapshot
+    let proxy_pid_by_workspace = snapshot
         .processes
         .iter()
-        .filter_map(|process| extract_zed_proxy_workspace(&process.args))
-        .collect::<HashSet<_>>();
+        .filter_map(|process| {
+            extract_zed_proxy_workspace(&process.args).map(|workspace| (workspace, process.pid))
+        })
+        .collect::<HashMap<_, _>>();
     for process in &snapshot.processes {
         let Some(zed) = extract_zed_run_session(&process.args) else {
             continue;
@@ -210,11 +214,12 @@ fn collect_zed_sessions_from_snapshot(snapshot: &ProcScanSnapshot) -> Vec<IdeSes
 
         let (cpu_percent, rss_bytes, uptime_secs) = process_resource_usage(process, snapshot);
         let uid = read_uid_from_status(&process.proc_dir.join("status")).unwrap_or(0);
-        let transport_occupied = zed
+        let link_pid = zed
             .workspace_id
             .as_ref()
-            .is_some_and(|workspace| occupied_workspaces.contains(workspace));
-        let rpc_probe = if transport_occupied {
+            .and_then(|workspace| proxy_pid_by_workspace.get(workspace).copied());
+        let desktop_connected = link_pid.is_some();
+        let rpc_probe = if desktop_connected {
             None
         } else {
             Some(zed_rpc::probe(
@@ -233,21 +238,28 @@ fn collect_zed_sessions_from_snapshot(snapshot: &ProcScanSnapshot) -> Vec<IdeSes
             }
         }
         let log_project = zed.log_file.as_deref().and_then(infer_zed_project_from_log);
-        let (project_paths, project_source) =
-            resolve_zed_project_paths(rpc_projects, log_project, zed.workspace_id.as_deref());
+        let (project_paths, project_source) = resolve_zed_project_paths(
+            rpc_projects,
+            log_project.as_ref(),
+            zed.workspace_id.as_deref(),
+        );
         let project_real = match project_paths.as_slice() {
             [single] => single.clone(),
             _ => "<multi-project>".to_string(),
         };
-        let snapshot_millis = snapshot.now_millis.map(u128::from).unwrap_or_default();
         let control_live = zed_control_sockets_live(&zed);
+        let snapshot_millis = zed_project_snapshot_millis(
+            project_source,
+            snapshot.now_millis,
+            log_project.as_ref().map(|project| project.modified_millis),
+        );
         let remote_projects = project_paths
             .into_iter()
             .map(|project_path| RemoteProjectState {
                 project_path,
                 source: project_source,
-                connected: control_live,
-                seconds_since_last_controller_activity: control_live.then_some(0),
+                connected: desktop_connected,
+                seconds_since_last_controller_activity: desktop_connected.then_some(0),
                 date_last_opened_ms: None,
                 background_tasks_running: false,
                 users: Vec::new(),
@@ -283,6 +295,7 @@ fn collect_zed_sessions_from_snapshot(snapshot: &ProcScanSnapshot) -> Vec<IdeSes
                 snapshot_millis,
             ),
             ide_station_socket_live: control_live,
+            link_pid,
             remote_rpc_responsive: rpc_probe.as_ref().map(|probe| probe.responsive),
             duplicate_group_size: 1,
             over_limit: false,
@@ -296,19 +309,33 @@ fn collect_zed_sessions_from_snapshot(snapshot: &ProcScanSnapshot) -> Vec<IdeSes
 
 fn resolve_zed_project_paths(
     rpc_projects: Vec<String>,
-    log_project: Option<String>,
+    log_project: Option<&ZedLogProject>,
     workspace_id: Option<&str>,
 ) -> (Vec<String>, RemoteProjectSource) {
     if !rpc_projects.is_empty() {
         return (rpc_projects, RemoteProjectSource::Rpc);
     }
     if let Some(project) = log_project {
-        return (vec![project], RemoteProjectSource::Log);
+        return (vec![project.path.clone()], RemoteProjectSource::Log);
     }
     (
         vec![zed_unknown_project_label(workspace_id)],
         RemoteProjectSource::Unknown,
     )
+}
+
+fn zed_project_snapshot_millis(
+    source: RemoteProjectSource,
+    now_millis: Option<u64>,
+    log_modified_millis: Option<u128>,
+) -> u128 {
+    match source {
+        RemoteProjectSource::Log => log_modified_millis.unwrap_or_default(),
+        RemoteProjectSource::Rpc | RemoteProjectSource::Unknown => {
+            now_millis.map(u128::from).unwrap_or_default()
+        }
+        RemoteProjectSource::Native => 0,
+    }
 }
 
 fn zed_unknown_project_label(workspace_id: Option<&str>) -> String {
@@ -431,9 +458,28 @@ fn parse_zed_remote_version(executable: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn infer_zed_project_from_log(path: &Path) -> Option<String> {
+#[derive(Debug)]
+struct ZedLogProject {
+    path: String,
+    modified_millis: u128,
+}
+
+fn infer_zed_project_from_log(path: &Path) -> Option<ZedLogProject> {
+    let modified_millis = fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| {
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_millis())
+        })
+        .unwrap_or_default();
     let raw = read_tail_lossy(path, 2 * 1024 * 1024).ok()?;
-    parse_zed_project_from_log(&raw).map(|project| project_state::normalize_project_path(&project))
+    parse_zed_project_from_log(&raw).map(|project| ZedLogProject {
+        path: project_state::normalize_project_path(&project),
+        modified_millis,
+    })
 }
 
 fn parse_zed_project_from_log(raw: &str) -> Option<String> {
@@ -506,7 +552,12 @@ fn finish_sessions(sessions: &mut [IdeSession], child_map: &HashMap<i32, Vec<Chi
                 .count();
             session.shell_children = children
                 .iter()
-                .filter(|child| is_shell_comm(&child.comm) && child.shell_integration)
+                .filter(|child| match session.provider {
+                    IdeProvider::JetBrains => {
+                        is_shell_comm(&child.comm) && child.jetbrains_terminal
+                    }
+                    IdeProvider::Zed => is_shell_comm(&child.comm) && child.zed_terminal,
+                })
                 .count();
         }
     }
@@ -616,6 +667,25 @@ fn is_shell_comm(comm: &str) -> bool {
 pub(super) fn has_jetbrains_shell_integration(args: &[String]) -> bool {
     args.iter()
         .any(|arg| arg.contains("/plugins/terminal/shell-integrations/"))
+}
+
+fn has_zed_terminal_environment(proc_dir: &Path) -> bool {
+    let Ok(raw) = fs::read(proc_dir.join("environ")) else {
+        return false;
+    };
+    let mut has_zed_term = false;
+    let mut has_term_program = false;
+    for item in raw.split(|byte| *byte == 0) {
+        match item {
+            b"ZED_TERM=true" => has_zed_term = true,
+            b"TERM_PROGRAM=zed" => has_term_program = true,
+            _ => {}
+        }
+        if has_zed_term && has_term_program {
+            return true;
+        }
+    }
+    false
 }
 
 fn runtime_dir_for_uid(uid: u32) -> PathBuf {
@@ -897,8 +967,12 @@ mod tests {
             resolve_zed_project_paths(vec!["/opt/app/live".to_string()], None, Some("workspace-9")),
             (vec!["/opt/app/live".to_string()], RemoteProjectSource::Rpc)
         );
+        let log_project = ZedLogProject {
+            path: "/opt/app/log".to_string(),
+            modified_millis: 42,
+        };
         assert_eq!(
-            resolve_zed_project_paths(Vec::new(), Some("/opt/app/log".to_string()), None),
+            resolve_zed_project_paths(Vec::new(), Some(&log_project), None),
             (vec!["/opt/app/log".to_string()], RemoteProjectSource::Log)
         );
         assert_eq!(

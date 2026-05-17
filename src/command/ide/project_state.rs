@@ -181,6 +181,14 @@ pub(super) fn build_project_rows(
         let tracked_paths = tracked_project_paths(opened_state);
         let recent_projects = recent_remote_projects(session, now_ms, tracked_paths.as_ref());
         if recent_projects.is_empty() {
+            let stale_projects =
+                stale_remote_projects_for_display(session, now_ms, tracked_paths.as_ref());
+            if !stale_projects.is_empty() {
+                for project in stale_projects {
+                    rows.push(build_remote_project_row(session, project, now_ms));
+                }
+                continue;
+            }
             let fallback_paths = fallback_project_paths(session, opened_state);
             for path in fallback_paths {
                 rows.push(build_non_remote_project_row(session, path));
@@ -189,58 +197,8 @@ pub(super) fn build_project_rows(
         }
         let mut seen = HashSet::new();
         for project in recent_projects {
-            let project_snapshot_age_secs = snapshot_age_secs(now_ms, project.snapshot_millis);
             seen.insert(project.project_path.clone());
-            rows.push(IdeProjectRow {
-                provider: session.provider,
-                pid: session.pid,
-                ide: session.ide.clone(),
-                ide_version: session.ide_version.clone(),
-                ide_build_number: session.ide_build_number.clone(),
-                project_path: project.project_path.clone(),
-                controller_connected: project.connected,
-                seconds_since_last_controller_activity: project
-                    .seconds_since_last_controller_activity,
-                date_last_opened_ms: project.date_last_opened_ms,
-                project_opened_age_secs: project_opened_age_secs(
-                    now_ms,
-                    project.date_last_opened_ms,
-                ),
-                state: project_state_label(
-                    session.orphan_due,
-                    session.over_limit,
-                    session.ide_station_socket_live,
-                    project_snapshot_age_secs,
-                    project.connected,
-                ),
-                backend_unresponsive: session.remote_backend_unresponsive,
-                modal_dialog_is_opened: session.remote_modal_dialog_is_opened,
-                background_tasks_running: project.background_tasks_running,
-                health: project_health_label(
-                    session.remote_backend_unresponsive,
-                    session.remote_modal_dialog_is_opened,
-                    project.background_tasks_running,
-                ),
-                users: project.users.clone(),
-                users_count: project.users.len(),
-                cpu_percent: session.cpu_percent,
-                rss_bytes: session.rss_bytes,
-                heap_limit_bytes: session.heap_limit_bytes,
-                uptime_secs: session.uptime_secs,
-                child_count: session.child_count,
-                shell_children: session.shell_children,
-                remote_snapshot_age_secs: project_snapshot_age_secs,
-                ide_station_socket_live: session.ide_station_socket_live,
-                remote_rpc_responsive: session.remote_rpc_responsive,
-                project_source: project.source,
-                confidence: infer_confidence(
-                    session.ide_station_socket_live,
-                    project_snapshot_age_secs,
-                ),
-                duplicate_group_size: session.duplicate_group_size,
-                over_limit: session.over_limit,
-                orphan_due: session.orphan_due,
-            });
+            rows.push(build_remote_project_row(session, project, now_ms));
         }
         if let Some(state) = opened_state {
             let mut missing = state
@@ -263,6 +221,62 @@ pub(super) fn build_project_rows(
             .then_with(|| a.pid.cmp(&b.pid))
     });
     rows
+}
+
+fn build_remote_project_row(
+    session: &IdeSession,
+    project: &RemoteProjectState,
+    now_ms: Option<u64>,
+) -> IdeProjectRow {
+    let project_snapshot_age_secs = snapshot_age_secs(now_ms, project.snapshot_millis);
+    IdeProjectRow {
+        provider: session.provider,
+        pid: session.pid,
+        ide: session.ide.clone(),
+        ide_version: session.ide_version.clone(),
+        ide_build_number: session.ide_build_number.clone(),
+        project_path: project.project_path.clone(),
+        controller_connected: project.connected,
+        seconds_since_last_controller_activity: project.seconds_since_last_controller_activity,
+        date_last_opened_ms: project.date_last_opened_ms,
+        project_opened_age_secs: project_opened_age_secs(now_ms, project.date_last_opened_ms),
+        state: project_state_label(
+            session.orphan_due,
+            session.over_limit,
+            session.ide_station_socket_live,
+            project_snapshot_age_secs,
+            project.connected,
+        ),
+        backend_unresponsive: session.remote_backend_unresponsive,
+        modal_dialog_is_opened: session.remote_modal_dialog_is_opened,
+        background_tasks_running: project.background_tasks_running,
+        health: project_health_label(
+            session.remote_backend_unresponsive,
+            session.remote_modal_dialog_is_opened,
+            project.background_tasks_running,
+        ),
+        users: project.users.clone(),
+        users_count: project.users.len(),
+        cpu_percent: session.cpu_percent,
+        rss_bytes: session.rss_bytes,
+        heap_limit_bytes: session.heap_limit_bytes,
+        uptime_secs: session.uptime_secs,
+        child_count: session.child_count,
+        shell_children: session.shell_children,
+        remote_snapshot_age_secs: project_snapshot_age_secs,
+        ide_station_socket_live: session.ide_station_socket_live,
+        link_pid: session.link_pid,
+        remote_rpc_responsive: session.remote_rpc_responsive,
+        project_source: project.source,
+        confidence: infer_confidence(
+            session.ide_station_socket_live,
+            project_snapshot_age_secs,
+            project.source,
+        ),
+        duplicate_group_size: session.duplicate_group_size,
+        over_limit: session.over_limit,
+        orphan_due: session.orphan_due,
+    }
 }
 
 fn build_non_remote_project_row(session: &IdeSession, project_path: String) -> IdeProjectRow {
@@ -302,16 +316,48 @@ fn build_non_remote_project_row(session: &IdeSession, project_path: String) -> I
         shell_children: session.shell_children,
         remote_snapshot_age_secs: session.remote_snapshot_age_secs,
         ide_station_socket_live: session.ide_station_socket_live,
+        link_pid: session.link_pid,
         remote_rpc_responsive: session.remote_rpc_responsive,
         project_source: RemoteProjectSource::Unknown,
         confidence: infer_confidence(
             session.ide_station_socket_live,
             session.remote_snapshot_age_secs,
+            RemoteProjectSource::Unknown,
         ),
         duplicate_group_size: session.duplicate_group_size,
         over_limit: session.over_limit,
         orphan_due: session.orphan_due,
     }
+}
+
+fn stale_remote_projects_for_display<'a>(
+    session: &'a IdeSession,
+    now_ms: Option<u64>,
+    opened_paths: Option<&HashSet<String>>,
+) -> Vec<&'a RemoteProjectState> {
+    if session.remote_projects.is_empty() {
+        return Vec::new();
+    }
+
+    if let Some(opened) = opened_paths
+        && !opened.is_empty()
+    {
+        let mut projects = session
+            .remote_projects
+            .iter()
+            .filter(|project| opened.contains(&project.project_path))
+            .collect::<Vec<_>>();
+        projects.sort_by(|a, b| a.project_path.cmp(&b.project_path));
+        return projects;
+    }
+
+    session
+        .remote_projects
+        .iter()
+        .filter(|project| snapshot_age_secs(now_ms, project.snapshot_millis).is_some())
+        .max_by_key(|project| project.snapshot_millis)
+        .into_iter()
+        .collect()
 }
 
 fn fallback_project_paths(
@@ -630,9 +676,19 @@ fn project_state_label(
 fn infer_confidence(
     ide_station_socket_live: bool,
     remote_snapshot_age_secs: Option<u64>,
+    project_source: RemoteProjectSource,
 ) -> ConfidenceLevel {
+    if matches!(project_source, RemoteProjectSource::Unknown) {
+        return ConfidenceLevel::Low;
+    }
     if !ide_station_socket_live {
         return ConfidenceLevel::Low;
+    }
+    if matches!(project_source, RemoteProjectSource::Log) {
+        return match remote_snapshot_age_secs {
+            Some(age) if age <= 120 => ConfidenceLevel::Medium,
+            _ => ConfidenceLevel::Low,
+        };
     }
     match remote_snapshot_age_secs {
         Some(age) if age <= 120 => ConfidenceLevel::High,

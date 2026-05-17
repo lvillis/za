@@ -3,7 +3,26 @@
 mod proc_scan;
 mod project_state;
 mod toolbox_status;
+#[cfg(unix)]
 mod zed_rpc;
+#[cfg(not(unix))]
+mod zed_rpc {
+    use std::path::Path;
+
+    #[derive(Debug, Clone, Default)]
+    pub(super) struct ZedRpcProbe {
+        pub responsive: bool,
+        pub projects: Vec<String>,
+    }
+
+    pub(super) fn probe(
+        _stdin_socket: Option<&Path>,
+        _stdout_socket: Option<&Path>,
+        _stderr_socket: Option<&Path>,
+    ) -> ZedRpcProbe {
+        ZedRpcProbe::default()
+    }
+}
 
 use crate::{
     cli::{IdeAgentCommands, IdeCommands, IdeReconcileStrategy},
@@ -80,6 +99,8 @@ struct IdeSession {
     remote_snapshot_age_secs: Option<u64>,
     ide_station_socket_live: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    link_pid: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     remote_rpc_responsive: Option<bool>,
     duplicate_group_size: usize,
     over_limit: bool,
@@ -113,7 +134,8 @@ enum StopOutcome {
 #[derive(Debug, Clone)]
 struct ChildProc {
     comm: String,
-    shell_integration: bool,
+    jetbrains_terminal: bool,
+    zed_terminal: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -370,6 +392,8 @@ struct IdeProjectRow {
     shell_children: usize,
     remote_snapshot_age_secs: Option<u64>,
     ide_station_socket_live: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link_pid: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     remote_rpc_responsive: Option<bool>,
     project_source: RemoteProjectSource,
@@ -1741,10 +1765,11 @@ fn format_memory_bytes(bytes: u64) -> String {
 
 fn render_ps_project_rows(rows: &[IdeProjectRow]) -> Vec<String> {
     let mut lines = vec![format!(
-        "{:<7} {:<12} {:<12} {:>7} {:>7} {:>5} {:>5} {:>6} {:<10} {:<12} {:>6} {:>6}  PROJECT",
+        "{:<7} {:<12} {:<12} {:>6} {:>7} {:>7} {:>5} {:>7} {:>6} {:<10} {:<12} {:>6} {:<6} {:>6}  PROJECT",
         "PID",
         "IDE",
         "VER",
+        "CPU",
         "RSS",
         "LIMIT",
         "TERM",
@@ -1753,6 +1778,7 @@ fn render_ps_project_rows(rows: &[IdeProjectRow]) -> Vec<String> {
         "STATE",
         "HEALTH",
         "FRESH",
+        "SRC",
         "CONF"
     )];
     let mut last_pid = None;
@@ -1766,7 +1792,7 @@ fn render_ps_project_rows(rows: &[IdeProjectRow]) -> Vec<String> {
 
 fn render_ps_project_row(row: &IdeProjectRow, show_process: bool) -> String {
     let version = truncate_end(&project_state::ide_project_row_version_label(row), 12);
-    let link = if row.controller_connected { "yes" } else { "-" };
+    let link = format_link_label(row);
     let idle = row
         .seconds_since_last_controller_activity
         .map(|secs| format!("{secs}s"))
@@ -1775,11 +1801,12 @@ fn render_ps_project_row(row: &IdeProjectRow, show_process: bool) -> String {
         .remote_snapshot_age_secs
         .map(|secs| format!("{secs}s"))
         .unwrap_or_else(|| "-".to_string());
-    let (pid, ide, version, rss, resource_limit, terminal_count) = if show_process {
+    let (pid, ide, version, cpu, rss, resource_limit, terminal_count) = if show_process {
         (
             row.pid.to_string(),
             truncate_end(&row.ide, 12),
             version,
+            format_cpu_percent(row.cpu_percent),
             format_memory_bytes(row.rss_bytes),
             format_optional_memory_bytes(row.heap_limit_bytes),
             row.shell_children.to_string(),
@@ -1792,13 +1819,15 @@ fn render_ps_project_row(row: &IdeProjectRow, show_process: bool) -> String {
             String::new(),
             String::new(),
             String::new(),
+            String::new(),
         )
     };
     format!(
-        "{:<7} {:<12} {:<12} {:>7} {:>7} {:>5} {:>5} {:>6} {:<10} {:<12} {:>6} {:>6}  {}",
+        "{:<7} {:<12} {:<12} {:>6} {:>7} {:>7} {:>5} {:>7} {:>6} {:<10} {:<12} {:>6} {:<6} {:>6}  {}",
         pid,
         ide,
         version,
+        cpu,
         rss,
         resource_limit,
         terminal_count,
@@ -1807,9 +1836,38 @@ fn render_ps_project_row(row: &IdeProjectRow, show_process: bool) -> String {
         truncate_end(&row.state, 10),
         truncate_end(&row.health, 12),
         freshness,
+        project_source_label(row.project_source),
         project_state::confidence_label(row.confidence),
         row.project_path
     )
+}
+
+fn format_cpu_percent(value: f64) -> String {
+    if value >= 100.0 {
+        format!("{value:.0}%")
+    } else if value >= 10.0 {
+        format!("{value:.1}%")
+    } else {
+        format!("{value:.2}%")
+    }
+}
+
+fn format_link_label(row: &IdeProjectRow) -> String {
+    if !row.controller_connected {
+        return "-".to_string();
+    }
+    row.link_pid
+        .map(|pid| format!("p{pid}"))
+        .unwrap_or_else(|| "yes".to_string())
+}
+
+fn project_source_label(source: RemoteProjectSource) -> &'static str {
+    match source {
+        RemoteProjectSource::Native => "native",
+        RemoteProjectSource::Rpc => "rpc",
+        RemoteProjectSource::Log => "log",
+        RemoteProjectSource::Unknown => "unknown",
+    }
 }
 
 fn render_ps_summary(
@@ -2580,6 +2638,7 @@ mod tests {
                 remote_snapshot_millis: 0,
                 remote_snapshot_age_secs: None,
                 ide_station_socket_live: false,
+                link_pid: None,
                 remote_rpc_responsive: None,
                 duplicate_group_size: 2,
                 over_limit: true,
@@ -2612,6 +2671,7 @@ mod tests {
                 remote_snapshot_millis: 0,
                 remote_snapshot_age_secs: None,
                 ide_station_socket_live: false,
+                link_pid: None,
                 remote_rpc_responsive: None,
                 duplicate_group_size: 2,
                 over_limit: true,
@@ -2687,11 +2747,14 @@ mod tests {
         let lines = render_ps_project_rows(&[first, second]);
         assert!(lines[0].contains("RSS"));
         assert!(lines[0].contains("LIMIT"));
+        assert!(lines[0].contains("CPU"));
         assert!(lines[0].contains("TERM"));
         assert!(lines[0].contains("LINK"));
+        assert!(lines[0].contains("SRC"));
         assert!(lines[1].starts_with("4082669"));
         assert!(lines[1].contains("4.8GiB"));
         assert!(lines[1].contains("4.0GiB"));
+        assert!(lines[1].contains("native"));
         assert!(lines[2].starts_with("        "));
         assert!(!lines[2].contains("4082669"));
         assert!(!lines[2].contains("4.8GiB"));
@@ -2875,6 +2938,7 @@ mod tests {
             shell_children: 0,
             remote_snapshot_age_secs: Some(0),
             ide_station_socket_live: true,
+            link_pid: None,
             remote_rpc_responsive: None,
             project_source: RemoteProjectSource::Native,
             confidence: ConfidenceLevel::High,
