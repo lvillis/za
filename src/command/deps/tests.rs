@@ -1,11 +1,12 @@
 use super::latest::{
     LatestQuerySource, LatestRecord, LatestStatus, LatestSuggestionKind, LatestSummary,
+    render_empty_latest,
 };
 use super::render::{render_latest_lines, render_latest_toml, render_report_lines};
 use super::{
     AuditSummary, CargoDependency, CargoMetadata, CargoPackage, CargoResolve, CargoResolveDepKind,
     CargoResolveNode, CargoResolveNodeDep, DepAuditRecord, DependencyUpdatePlan, RiskLevel,
-    collect_dependency_specs, derive_auto_jobs,
+    collect_dependency_inventory, collect_dependency_specs, derive_auto_jobs,
 };
 use std::path::Path;
 
@@ -56,6 +57,71 @@ fn collect_dependency_specs_include_optional_adds_inactive_optional_declarations
 }
 
 #[test]
+fn collect_dependency_specs_scans_all_workspace_members_even_when_root_is_set() {
+    let metadata = workspace_metadata();
+
+    let specs = collect_dependency_specs(&metadata, false, false, false).unwrap();
+    let names = specs
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(names, vec!["serde", "tokio"]);
+}
+
+#[test]
+fn collect_dependency_inventory_skips_workspace_and_local_path_crates() {
+    let metadata = workspace_metadata();
+
+    let inventory = collect_dependency_inventory(&metadata, false, false, false).unwrap();
+    let names = inventory
+        .specs
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect::<Vec<_>>();
+    let skipped = inventory
+        .skipped_local
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(names, vec!["serde", "tokio"]);
+    assert_eq!(skipped, vec!["local-helper", "workspace-core"]);
+}
+
+#[test]
+fn collect_dependency_specs_discards_partial_resolve_before_declared_fallback() {
+    let mut metadata = workspace_metadata();
+    metadata.packages[0].dependencies.push(CargoDependency {
+        name: "hyper".to_string(),
+        source: Some(registry_source()),
+        req: "^1".to_string(),
+        kind: None,
+        optional: true,
+    });
+    metadata.packages.push(CargoPackage {
+        id: "pkg-hyper".to_string(),
+        name: "hyper".to_string(),
+        source: Some(registry_source()),
+        dependencies: Vec::new(),
+    });
+    let resolve = metadata.resolve.as_mut().unwrap();
+    resolve.nodes[0].deps.push(CargoResolveNodeDep {
+        pkg: "pkg-hyper".to_string(),
+        dep_kinds: vec![CargoResolveDepKind { kind: None }],
+    });
+    resolve.nodes.retain(|node| node.id != "pkg-workspace-core");
+
+    let specs = collect_dependency_specs(&metadata, false, false, false).unwrap();
+    let names = specs
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(names, vec!["serde", "tokio"]);
+}
+
+#[test]
 fn render_report_lines_default_focuses_on_attention() {
     let manifest = Path::new("/tmp/work/Cargo.toml");
     let summary = AuditSummary {
@@ -63,6 +129,7 @@ fn render_report_lines_default_focuses_on_attention() {
         medium: 0,
         low: 1,
         unknown: 1,
+        skipped_local: 0,
     };
     let records = vec![
         sample_record(
@@ -102,6 +169,7 @@ fn render_report_lines_default_surfaces_low_risk_version_updates() {
         medium: 0,
         low: 2,
         unknown: 0,
+        skipped_local: 0,
     };
     let mut bumped = sample_record("reqx", RiskLevel::Low, &[]);
     bumped.latest_version = Some("0.1.31".to_string());
@@ -137,6 +205,7 @@ fn render_report_lines_verbose_includes_baseline_and_manifest() {
         medium: 1,
         low: 1,
         unknown: 0,
+        skipped_local: 0,
     };
     let records = vec![
         sample_record(
@@ -159,6 +228,24 @@ fn render_report_lines_verbose_includes_baseline_and_manifest() {
     assert!(output.contains("manifest  /tmp/work/Cargo.toml"));
     assert!(output.contains("reqwest"));
     assert!(output.contains("bytes"));
+}
+
+#[test]
+fn render_report_lines_summarizes_skipped_internal_dependencies() {
+    let manifest = Path::new("/tmp/work/Cargo.toml");
+    let summary = AuditSummary {
+        high: 0,
+        medium: 0,
+        low: 1,
+        unknown: 0,
+        skipped_local: 2,
+    };
+    let records = vec![sample_record("bytes", RiskLevel::Low, &[])];
+
+    let lines = render_report_lines(manifest, &summary, &records, false);
+    let output = lines.join("\n");
+
+    assert!(output.contains("OK     Cargo.toml  1 deps  1 low · 2 internal skipped"));
 }
 
 #[test]
@@ -210,6 +297,15 @@ fn render_latest_lines_show_summary_and_failure_note() {
     assert!(output.contains("mystery"));
     assert!(output.contains("timeout"));
     assert!(output.contains("manifest  /tmp/work/Cargo.toml"));
+}
+
+#[test]
+fn render_empty_latest_rejects_missing_manifest_source() {
+    let err = render_empty_latest(None, false, false).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("provide crate names or `--manifest-path <Cargo.toml>` or `--path <DIR>`")
+    );
 }
 
 #[test]
@@ -327,27 +423,32 @@ fn sample_metadata() -> CargoMetadata {
             CargoPackage {
                 id: "pkg-root".to_string(),
                 name: "sample".to_string(),
+                source: None,
                 dependencies: vec![
                     CargoDependency {
                         name: "bytes".to_string(),
+                        source: Some(registry_source()),
                         req: "^1".to_string(),
                         kind: None,
                         optional: false,
                     },
                     CargoDependency {
                         name: "futures-core".to_string(),
+                        source: Some(registry_source()),
                         req: "^0.3".to_string(),
                         kind: None,
                         optional: true,
                     },
                     CargoDependency {
                         name: "hyper".to_string(),
+                        source: Some(registry_source()),
                         req: "^1".to_string(),
                         kind: None,
                         optional: true,
                     },
                     CargoDependency {
                         name: "criterion".to_string(),
+                        source: Some(registry_source()),
                         req: "^0.5".to_string(),
                         kind: Some("dev".to_string()),
                         optional: false,
@@ -357,21 +458,25 @@ fn sample_metadata() -> CargoMetadata {
             CargoPackage {
                 id: "pkg-bytes".to_string(),
                 name: "bytes".to_string(),
+                source: Some(registry_source()),
                 dependencies: Vec::new(),
             },
             CargoPackage {
                 id: "pkg-futures-core".to_string(),
                 name: "futures-core".to_string(),
+                source: Some(registry_source()),
                 dependencies: Vec::new(),
             },
             CargoPackage {
                 id: "pkg-hyper".to_string(),
                 name: "hyper".to_string(),
+                source: Some(registry_source()),
                 dependencies: Vec::new(),
             },
             CargoPackage {
                 id: "pkg-criterion".to_string(),
                 name: "criterion".to_string(),
+                source: Some(registry_source()),
                 dependencies: Vec::new(),
             },
         ],
@@ -399,4 +504,103 @@ fn sample_metadata() -> CargoMetadata {
             }],
         }),
     }
+}
+
+fn workspace_metadata() -> CargoMetadata {
+    CargoMetadata {
+        packages: vec![
+            CargoPackage {
+                id: "pkg-app".to_string(),
+                name: "app".to_string(),
+                source: None,
+                dependencies: vec![
+                    CargoDependency {
+                        name: "serde".to_string(),
+                        source: Some(registry_source()),
+                        req: "^1".to_string(),
+                        kind: None,
+                        optional: false,
+                    },
+                    CargoDependency {
+                        name: "workspace-core".to_string(),
+                        source: None,
+                        req: "^0.1".to_string(),
+                        kind: None,
+                        optional: false,
+                    },
+                    CargoDependency {
+                        name: "local-helper".to_string(),
+                        source: None,
+                        req: "^0.1".to_string(),
+                        kind: None,
+                        optional: false,
+                    },
+                ],
+            },
+            CargoPackage {
+                id: "pkg-workspace-core".to_string(),
+                name: "workspace-core".to_string(),
+                source: None,
+                dependencies: vec![CargoDependency {
+                    name: "tokio".to_string(),
+                    source: Some(registry_source()),
+                    req: "^1".to_string(),
+                    kind: None,
+                    optional: false,
+                }],
+            },
+            CargoPackage {
+                id: "pkg-local-helper".to_string(),
+                name: "local-helper".to_string(),
+                source: None,
+                dependencies: Vec::new(),
+            },
+            CargoPackage {
+                id: "pkg-serde".to_string(),
+                name: "serde".to_string(),
+                source: Some(registry_source()),
+                dependencies: Vec::new(),
+            },
+            CargoPackage {
+                id: "pkg-tokio".to_string(),
+                name: "tokio".to_string(),
+                source: Some(registry_source()),
+                dependencies: Vec::new(),
+            },
+        ],
+        workspace_members: vec!["pkg-app".to_string(), "pkg-workspace-core".to_string()],
+        root: Some("pkg-app".to_string()),
+        resolve: Some(CargoResolve {
+            nodes: vec![
+                CargoResolveNode {
+                    id: "pkg-app".to_string(),
+                    deps: vec![
+                        CargoResolveNodeDep {
+                            pkg: "pkg-serde".to_string(),
+                            dep_kinds: vec![CargoResolveDepKind { kind: None }],
+                        },
+                        CargoResolveNodeDep {
+                            pkg: "pkg-workspace-core".to_string(),
+                            dep_kinds: vec![CargoResolveDepKind { kind: None }],
+                        },
+                        CargoResolveNodeDep {
+                            pkg: "pkg-local-helper".to_string(),
+                            dep_kinds: vec![CargoResolveDepKind { kind: None }],
+                        },
+                    ],
+                },
+                CargoResolveNode {
+                    id: "pkg-workspace-core".to_string(),
+                    deps: vec![CargoResolveNodeDep {
+                        pkg: "pkg-tokio".to_string(),
+                        dep_kinds: vec![CargoResolveDepKind { kind: None }],
+                    }],
+                },
+            ],
+        }),
+    }
+}
+
+fn registry_source() -> String {
+    "registry+https://github.com/rust-lang/crates.io-index".to_string()
 }

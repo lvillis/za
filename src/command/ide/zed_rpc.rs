@@ -153,10 +153,7 @@ fn parse_envelope(bytes: &[u8]) -> Option<Envelope> {
                     Some(u32::try_from(decode_varint(bytes, &mut cursor)?).ok()?);
             }
             (_, 2) => {
-                let len = usize::try_from(decode_varint(bytes, &mut cursor)?).ok()?;
-                let end = cursor.checked_add(len)?;
-                let payload = bytes.get(cursor..end)?;
-                cursor = end;
+                let payload = read_len_delimited(bytes, &mut cursor)?;
                 if is_zed_envelope_payload(field) {
                     envelope.payload_field = Some(field);
                     envelope.payload = payload.to_vec();
@@ -165,8 +162,8 @@ fn parse_envelope(bytes: &[u8]) -> Option<Envelope> {
             (_, 0) => {
                 let _ = decode_varint(bytes, &mut cursor)?;
             }
-            (_, 1) => cursor = cursor.checked_add(8)?,
-            (_, 5) => cursor = cursor.checked_add(4)?,
+            (_, 1) => skip_fixed(bytes, &mut cursor, 8)?,
+            (_, 5) => skip_fixed(bytes, &mut cursor, 4)?,
             _ => return None,
         }
     }
@@ -197,18 +194,9 @@ fn parse_update_project_paths(bytes: &[u8]) -> Vec<String> {
         match (field, wire) {
             (1, 0) => project_id = decode_varint(bytes, &mut cursor),
             (2, 2) => {
-                let Some(len) =
-                    decode_varint(bytes, &mut cursor).and_then(|v| usize::try_from(v).ok())
-                else {
+                let Some(worktree) = read_len_delimited(bytes, &mut cursor) else {
                     break;
                 };
-                let Some(end) = cursor.checked_add(len) else {
-                    break;
-                };
-                let Some(worktree) = bytes.get(cursor..end) else {
-                    break;
-                };
-                cursor = end;
                 if let Some(path) = parse_worktree_abs_path(worktree) {
                     paths.push(path);
                 }
@@ -217,18 +205,20 @@ fn parse_update_project_paths(bytes: &[u8]) -> Vec<String> {
                 let _ = decode_varint(bytes, &mut cursor);
             }
             (_, 2) => {
-                let Some(len) =
-                    decode_varint(bytes, &mut cursor).and_then(|v| usize::try_from(v).ok())
-                else {
+                if read_len_delimited(bytes, &mut cursor).is_none() {
                     break;
-                };
-                let Some(end) = cursor.checked_add(len) else {
-                    break;
-                };
-                cursor = end;
+                }
             }
-            (_, 1) => cursor = cursor.saturating_add(8),
-            (_, 5) => cursor = cursor.saturating_add(4),
+            (_, 1) => {
+                if skip_fixed(bytes, &mut cursor, 8).is_none() {
+                    break;
+                }
+            }
+            (_, 5) => {
+                if skip_fixed(bytes, &mut cursor, 4).is_none() {
+                    break;
+                }
+            }
             _ => break,
         }
     }
@@ -246,24 +236,22 @@ fn parse_worktree_abs_path(bytes: &[u8]) -> Option<String> {
         let wire = key & 0b111;
         match (field, wire) {
             (4, 2) => {
-                let len = usize::try_from(decode_varint(bytes, &mut cursor)?).ok()?;
-                let end = cursor.checked_add(len)?;
-                let raw = bytes.get(cursor..end)?;
+                let raw = read_len_delimited(bytes, &mut cursor)?;
                 return std::str::from_utf8(raw)
                     .ok()
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
+                    .filter(|value| Path::new(value).is_absolute())
                     .map(ToString::to_string);
             }
             (_, 0) => {
                 let _ = decode_varint(bytes, &mut cursor)?;
             }
             (_, 2) => {
-                let len = usize::try_from(decode_varint(bytes, &mut cursor)?).ok()?;
-                cursor = cursor.checked_add(len)?;
+                let _ = read_len_delimited(bytes, &mut cursor)?;
             }
-            (_, 1) => cursor = cursor.checked_add(8)?,
-            (_, 5) => cursor = cursor.checked_add(4)?,
+            (_, 1) => skip_fixed(bytes, &mut cursor, 8)?,
+            (_, 5) => skip_fixed(bytes, &mut cursor, 4)?,
             _ => return None,
         }
     }
@@ -287,6 +275,21 @@ fn encode_len_delimited_field(out: &mut Vec<u8>, field: u64, value: &[u8]) {
     encode_varint(out, (field << 3) | 2);
     encode_varint(out, value.len() as u64);
     out.extend_from_slice(value);
+}
+
+fn read_len_delimited<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+    let len = usize::try_from(decode_varint(bytes, cursor)?).ok()?;
+    let end = cursor.checked_add(len)?;
+    let payload = bytes.get(*cursor..end)?;
+    *cursor = end;
+    Some(payload)
+}
+
+fn skip_fixed(bytes: &[u8], cursor: &mut usize, len: usize) -> Option<()> {
+    let end = cursor.checked_add(len)?;
+    bytes.get(*cursor..end)?;
+    *cursor = end;
+    Some(())
 }
 
 fn encode_varint(out: &mut Vec<u8>, mut value: u64) {
@@ -331,25 +334,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_envelope_rejects_truncated_fixed_field() {
+        let mut bytes = Vec::new();
+        encode_varint(&mut bytes, (99 << 3) | 1);
+        bytes.extend_from_slice(&[1, 2, 3]);
+
+        assert!(parse_envelope(&bytes).is_none());
+    }
+
+    #[test]
     fn parse_update_project_paths_extracts_remote_worktree_paths() {
         let mut worktree = Vec::new();
         encode_varint_field(&mut worktree, 1, 7);
-        encode_len_delimited_field(&mut worktree, 4, b"/opt/app/za");
+        encode_len_delimited_field(&mut worktree, 4, b"/workspace/sample-repo");
 
         let mut update = Vec::new();
         encode_varint_field(&mut update, 1, REMOTE_SERVER_PROJECT_ID);
         encode_len_delimited_field(&mut update, 2, &worktree);
 
-        assert_eq!(parse_update_project_paths(&update), vec!["/opt/app/za"]);
+        assert_eq!(
+            parse_update_project_paths(&update),
+            vec!["/workspace/sample-repo"]
+        );
     }
 
     #[test]
     fn parse_update_project_paths_ignores_non_remote_project_id() {
         let mut worktree = Vec::new();
-        encode_len_delimited_field(&mut worktree, 4, b"/opt/app/za");
+        encode_len_delimited_field(&mut worktree, 4, b"/workspace/sample-repo");
 
         let mut update = Vec::new();
         encode_varint_field(&mut update, 1, 99);
+        encode_len_delimited_field(&mut update, 2, &worktree);
+
+        assert!(parse_update_project_paths(&update).is_empty());
+    }
+
+    #[test]
+    fn parse_update_project_paths_ignores_relative_worktree_paths() {
+        let mut worktree = Vec::new();
+        encode_len_delimited_field(&mut worktree, 4, b"relative/project");
+
+        let mut update = Vec::new();
+        encode_varint_field(&mut update, 1, REMOTE_SERVER_PROJECT_ID);
         encode_len_delimited_field(&mut update, 2, &worktree);
 
         assert!(parse_update_project_paths(&update).is_empty());

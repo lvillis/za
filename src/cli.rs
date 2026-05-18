@@ -105,7 +105,7 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: Option<ConfigCommands>,
     },
-    /// Manage JetBrains remote IDE sessions
+    /// Inspect and manage supported remote IDE sessions
     Ide {
         #[command(subcommand)]
         cmd: IdeCommands,
@@ -566,11 +566,14 @@ pub struct AiGitDiffArgs {
     pub staged: bool,
 }
 
-#[derive(Args, Clone, Debug, Default)]
+#[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
 pub struct DepsAuditArgs {
     /// Optional path to Cargo.toml (defaults to current workspace root).
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "path")]
     pub manifest_path: Option<PathBuf>,
+    /// Optional project directory or Cargo.toml path to audit.
+    #[arg(long, value_name = "PATH")]
+    pub path: Option<PathBuf>,
     /// Optional GitHub token override for this run.
     #[arg(long, value_name = "TOKEN")]
     pub github_token: Option<String>,
@@ -601,22 +604,25 @@ pub struct DepsAuditArgs {
 pub enum DepsCommands {
     /// Resolve latest stable versions for one or more crates
     Latest {
-        /// Crate names to resolve. Omit only when `--manifest-path` is used.
+        /// Crate names to resolve. Omit only when `--manifest-path` or `--path` is used.
         #[arg(value_name = "CRATE")]
         crates: Vec<String>,
         /// Optional path to Cargo.toml used to source crate names.
-        #[arg(long, alias = "manifest", value_name = "PATH")]
+        #[arg(long, alias = "manifest", value_name = "PATH", conflicts_with = "path")]
         manifest_path: Option<PathBuf>,
+        /// Optional project directory or Cargo.toml path used to source crate names.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
         /// Number of concurrent workers for API queries (default: auto, based on CPU count).
         #[arg(long, value_name = "JOBS")]
         jobs: Option<usize>,
-        /// Include dev-dependencies when `--manifest-path` is used.
+        /// Include dev-dependencies when reading crates from a manifest.
         #[arg(long)]
         include_dev: bool,
-        /// Include build-dependencies when `--manifest-path` is used.
+        /// Include build-dependencies when reading crates from a manifest.
         #[arg(long)]
         include_build: bool,
-        /// Also include optional dependencies when `--manifest-path` is used.
+        /// Also include optional dependencies when reading crates from a manifest.
         #[arg(long)]
         include_optional: bool,
         /// Print JSON output for scripting.
@@ -731,7 +737,7 @@ pub enum IdeCommands {
         #[command(subcommand)]
         cmd: IdeAgentCommands,
     },
-    /// List JetBrains remote IDE server processes
+    /// List supported remote IDE server processes
     Ps {
         /// Only show projects with duplicate server instances.
         #[arg(long)]
@@ -1500,6 +1506,7 @@ mod tests {
             Commands::Deps { audit, cmd } => {
                 assert!(cmd.is_none());
                 assert!(audit.manifest_path.is_none());
+                assert!(audit.path.is_none());
                 assert!(audit.github_token.is_none());
                 assert!(audit.jobs.is_none());
                 assert!(!audit.include_dev);
@@ -1508,6 +1515,20 @@ mod tests {
                 assert!(audit.json.is_none());
                 assert!(!audit.fail_on_high);
                 assert!(audit.verbose);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn deps_parses_project_path() {
+        let cli = Cli::try_parse_from(["za", "deps", "--path", "/workspace/project"])
+            .expect("must parse");
+        match cli.cmd {
+            Commands::Deps { audit, cmd } => {
+                assert!(cmd.is_none());
+                assert_eq!(audit.path, Some(PathBuf::from("/workspace/project")));
+                assert!(audit.manifest_path.is_none());
             }
             _ => panic!("unexpected command"),
         }
@@ -1530,6 +1551,7 @@ mod tests {
                 Some(DepsCommands::Latest {
                     crates,
                     manifest_path,
+                    path,
                     jobs,
                     include_dev,
                     include_build,
@@ -1540,6 +1562,7 @@ mod tests {
                 }) => {
                     assert_eq!(crates, vec!["serde"]);
                     assert_eq!(manifest_path, Some(PathBuf::from("Cargo.toml")));
+                    assert!(path.is_none());
                     assert!(jobs.is_none());
                     assert!(!include_dev);
                     assert!(!include_build);
@@ -1576,6 +1599,50 @@ mod tests {
             },
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn deps_latest_rejects_conflicting_output_modes() {
+        assert!(Cli::try_parse_from(["za", "deps", "latest", "reqx", "--json", "--toml"]).is_err());
+        assert!(
+            Cli::try_parse_from(["za", "deps", "latest", "reqx", "--toml", "--suggest"]).is_err()
+        );
+    }
+
+    #[test]
+    fn deps_latest_parses_project_path() {
+        let cli = Cli::try_parse_from(["za", "deps", "latest", "--path", "/workspace/project"])
+            .expect("must parse");
+        match cli.cmd {
+            Commands::Deps { cmd, .. } => match cmd {
+                Some(DepsCommands::Latest {
+                    crates,
+                    manifest_path,
+                    path,
+                    ..
+                }) => {
+                    assert!(crates.is_empty());
+                    assert!(manifest_path.is_none());
+                    assert_eq!(path, Some(PathBuf::from("/workspace/project")));
+                }
+                _ => panic!("unexpected deps command"),
+            },
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn deps_allows_global_color_before_subcommand() {
+        let cli =
+            Cli::try_parse_from(["za", "deps", "--color", "never", "latest"]).expect("must parse");
+        assert_eq!(cli.color, ColorWhen::Never);
+        assert!(matches!(
+            cli.cmd,
+            Commands::Deps {
+                cmd: Some(DepsCommands::Latest { .. }),
+                ..
+            }
+        ));
     }
 
     #[test]

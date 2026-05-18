@@ -887,12 +887,12 @@ mod tests {
 
     #[test]
     fn codex_env_overrides_include_expected_markers_and_bash_env() {
-        let envs = codex_env_overrides(Path::new("/opt/app/za")).expect("env overrides");
+        let envs = codex_env_overrides(Path::new("/workspace/sample-repo")).expect("env overrides");
         assert!(envs.iter().any(|(k, v)| k == AI_SESSION_KEY && v == "1"));
         assert!(envs.iter().any(|(k, v)| k == AI_AGENT_KEY && v == "codex"));
         assert!(
             envs.iter()
-                .any(|(k, v)| k == AI_WORKSPACE_KEY && v == "/opt/app/za")
+                .any(|(k, v)| k == AI_WORKSPACE_KEY && v == "/workspace/sample-repo")
         );
         let bash_env = envs
             .iter()
@@ -911,7 +911,7 @@ mod tests {
             AiShell::Bash,
             &super::AiSessionContext {
                 agent: "codex".to_string(),
-                workspace: "/opt/app/za".to_string(),
+                workspace: "/workspace/sample-repo".to_string(),
                 za_executable: "/usr/local/bin/za".to_string(),
             },
         );
@@ -937,7 +937,7 @@ mod tests {
                 schema_version: 1,
                 recorded_at_unix_ms: 1,
                 agent: "codex".to_string(),
-                workspace: "/opt/app/za".to_string(),
+                workspace: "/workspace/sample-repo".to_string(),
                 route: "git status".to_string(),
                 source_command: "git status".to_string(),
                 raw_bytes: 1200,
@@ -950,7 +950,7 @@ mod tests {
                 schema_version: 1,
                 recorded_at_unix_ms: 2,
                 agent: "codex".to_string(),
-                workspace: "/opt/app/za".to_string(),
+                workspace: "/workspace/sample-repo".to_string(),
                 route: "git diff".to_string(),
                 source_command: "git diff --cached".to_string(),
                 raw_bytes: 2400,
@@ -961,7 +961,7 @@ mod tests {
             },
         ];
 
-        let out = aggregate_gain_records(7, "/opt/app/za", GainView::Summary, &records);
+        let out = aggregate_gain_records(7, "/workspace/sample-repo", GainView::Summary, &records);
         assert_eq!(out.total_calls, 2);
         assert_eq!(out.total_raw_bytes, 3600);
         assert_eq!(out.total_saved_bytes, 2700);
@@ -974,13 +974,13 @@ mod tests {
     fn render_gain_mentions_routes_and_savings() {
         let out = render_gain(&aggregate_gain_records(
             7,
-            "/opt/app/za",
+            "/workspace/sample-repo",
             GainView::Summary,
             &[AiAnalyticsRecord {
                 schema_version: 1,
                 recorded_at_unix_ms: 1,
                 agent: "codex".to_string(),
-                workspace: "/opt/app/za".to_string(),
+                workspace: "/workspace/sample-repo".to_string(),
                 route: "git status".to_string(),
                 source_command: "git status".to_string(),
                 raw_bytes: 2048,
@@ -1005,7 +1005,7 @@ mod tests {
                 schema_version: 1,
                 recorded_at_unix_ms: 1_700_000_000_000,
                 agent: "codex".to_string(),
-                workspace: "/opt/app/za".to_string(),
+                workspace: "/workspace/sample-repo".to_string(),
                 route: "git diff".to_string(),
                 source_command: "git diff".to_string(),
                 raw_bytes: 4096,

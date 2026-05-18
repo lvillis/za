@@ -216,12 +216,12 @@ fi"#
 pub(crate) fn blesh_bash_init_top_block(active_path: &Path) -> String {
     format!(
         r#"if _za_is_supported_ide_terminal && [[ $- == *i* ]]; then
-  if source -- "{}" --attach=none; then
+  if source -- {} --attach=none; then
     bleopt prompt_command_changes_layout=1
     bleopt internal_suppress_bash_output=
   fi
 fi"#,
-        active_path.display()
+        shell_single_quote(&active_path.display().to_string())
     )
 }
 
@@ -382,4 +382,8 @@ fn insert_managed_block_before_marker(content: &str, block: &str, marker: &str) 
         (false, true) => format!("{prefix}\n\n{block}\n"),
         (false, false) => format!("{prefix}\n\n{block}\n\n{suffix}\n"),
     }
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }

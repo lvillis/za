@@ -54,6 +54,8 @@ pub(super) struct AuditSummary {
     pub(super) medium: usize,
     pub(super) low: usize,
     pub(super) unknown: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(super) skipped_local: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +114,10 @@ pub(super) struct AuditReport {
     pub(super) manifest_path: String,
     pub(super) summary: AuditSummary,
     pub(super) dependencies: Vec<DepAuditRecord>,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 pub(super) fn classify_risk(record: &mut DepAuditRecord) {

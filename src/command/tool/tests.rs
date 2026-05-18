@@ -639,12 +639,18 @@ fn starship_bash_init_block_uses_supported_ide_terminal_helper() {
 }
 
 #[test]
-fn blesh_bash_init_top_block_sets_jetbrains_compatibility_options() {
+fn blesh_bash_init_top_block_sets_supported_ide_options() {
     let block = blesh_bash_init_top_block(std::path::Path::new("/tmp/blesh/ble.sh"));
     assert!(block.contains(r#"if _za_is_supported_ide_terminal && [[ $- == *i* ]]; then"#));
-    assert!(block.contains(r#"if source -- "/tmp/blesh/ble.sh" --attach=none; then"#));
+    assert!(block.contains(r#"if source -- '/tmp/blesh/ble.sh' --attach=none; then"#));
     assert!(block.contains("bleopt prompt_command_changes_layout=1"));
     assert!(block.contains("bleopt internal_suppress_bash_output="));
+}
+
+#[test]
+fn blesh_bash_init_top_block_shell_quotes_active_path() {
+    let block = blesh_bash_init_top_block(std::path::Path::new("/tmp/a'b/ble.sh"));
+    assert!(block.contains(r#"if source -- '/tmp/a'"'"'b/ble.sh' --attach=none; then"#));
 }
 
 #[test]
@@ -847,7 +853,7 @@ export PATH=/tmp
     assert!(helper_index < top_index);
     assert!(top_index < path_index);
     assert_eq!(content.matches(BLESH_BASH_INIT_TOP_START_MARKER).count(), 1);
-    assert!(content.contains(r#"source -- "/tmp/blesh/ble.sh" --attach=none"#));
+    assert!(content.contains(r#"source -- '/tmp/blesh/ble.sh' --attach=none"#));
 
     let _ = fs::remove_dir_all(&root);
 }

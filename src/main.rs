@@ -14,20 +14,8 @@ fn main() -> Result<()> {
         cli::ColorWhen::Never => command::style::ColorMode::Never,
     });
     match args.cmd {
-        cli::Commands::Ai { cmd } => {
-            let exit_code = command::ai::run(cmd)?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-            Ok(())
-        }
-        cli::Commands::Completion { cmd } => {
-            let exit_code = command::completion::run(cmd)?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-            Ok(())
-        }
+        cli::Commands::Ai { cmd } => exit_with(command::ai::run(cmd)?),
+        cli::Commands::Completion { cmd } => exit_with(command::completion::run(cmd)?),
         cli::Commands::Diff { args, cmd } => {
             let exit_code = match cmd {
                 Some(cli::DiffCommands::Stats {
@@ -77,10 +65,7 @@ fn main() -> Result<()> {
                         .collect(),
                 })?,
             };
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-            Ok(())
+            exit_with(exit_code)
         }
         cli::Commands::Gen {
             max_lines,
@@ -90,20 +75,11 @@ fn main() -> Result<()> {
             r#ref,
         } => command::r#gen::run(max_lines, output, include_binary, repo, r#ref),
         cli::Commands::Deps { audit, cmd } => match cmd {
-            None => command::deps::run(command::deps::DepsRunOptions {
-                manifest_path: audit.manifest_path,
-                github_token_override: audit.github_token,
-                jobs: audit.jobs,
-                include_dev: audit.include_dev,
-                include_build: audit.include_build,
-                include_optional: audit.include_optional,
-                json_out: audit.json,
-                fail_on_high: audit.fail_on_high,
-                verbose: audit.verbose,
-            }),
+            None => run_deps_audit(audit),
             Some(cli::DepsCommands::Latest {
                 crates,
                 manifest_path,
+                path,
                 jobs,
                 include_dev,
                 include_build,
@@ -111,97 +87,77 @@ fn main() -> Result<()> {
                 json,
                 toml,
                 suggest,
-            }) => command::deps::run_latest(command::deps::DepsLatestOptions {
-                crates,
-                manifest_path,
-                jobs,
-                include_dev,
-                include_build,
-                include_optional,
-                json,
-                toml,
-                suggest,
-            }),
+            }) => {
+                reject_parent_deps_audit_args(&audit)?;
+                command::deps::run_latest(command::deps::DepsLatestOptions {
+                    crates,
+                    manifest_path,
+                    project_path: path,
+                    jobs,
+                    include_dev,
+                    include_build,
+                    include_optional,
+                    json,
+                    toml,
+                    suggest,
+                })
+            }
         },
-        cli::Commands::Pin { cmd } => {
-            let exit_code = command::pin::run(cmd)?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-            Ok(())
-        }
-        cli::Commands::Port { cmd } => {
-            let exit_code = command::port::run(cmd)?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-            Ok(())
-        }
-        cli::Commands::Tool { user, cmd } => {
-            let exit_code = command::tool::run(cmd, user)?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-            Ok(())
-        }
-        cli::Commands::Run { tool, args } => {
-            let exit_code = command::run::run(&tool, &args)?;
-            std::process::exit(exit_code);
-        }
-        cli::Commands::Codex { cmd, args } => {
-            let exit_code = command::codex::run(cmd, &args)?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-            Ok(())
-        }
+        cli::Commands::Pin { cmd } => exit_with(command::pin::run(cmd)?),
+        cli::Commands::Port { cmd } => exit_with(command::port::run(cmd)?),
+        cli::Commands::Tool { user, cmd } => exit_with(command::tool::run(cmd, user)?),
+        cli::Commands::Run { tool, args } => exit_with(command::run::run(&tool, &args)?),
+        cli::Commands::Codex { cmd, args } => exit_with(command::codex::run(cmd, &args)?),
         cli::Commands::Update {
             user,
             check,
             version,
-        } => {
-            let exit_code = command::tool::update_self(user, check, version)?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-            Ok(())
-        }
+        } => exit_with(command::tool::update_self(user, check, version)?),
         cli::Commands::Config { cmd } => command::za_config::run(cmd),
-        cli::Commands::Ide { cmd } => {
-            let exit_code = command::ide::run(cmd)?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-            Ok(())
-        }
+        cli::Commands::Ide { cmd } => exit_with(command::ide::run(cmd)?),
         cli::Commands::Gh { cmd } => match cmd {
-            cli::GhCommands::Auth { cmd } => {
-                let exit_code = command::git::run_auth(cmd)?;
-                if exit_code != 0 {
-                    std::process::exit(exit_code);
-                }
-                Ok(())
-            }
+            cli::GhCommands::Auth { cmd } => exit_with(command::git::run_auth(cmd)?),
             cli::GhCommands::Ci {
                 json,
                 github_token,
                 cmd,
-            } => {
-                let exit_code = command::ci::run(cmd, json, github_token)?;
-                if exit_code != 0 {
-                    std::process::exit(exit_code);
-                }
-                Ok(())
-            }
+            } => exit_with(command::ci::run(cmd, json, github_token)?),
             cli::GhCommands::Credential { operation } => {
-                let exit_code = command::git::run_credential(operation)?;
-                if exit_code != 0 {
-                    std::process::exit(exit_code);
-                }
-                Ok(())
+                exit_with(command::git::run_credential(operation)?)
             }
         },
     }
+}
+
+fn run_deps_audit(audit: cli::DepsAuditArgs) -> Result<()> {
+    command::deps::run(command::deps::DepsRunOptions {
+        manifest_path: audit.manifest_path,
+        project_path: audit.path,
+        github_token_override: audit.github_token,
+        jobs: audit.jobs,
+        include_dev: audit.include_dev,
+        include_build: audit.include_build,
+        include_optional: audit.include_optional,
+        json_out: audit.json,
+        fail_on_high: audit.fail_on_high,
+        verbose: audit.verbose,
+    })
+}
+
+fn reject_parent_deps_audit_args(audit: &cli::DepsAuditArgs) -> Result<()> {
+    if audit != &cli::DepsAuditArgs::default() {
+        return Err(anyhow!(
+            "`za deps <subcommand>` does not accept audit options before the subcommand; pass subcommand options after `latest`"
+        ));
+    }
+    Ok(())
+}
+
+fn exit_with(code: i32) -> Result<()> {
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 fn init_tls_crypto_provider() -> Result<()> {

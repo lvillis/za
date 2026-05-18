@@ -48,6 +48,7 @@ const GITHUB_CACHE_TTL_SECS: u64 = 60 * 60;
 
 pub struct DepsRunOptions {
     pub manifest_path: Option<PathBuf>,
+    pub project_path: Option<PathBuf>,
     pub github_token_override: Option<String>,
     pub jobs: Option<usize>,
     pub include_dev: bool,
@@ -61,6 +62,7 @@ pub struct DepsRunOptions {
 pub struct DepsLatestOptions {
     pub crates: Vec<String>,
     pub manifest_path: Option<PathBuf>,
+    pub project_path: Option<PathBuf>,
     pub jobs: Option<usize>,
     pub include_dev: bool,
     pub include_build: bool,
@@ -73,6 +75,7 @@ pub struct DepsLatestOptions {
 pub fn run(opts: DepsRunOptions) -> Result<()> {
     let DepsRunOptions {
         manifest_path,
+        project_path,
         github_token_override,
         jobs,
         include_dev,
@@ -83,26 +86,36 @@ pub fn run(opts: DepsRunOptions) -> Result<()> {
         verbose,
     } = opts;
 
-    let manifest_path = canonical_manifest_path(manifest_path)?;
+    let manifest_path = resolve_manifest_path(manifest_path, project_path)?;
     let metadata = cargo_metadata(&manifest_path)?;
-    let specs = collect_dependency_specs(&metadata, include_dev, include_build, include_optional)?;
-    if specs.is_empty() {
-        println!("No dependencies found for audit.");
+    let inventory =
+        collect_dependency_inventory(&metadata, include_dev, include_build, include_optional)?;
+    if inventory.specs.is_empty() {
+        if inventory.skipped_local_count() > 0 {
+            println!(
+                "No external dependencies found for audit; skipped {} internal/path {}.",
+                inventory.skipped_local_count(),
+                dependency_label(inventory.skipped_local_count())
+            );
+        } else {
+            println!("No dependencies found for audit.");
+        }
         return Ok(());
     }
 
     let requested_jobs = jobs.unwrap_or_else(default_deps_jobs);
-    let worker_count = normalize_jobs(requested_jobs, specs.len());
+    let worker_count = normalize_jobs(requested_jobs, inventory.specs.len());
     println!(
         "Auditing {} dependencies with {} workers...",
-        specs.len(),
+        inventory.specs.len(),
         worker_count
     );
+    let skipped_local = inventory.skipped_local_count();
     let api = Arc::new(ApiClient::new(github_token_override)?);
-    let mut records = audit_dependencies(Arc::clone(&api), specs, worker_count)?;
+    let mut records = audit_dependencies(Arc::clone(&api), inventory.specs, worker_count)?;
     sort_records(&mut records);
 
-    let summary = build_summary(&records);
+    let summary = build_summary(&records, skipped_local);
     print_report(&manifest_path, &summary, &records, verbose);
 
     if let Some(path) = json_out {
@@ -143,14 +156,35 @@ fn audit_dependencies(
     specs: Vec<DependencySpec>,
     jobs: usize,
 ) -> Result<Vec<DepAuditRecord>> {
-    let progress = build_progress(specs.len() as u64);
-    let queue = Arc::new(Mutex::new(VecDeque::from(specs)));
+    run_work_queue(
+        specs,
+        jobs,
+        "dependency queue",
+        "dependency records",
+        |spec| api.audit_one(spec),
+    )
+}
+
+fn run_work_queue<T, R, F>(
+    items: Vec<T>,
+    jobs: usize,
+    queue_label: &'static str,
+    records_label: &'static str,
+    worker: F,
+) -> Result<Vec<R>>
+where
+    T: Send,
+    R: Send,
+    F: Fn(T) -> Result<R> + Sync,
+{
+    let progress = build_progress(items.len() as u64);
+    let queue = Arc::new(Mutex::new(VecDeque::from(items)));
     let records = Arc::new(Mutex::new(Vec::new()));
     let first_error: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
+    let worker = &worker;
 
     thread::scope(|scope| {
         for _ in 0..jobs {
-            let api = Arc::clone(&api);
             let queue = Arc::clone(&queue);
             let records = Arc::clone(&records);
             let first_error = Arc::clone(&first_error);
@@ -162,28 +196,28 @@ fn audit_dependencies(
                         break;
                     }
 
-                    let spec = match queue.lock() {
+                    let item = match queue.lock() {
                         Ok(mut guard) => guard.pop_front(),
                         Err(_) => {
                             store_error(
                                 first_error.as_ref(),
-                                anyhow!("dependency queue lock poisoned"),
+                                anyhow!("{queue_label} lock poisoned"),
                             );
                             break;
                         }
                     };
 
-                    let Some(spec) = spec else {
+                    let Some(item) = item else {
                         break;
                     };
 
-                    match api.audit_one(spec) {
+                    match worker(item) {
                         Ok(record) => match records.lock() {
                             Ok(mut guard) => guard.push(record),
                             Err(_) => {
                                 store_error(
                                     first_error.as_ref(),
-                                    anyhow!("dependency records lock poisoned"),
+                                    anyhow!("{records_label} lock poisoned"),
                                 );
                                 break;
                             }
@@ -215,7 +249,7 @@ fn audit_dependencies(
 
     let mut records_guard = records
         .lock()
-        .map_err(|_| anyhow!("dependency records lock poisoned"))?;
+        .map_err(|_| anyhow!("{records_label} lock poisoned"))?;
     Ok(std::mem::take(&mut *records_guard))
 }
 
@@ -247,11 +281,28 @@ fn store_error(first_error: &Mutex<Option<anyhow::Error>>, err: anyhow::Error) {
     }
 }
 
-fn canonical_manifest_path(input: Option<PathBuf>) -> Result<PathBuf> {
-    let path = match input {
-        Some(path) => path,
-        None => PathBuf::from("Cargo.toml"),
+fn resolve_manifest_path(
+    manifest_path: Option<PathBuf>,
+    project_path: Option<PathBuf>,
+) -> Result<PathBuf> {
+    let path = match (manifest_path, project_path) {
+        (Some(path), None) => path,
+        (None, Some(path)) => manifest_from_project_path(path),
+        (None, None) => PathBuf::from("Cargo.toml"),
+        (Some(_), Some(_)) => bail!("use either `--manifest-path` or `--path`, not both"),
     };
+    canonical_manifest_path(path)
+}
+
+fn manifest_from_project_path(path: PathBuf) -> PathBuf {
+    if path.is_dir() {
+        path.join("Cargo.toml")
+    } else {
+        path
+    }
+}
+
+fn canonical_manifest_path(path: PathBuf) -> Result<PathBuf> {
     let canonical = fs::canonicalize(&path)
         .with_context(|| format!("cannot resolve manifest path {}", path.display()))?;
     if !canonical.is_file() {
@@ -283,146 +334,231 @@ fn collect_dependency_specs(
     include_build: bool,
     include_optional: bool,
 ) -> Result<Vec<DependencySpec>> {
-    let mut package_by_id: BTreeMap<&str, &CargoPackage> = BTreeMap::new();
-    for pkg in &metadata.packages {
-        package_by_id.insert(pkg.id.as_str(), pkg);
-    }
+    Ok(collect_dependency_inventory(metadata, include_dev, include_build, include_optional)?.specs)
+}
 
-    let package_ids = target_package_ids(metadata);
-    let mut collected: BTreeMap<String, DependencySpecBuilder> = BTreeMap::new();
-
-    let used_resolve = collect_resolved_dependency_specs(
-        metadata,
-        &package_by_id,
-        &package_ids,
-        include_dev,
-        include_build,
-        &mut collected,
-    )?;
+fn collect_dependency_inventory(
+    metadata: &CargoMetadata,
+    include_dev: bool,
+    include_build: bool,
+    include_optional: bool,
+) -> Result<DependencyInventory> {
+    let mut collector = DependencyCollector::new(metadata, include_dev, include_build);
+    let used_resolve = collector.collect_resolved_dependency_specs()?;
 
     if include_optional {
-        collect_declared_dependency_specs(
-            &package_by_id,
-            &package_ids,
-            include_dev,
-            include_build,
-            true,
-            &mut collected,
-            DeclaredDependencySelection::OptionalOnly,
-        )?;
+        collector
+            .collect_declared_dependency_specs(true, DeclaredDependencySelection::OptionalOnly)?;
     }
 
     if !used_resolve {
-        collect_declared_dependency_specs(
-            &package_by_id,
-            &package_ids,
-            include_dev,
-            include_build,
+        collector.collect_declared_dependency_specs(
             include_optional,
-            &mut collected,
             DeclaredDependencySelection::All,
         )?;
     }
 
-    Ok(build_dependency_specs(collected))
+    Ok(collector.finish())
 }
 
-fn collect_resolved_dependency_specs(
-    metadata: &CargoMetadata,
-    package_by_id: &BTreeMap<&str, &CargoPackage>,
-    package_ids: &[&str],
+struct DependencyCollector<'a> {
+    metadata: &'a CargoMetadata,
+    package_by_id: BTreeMap<&'a str, &'a CargoPackage>,
+    package_ids: Vec<&'a str>,
+    workspace_member_ids: BTreeSet<&'a str>,
     include_dev: bool,
     include_build: bool,
-    collected: &mut BTreeMap<String, DependencySpecBuilder>,
-) -> Result<bool> {
-    let Some(resolve) = metadata.resolve.as_ref() else {
-        return Ok(false);
-    };
+    collected: BTreeMap<String, DependencySpecBuilder>,
+    skipped_local: BTreeMap<String, DependencySpecBuilder>,
+}
 
-    let mut node_by_id: BTreeMap<&str, &CargoResolveNode> = BTreeMap::new();
-    for node in &resolve.nodes {
-        node_by_id.insert(node.id.as_str(), node);
+struct CollectedDependencyEntry {
+    local: bool,
+    name: String,
+    requirement: String,
+    kind: String,
+    optional: bool,
+}
+
+impl<'a> DependencyCollector<'a> {
+    fn new(metadata: &'a CargoMetadata, include_dev: bool, include_build: bool) -> Self {
+        let mut package_by_id: BTreeMap<&str, &CargoPackage> = BTreeMap::new();
+        for pkg in &metadata.packages {
+            package_by_id.insert(pkg.id.as_str(), pkg);
+        }
+        Self {
+            metadata,
+            package_by_id,
+            package_ids: target_package_ids(metadata),
+            workspace_member_ids: metadata
+                .workspace_members
+                .iter()
+                .map(String::as_str)
+                .collect(),
+            include_dev,
+            include_build,
+            collected: BTreeMap::new(),
+            skipped_local: BTreeMap::new(),
+        }
     }
 
-    for package_id in package_ids {
-        let package = package_by_id
-            .get(package_id)
-            .ok_or_else(|| anyhow!("workspace package id not found in metadata: {package_id}"))?;
-        let Some(node) = node_by_id.get(package_id) else {
+    fn collect_resolved_dependency_specs(&mut self) -> Result<bool> {
+        let Some(resolve) = self.metadata.resolve.as_ref() else {
             return Ok(false);
         };
 
-        for dep in &node.deps {
-            let dep_package = package_by_id
-                .get(dep.pkg.as_str())
-                .ok_or_else(|| anyhow!("resolved dependency package not found: {}", dep.pkg))?;
+        let mut node_by_id: BTreeMap<&str, &CargoResolveNode> = BTreeMap::new();
+        for node in &resolve.nodes {
+            node_by_id.insert(node.id.as_str(), node);
+        }
 
-            let active_kinds = dependency_kinds_from_resolve(dep);
-            for kind in active_kinds {
-                if !should_include_kind(kind, include_dev, include_build) {
-                    continue;
+        let mut collected = BTreeMap::new();
+        let mut skipped_local = BTreeMap::new();
+
+        for package_id in self.package_ids.clone() {
+            let package = self.package(package_id)?;
+            let Some(node) = node_by_id.get(package_id) else {
+                return Ok(false);
+            };
+
+            for dep in &node.deps {
+                let dep_package = self
+                    .package_by_id
+                    .get(dep.pkg.as_str())
+                    .ok_or_else(|| anyhow!("resolved dependency package not found: {}", dep.pkg))?;
+                for entry in self.resolved_dependency_entries(package, dep_package, dep) {
+                    Self::insert_entry_into(&mut collected, &mut skipped_local, entry);
                 }
-
-                let declarations =
-                    matching_dependency_declarations(package, &dep_package.name, kind);
-                let requirement = declarations
-                    .iter()
-                    .map(|dep| dep.req.as_str())
-                    .collect::<BTreeSet<_>>();
-                let optional = declarations.iter().all(|dep| dep.optional);
-
-                insert_dependency_spec(
-                    collected,
-                    dep_package.name.clone(),
-                    join_str_set(&requirement),
-                    kind.to_string(),
-                    optional,
-                );
             }
         }
+
+        self.collected = collected;
+        self.skipped_local = skipped_local;
+        Ok(true)
     }
 
-    Ok(true)
-}
+    fn resolved_dependency_entries(
+        &self,
+        package: &CargoPackage,
+        dep_package: &CargoPackage,
+        dep: &CargoResolveNodeDep,
+    ) -> Vec<CollectedDependencyEntry> {
+        let mut entries = Vec::new();
+        for kind in dependency_kinds_from_resolve(dep) {
+            if !should_include_kind(kind, self.include_dev, self.include_build) {
+                continue;
+            }
 
-fn collect_declared_dependency_specs(
-    package_by_id: &BTreeMap<&str, &CargoPackage>,
-    package_ids: &[&str],
-    include_dev: bool,
-    include_build: bool,
-    include_optional: bool,
-    collected: &mut BTreeMap<String, DependencySpecBuilder>,
-    selection: DeclaredDependencySelection,
-) -> Result<()> {
-    for package_id in package_ids {
-        let package = package_by_id
+            let declarations = matching_dependency_declarations(package, &dep_package.name, kind);
+            let requirement = declarations
+                .iter()
+                .map(|dep| dep.req.as_str())
+                .collect::<BTreeSet<_>>();
+            let optional = declarations.iter().all(|dep| dep.optional);
+            entries.push(CollectedDependencyEntry {
+                local: self.is_local_package(dep_package),
+                name: dep_package.name.clone(),
+                requirement: join_str_set(&requirement),
+                kind: kind.to_string(),
+                optional,
+            });
+        }
+        entries
+    }
+
+    fn collect_declared_dependency_specs(
+        &mut self,
+        include_optional: bool,
+        selection: DeclaredDependencySelection,
+    ) -> Result<()> {
+        for package_id in self.package_ids.clone() {
+            let package = self.package(package_id)?;
+            let entries = package
+                .dependencies
+                .iter()
+                .filter_map(|dep| self.declared_dependency_entry(dep, include_optional, selection))
+                .collect::<Vec<_>>();
+
+            for entry in entries {
+                self.insert_entry(entry);
+            }
+        }
+        Ok(())
+    }
+
+    fn declared_dependency_entry(
+        &self,
+        dep: &CargoDependency,
+        include_optional: bool,
+        selection: DeclaredDependencySelection,
+    ) -> Option<CollectedDependencyEntry> {
+        if !selection.matches(dep.optional) {
+            return None;
+        }
+        if dep.optional && !include_optional {
+            return None;
+        }
+
+        let kind = dependency_kind(dep.kind.as_deref());
+        if !should_include_kind(kind, self.include_dev, self.include_build) {
+            return None;
+        }
+
+        Some(CollectedDependencyEntry {
+            local: self.declared_dependency_is_local(dep),
+            name: dep.name.clone(),
+            requirement: dep.req.clone(),
+            kind: kind.to_string(),
+            optional: dep.optional,
+        })
+    }
+
+    fn insert_entry(&mut self, entry: CollectedDependencyEntry) {
+        Self::insert_entry_into(&mut self.collected, &mut self.skipped_local, entry);
+    }
+
+    fn insert_entry_into(
+        collected: &mut BTreeMap<String, DependencySpecBuilder>,
+        skipped_local: &mut BTreeMap<String, DependencySpecBuilder>,
+        entry: CollectedDependencyEntry,
+    ) {
+        let target = if entry.local {
+            skipped_local
+        } else {
+            collected
+        };
+        insert_dependency_spec(
+            target,
+            entry.name,
+            entry.requirement,
+            entry.kind,
+            entry.optional,
+        );
+    }
+
+    fn package(&self, package_id: &str) -> Result<&'a CargoPackage> {
+        self.package_by_id
             .get(package_id)
-            .ok_or_else(|| anyhow!("workspace package id not found in metadata: {package_id}"))?;
-
-        for dep in &package.dependencies {
-            if !selection.matches(dep.optional) {
-                continue;
-            }
-            if dep.optional && !include_optional {
-                continue;
-            }
-
-            let kind = dependency_kind(dep.kind.as_deref());
-            if !should_include_kind(kind, include_dev, include_build) {
-                continue;
-            }
-
-            insert_dependency_spec(
-                collected,
-                dep.name.clone(),
-                dep.req.clone(),
-                kind.to_string(),
-                dep.optional,
-            );
-        }
+            .copied()
+            .ok_or_else(|| anyhow!("workspace package id not found in metadata: {package_id}"))
     }
 
-    Ok(())
+    fn is_local_package(&self, package: &CargoPackage) -> bool {
+        package.source.is_none() || self.workspace_member_ids.contains(package.id.as_str())
+    }
+
+    fn declared_dependency_is_local(&self, dep: &CargoDependency) -> bool {
+        // `cargo metadata` leaves declaration `source` empty for path/workspace dependencies.
+        // Registry dependencies carry a concrete source even when they are inactive optional deps.
+        dep.source.is_none()
+    }
+
+    fn finish(self) -> DependencyInventory {
+        DependencyInventory {
+            specs: build_dependency_specs(self.collected),
+            skipped_local: build_dependency_specs(self.skipped_local),
+        }
+    }
 }
 
 fn build_dependency_specs(
@@ -515,14 +651,22 @@ fn join_str_set(set: &BTreeSet<&str>) -> String {
 }
 
 fn target_package_ids(metadata: &CargoMetadata) -> Vec<&str> {
-    if let Some(root) = metadata.root.as_deref() {
-        return vec![root];
+    if !metadata.workspace_members.is_empty() {
+        return metadata
+            .workspace_members
+            .iter()
+            .map(String::as_str)
+            .collect();
     }
-    metadata
-        .workspace_members
-        .iter()
-        .map(String::as_str)
-        .collect()
+    metadata.root.as_deref().into_iter().collect()
+}
+
+fn dependency_label(count: usize) -> &'static str {
+    if count == 1 {
+        "dependency"
+    } else {
+        "dependencies"
+    }
 }
 
 fn join_set(set: &BTreeSet<String>) -> String {
@@ -555,12 +699,16 @@ struct CargoMetadata {
 struct CargoPackage {
     id: String,
     name: String,
+    #[serde(default)]
+    source: Option<String>,
     dependencies: Vec<CargoDependency>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CargoDependency {
     name: String,
+    #[serde(default)]
+    source: Option<String>,
     req: String,
     kind: Option<String>,
     optional: bool,
@@ -594,6 +742,18 @@ struct CargoResolveDepKind {
 enum DeclaredDependencySelection {
     All,
     OptionalOnly,
+}
+
+#[derive(Debug, Default)]
+struct DependencyInventory {
+    specs: Vec<DependencySpec>,
+    skipped_local: Vec<DependencySpec>,
+}
+
+impl DependencyInventory {
+    fn skipped_local_count(&self) -> usize {
+        self.skipped_local.len()
+    }
 }
 
 impl DeclaredDependencySelection {

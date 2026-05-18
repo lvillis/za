@@ -3,20 +3,20 @@ FROM rust:1.95.0-alpine3.23 AS builder
 RUN set -ex \
     && apk add --no-cache build-base musl-dev openssl-dev perl make
 
-WORKDIR /opt/app
+WORKDIR /workspace
 
-COPY Cargo.toml /opt/app/Cargo.toml
-COPY Cargo.lock /opt/app/Cargo.lock
+COPY Cargo.toml /workspace/Cargo.toml
+COPY Cargo.lock /workspace/Cargo.lock
 
-RUN mkdir -p /opt/app/src && echo "fn main() {}" > /opt/app/src/main.rs
+RUN mkdir -p /workspace/src && echo "fn main() {}" > /workspace/src/main.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     set -ex \
     && cargo build --release --locked
 
-RUN rm -f /opt/app/src/main.rs
-COPY src/ /opt/app/src/
+RUN rm -f /workspace/src/main.rs
+COPY src/ /workspace/src/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -26,6 +26,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM scratch AS runtime
 
-COPY --from=builder /opt/app/target/release/za /usr/local/bin/za
+COPY --from=builder /workspace/target/release/za /usr/local/bin/za
 
 ENTRYPOINT ["/usr/local/bin/za"]

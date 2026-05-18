@@ -1,4 +1,4 @@
-//! Remote IDE process inspection and JetBrains remote IDE process management.
+//! Remote IDE process inspection plus JetBrains-specific process reconciliation.
 
 mod proc_scan;
 mod project_state;
@@ -2437,9 +2437,12 @@ mod tests {
 
     #[test]
     fn parse_cmdline_splits_nul_parts() {
-        let raw = b"/bin/rustrover\0serverMode\0/opt/app/proj\0";
+        let raw = b"/bin/rustrover\0serverMode\0/workspace/proj\0";
         let args = parse_cmdline(raw);
-        assert_eq!(args, vec!["/bin/rustrover", "serverMode", "/opt/app/proj"]);
+        assert_eq!(
+            args,
+            vec!["/bin/rustrover", "serverMode", "/workspace/proj"]
+        );
     }
 
     #[test]
@@ -2456,21 +2459,21 @@ mod tests {
     #[test]
     fn extract_jetbrains_server_session_detects_expected_shape() {
         let args = vec![
-            "/root/.local/share/JetBrains/Toolbox/apps/rustrover/bin/rustrover".to_string(),
+            "/home/dev/.local/share/JetBrains/Toolbox/apps/rustrover/bin/rustrover".to_string(),
             "serverMode".to_string(),
-            "/opt/app/s3-rs".to_string(),
+            "/workspace/sample-rust-app".to_string(),
         ];
         let (ide, exe, project) =
             extract_jetbrains_server_session(&args).expect("must be detected");
         assert_eq!(ide, "rustrover");
         assert!(exe.contains("JetBrains"));
-        assert_eq!(project, "/opt/app/s3-rs");
+        assert_eq!(project, "/workspace/sample-rust-app");
     }
 
     #[test]
     fn extract_jetbrains_server_session_allows_missing_project_arg() {
         let args = vec![
-            "/root/.local/share/JetBrains/Toolbox/apps/rustrover/bin/rustrover".to_string(),
+            "/home/dev/.local/share/JetBrains/Toolbox/apps/rustrover/bin/rustrover".to_string(),
             "serverMode".to_string(),
         ];
         let (ide, _, project) = extract_jetbrains_server_session(&args).expect("must be detected");
@@ -2483,7 +2486,7 @@ mod tests {
         let args = vec![
             "/bin/bash".to_string(),
             "--rcfile".to_string(),
-            "/root/.local/share/JetBrains/Toolbox/apps/rustrover/plugins/terminal/shell-integrations/bash/bash-integration.bash".to_string(),
+            "/home/dev/.local/share/JetBrains/Toolbox/apps/rustrover/plugins/terminal/shell-integrations/bash/bash-integration.bash".to_string(),
             "-i".to_string(),
         ];
         assert!(has_jetbrains_shell_integration(&args));
@@ -2735,14 +2738,14 @@ mod tests {
     fn render_ps_project_rows_groups_process_columns_by_pid() {
         let mut first = sample_project_row();
         first.pid = 4082669;
-        first.project_path = "/opt/app/rso".to_string();
+        first.project_path = "/workspace/project-a".to_string();
         first.state = "live".to_string();
         first.orphan_due = false;
         first.rss_bytes = 5_153_960_755;
         first.heap_limit_bytes = Some(4 * 1024 * 1024 * 1024);
         first.shell_children = 4;
         let mut second = first.clone();
-        second.project_path = "/opt/app/za".to_string();
+        second.project_path = "/workspace/sample-repo".to_string();
 
         let lines = render_ps_project_rows(&[first, second]);
         assert!(lines[0].contains("RSS"));
@@ -2758,7 +2761,7 @@ mod tests {
         assert!(lines[2].starts_with("        "));
         assert!(!lines[2].contains("4082669"));
         assert!(!lines[2].contains("4.8GiB"));
-        assert!(lines[2].contains("/opt/app/za"));
+        assert!(lines[2].contains("/workspace/sample-repo"));
     }
 
     #[test]
@@ -2834,7 +2837,7 @@ mod tests {
             toolbox_pids: vec![22],
             toolbox_stopped: Vec::new(),
             toolbox_failures: Vec::new(),
-            ipc_socket_path: Some("/root/.cache/JetBrains/Toolbox/ipc".to_string()),
+            ipc_socket_path: Some("/home/dev/.cache/JetBrains/Toolbox/ipc".to_string()),
             ipc_socket_existed: true,
             ipc_socket_removed: false,
             station_socket_paths: vec![
@@ -2851,7 +2854,7 @@ mod tests {
         });
         let rendered = lines.join("\n");
         assert!(rendered.contains("would stop [11]"));
-        assert!(rendered.contains("would remove /root/.cache/JetBrains/Toolbox/ipc"));
+        assert!(rendered.contains("would remove /home/dev/.cache/JetBrains/Toolbox/ipc"));
         assert!(rendered.contains("would remove /run/user/0/jb.station.sock"));
         assert!(rendered.contains("jb.station.ij.365582.sock"));
         assert!(rendered.contains("would remove 0xcd001e46 [1]"));
@@ -2918,7 +2921,7 @@ mod tests {
             ide: "rustrover".to_string(),
             ide_version: Some("2026.1".to_string()),
             ide_build_number: Some("261.1".to_string()),
-            project_path: "/opt/app/joint".to_string(),
+            project_path: "/workspace/joint".to_string(),
             controller_connected: true,
             seconds_since_last_controller_activity: Some(0),
             date_last_opened_ms: Some(0),

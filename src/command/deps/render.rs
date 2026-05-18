@@ -4,7 +4,7 @@ use super::latest::{
 use super::model::DependencyUpdatePlan;
 use super::*;
 
-pub(super) fn build_summary(records: &[DepAuditRecord]) -> AuditSummary {
+pub(super) fn build_summary(records: &[DepAuditRecord], skipped_local: usize) -> AuditSummary {
     let mut summary = AuditSummary::default();
     for rec in records {
         match rec.risk {
@@ -14,6 +14,7 @@ pub(super) fn build_summary(records: &[DepAuditRecord]) -> AuditSummary {
             RiskLevel::Unknown => summary.unknown += 1,
         }
     }
+    summary.skipped_local = skipped_local;
     summary
 }
 
@@ -138,6 +139,12 @@ fn render_summary_counts(summary: &AuditSummary, records: &[DepAuditRecord]) -> 
     }
     if summary.low > 0 {
         parts.push(tty_style::dim(format!("{} low", summary.low)));
+    }
+    if summary.skipped_local > 0 {
+        parts.push(tty_style::dim(format!(
+            "{} internal skipped",
+            summary.skipped_local
+        )));
     }
     let (bump_count, review_count) = version_attention_counts(records);
     if bump_count > 0 {

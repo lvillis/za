@@ -72,6 +72,7 @@ pub(super) fn run_latest(opts: DepsLatestOptions) -> Result<()> {
     let DepsLatestOptions {
         crates,
         manifest_path,
+        project_path,
         jobs,
         include_dev,
         include_build,
@@ -84,12 +85,14 @@ pub(super) fn run_latest(opts: DepsLatestOptions) -> Result<()> {
     let (manifest_path, queries) = collect_latest_queries(
         crates,
         manifest_path,
+        project_path,
         include_dev,
         include_build,
         include_optional,
     )?;
     if queries.is_empty() {
-        bail!("provide crate names or `--manifest-path <Cargo.toml>`");
+        render_empty_latest(manifest_path.as_deref(), json, toml)?;
+        return Ok(());
     }
 
     let requested_jobs = jobs.unwrap_or_else(default_deps_jobs);
@@ -109,17 +112,7 @@ pub(super) fn run_latest(opts: DepsLatestOptions) -> Result<()> {
     let summary = build_latest_summary(&records);
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&LatestReport {
-                manifest_path: manifest_path
-                    .as_ref()
-                    .map(|path| path.display().to_string()),
-                summary: summary.clone(),
-                records: records.clone(),
-            })
-            .context("serialize latest dependency output")?
-        );
+        print_latest_json(manifest_path.as_deref(), &summary, &records)?;
     } else if toml {
         print!("{}", render_latest_toml(&records));
     } else {
@@ -132,43 +125,81 @@ pub(super) fn run_latest(opts: DepsLatestOptions) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn render_empty_latest(
+    manifest_path: Option<&Path>,
+    json: bool,
+    toml: bool,
+) -> Result<()> {
+    let Some(manifest_path) = manifest_path else {
+        bail!("provide crate names or `--manifest-path <Cargo.toml>` or `--path <DIR>`");
+    };
+
+    if json {
+        print_latest_json(Some(manifest_path), &LatestSummary::default(), &[])?;
+    } else if !toml {
+        println!(
+            "No external dependencies found in {}.",
+            manifest_path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn print_latest_json(
+    manifest_path: Option<&Path>,
+    summary: &LatestSummary,
+    records: &[LatestRecord],
+) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&LatestReport {
+            manifest_path: manifest_path.map(|path| path.display().to_string()),
+            summary: summary.clone(),
+            records: records.to_vec(),
+        })
+        .context("serialize latest dependency output")?
+    );
+    Ok(())
+}
+
 pub(super) fn collect_latest_queries(
     crates: Vec<String>,
     manifest_path: Option<PathBuf>,
+    project_path: Option<PathBuf>,
     include_dev: bool,
     include_build: bool,
     include_optional: bool,
 ) -> Result<(Option<PathBuf>, Vec<LatestQuery>)> {
     let mut queries = BTreeMap::<String, LatestQuery>::new();
-    let manifest_path = match manifest_path {
-        Some(path) => {
-            let manifest_path = canonical_manifest_path(Some(path))?;
-            let metadata = cargo_metadata(&manifest_path)?;
-            let specs =
-                collect_dependency_specs(&metadata, include_dev, include_build, include_optional)?;
-            for spec in specs {
-                let key = normalize_dependency_name(&spec.name);
-                queries
-                    .entry(key)
-                    .and_modify(|query| {
-                        if query.requirement.is_none() && !spec.requirement.is_empty() {
-                            query.requirement = Some(spec.requirement.clone());
-                        }
-                        if query.kinds.is_none() && !spec.kinds.is_empty() {
-                            query.kinds = Some(spec.kinds.clone());
-                        }
-                        query.source = LatestQuerySource::Manifest;
-                    })
-                    .or_insert_with(|| LatestQuery {
-                        name: spec.name,
-                        requirement: Some(spec.requirement),
-                        kinds: Some(spec.kinds),
-                        source: LatestQuerySource::Manifest,
-                    });
-            }
-            Some(manifest_path)
+    let manifest_path = if manifest_path.is_some() || project_path.is_some() {
+        let manifest_path = resolve_manifest_path(manifest_path, project_path)?;
+        let metadata = cargo_metadata(&manifest_path)?;
+        let specs =
+            collect_dependency_specs(&metadata, include_dev, include_build, include_optional)?;
+        for spec in specs {
+            let key = normalize_dependency_name(&spec.name);
+            queries
+                .entry(key)
+                .and_modify(|query| {
+                    if query.requirement.is_none() && !spec.requirement.is_empty() {
+                        query.requirement = Some(spec.requirement.clone());
+                    }
+                    if query.kinds.is_none() && !spec.kinds.is_empty() {
+                        query.kinds = Some(spec.kinds.clone());
+                    }
+                    query.source = LatestQuerySource::Manifest;
+                })
+                .or_insert_with(|| LatestQuery {
+                    name: spec.name,
+                    requirement: Some(spec.requirement),
+                    kinds: Some(spec.kinds),
+                    source: LatestQuerySource::Manifest,
+                });
         }
-        None => None,
+        Some(manifest_path)
+    } else {
+        None
     };
 
     for krate in crates {
@@ -193,74 +224,13 @@ pub(super) fn resolve_latest_records(
     queries: Vec<LatestQuery>,
     jobs: usize,
 ) -> Result<Vec<LatestRecord>> {
-    let progress = build_progress(queries.len() as u64);
-    let queue = Arc::new(Mutex::new(VecDeque::from(queries)));
-    let records = Arc::new(Mutex::new(Vec::new()));
-    let first_error: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
-
-    thread::scope(|scope| {
-        for _ in 0..jobs {
-            let api = Arc::clone(&api);
-            let queue = Arc::clone(&queue);
-            let records = Arc::clone(&records);
-            let first_error = Arc::clone(&first_error);
-            let progress = progress.clone();
-
-            scope.spawn(move || {
-                loop {
-                    if has_error(first_error.as_ref()) {
-                        break;
-                    }
-
-                    let query = match queue.lock() {
-                        Ok(mut guard) => guard.pop_front(),
-                        Err(_) => {
-                            store_error(
-                                first_error.as_ref(),
-                                anyhow!("latest version queue lock poisoned"),
-                            );
-                            break;
-                        }
-                    };
-
-                    let Some(query) = query else {
-                        break;
-                    };
-                    let record = resolve_latest_record(api.as_ref(), query);
-                    match records.lock() {
-                        Ok(mut guard) => guard.push(record),
-                        Err(_) => {
-                            store_error(
-                                first_error.as_ref(),
-                                anyhow!("latest version records lock poisoned"),
-                            );
-                            break;
-                        }
-                    }
-
-                    if let Some(bar) = progress.as_ref() {
-                        bar.inc(1);
-                    }
-                }
-            });
-        }
-    });
-
-    if let Some(bar) = progress {
-        bar.finish_and_clear();
-    }
-
-    let mut error_guard = first_error
-        .lock()
-        .map_err(|_| anyhow!("error state lock poisoned"))?;
-    if let Some(err) = error_guard.take() {
-        return Err(err);
-    }
-
-    let mut records_guard = records
-        .lock()
-        .map_err(|_| anyhow!("latest version records lock poisoned"))?;
-    Ok(std::mem::take(&mut *records_guard))
+    run_work_queue(
+        queries,
+        jobs,
+        "latest version queue",
+        "latest version records",
+        |query| Ok(resolve_latest_record(api.as_ref(), query)),
+    )
 }
 
 fn resolve_latest_record(api: &ApiClient, query: LatestQuery) -> LatestRecord {

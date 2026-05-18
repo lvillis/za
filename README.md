@@ -126,10 +126,12 @@ za codex stop
 
 ```bash
 za deps
+za deps --path .
 za deps --jobs 16
 za deps --fail-on-high
 za deps latest serde regex
 za deps latest --manifest Cargo.toml --toml
+za deps latest --path . --suggest
 za deps latest --manifest Cargo.toml --suggest
 ```
 
@@ -144,7 +146,7 @@ za port stop 3000 --dry-run
 za port wait 3000
 ```
 
-### 6) Manage JetBrains remote IDE sessions
+### 6) Inspect remote IDE sessions
 
 ```bash
 za ide ps
@@ -160,6 +162,7 @@ za ide stop 42589
 - `ide-max-per-project` (default `1`)
 - `ide-orphan-ttl-minutes` (default `30`)
 
+`za ide ps` shows supported remote IDE backends, currently JetBrains remote IDEs and Zed remote servers.
 `za ide fix` stops orphaned backends, stops stale Toolbox main processes, and cleans stale Toolbox IPC socket / semaphore state when no Toolbox main process remains.
 
 ### 7) Track GitHub Actions
@@ -205,7 +208,7 @@ za gh auth test --repo https://github.com/org/repo.git
 | `za deps` | Audit Rust dependency governance and resolve latest crate versions with upgrade guidance. |
 | `za gh` | Unified GitHub shortcuts for auth repair and Actions status. |
 | `za config` | Persist CLI config (`[auth]`, `[proxy]`, `[run]`, `[tool]`, `[update]`). |
-| `za ide` | Inspect and reconcile JetBrains remote IDE server processes. |
+| `za ide` | Inspect supported remote IDE server processes and reconcile JetBrains backends. |
 
 ## Workspace Diff
 
@@ -375,9 +378,9 @@ za tool uninstall codex --version 0.104.0
 za tool uninstall codex
 ```
 
-`za tool install starship` also upserts a managed `~/.bashrc` block that initializes the prompt only when `TERMINAL_EMULATOR=JetBrains-JediTerm`. If `ble.sh` is also managed, `za` keeps the `starship` block ahead of the `ble-attach` hook so JetBrains bash shells render the prompt on first draw. Installation does not patch the current shell process; open a new JetBrains bash shell or `source ~/.bashrc` after install.
+`za tool install starship` also upserts a managed `~/.bashrc` block that initializes the prompt only in supported IDE terminals. Today that means JetBrains JediTerm (`TERMINAL_EMULATOR=JetBrains-JediTerm`) and Zed (`ZED_TERM=true` with `TERM_PROGRAM=zed`). If `ble.sh` is also managed, `za` keeps the `starship` block ahead of the `ble-attach` hook so supported IDE bash shells render the prompt on first draw. Installation does not patch the current shell process; open a new IDE bash shell or `source ~/.bashrc` after install.
 
-`za tool install ble.sh` tracks the upstream rolling `nightly` release instead of the stale stable release. It installs `ble.sh` as a managed package payload, keeps a stable active path under the tool state directory, and upserts JetBrains-only top/bottom `~/.bashrc` blocks for the current user so `source -- .../ble.sh --attach=none` and `ble-attach` stay in sync across updates, regardless of whether the managed payload lives in system or user scope. The JetBrains prelude also enables `bleopt prompt_command_changes_layout=1`, disables the transient `[ble: press RET to continue]` placeholder prompt, and uses an immediate-attach compatibility shim so the first `RET` is not consumed by deferred attach.
+`za tool install ble.sh` tracks the upstream rolling `nightly` release instead of the stale stable release. It installs `ble.sh` as a managed package payload, keeps a stable active path under the tool state directory, and upserts IDE-scoped top/bottom `~/.bashrc` blocks for the current user so `source -- .../ble.sh --attach=none` and `ble-attach` stay in sync across updates, regardless of whether the managed payload lives in system or user scope. The prelude also enables `bleopt prompt_command_changes_layout=1`, disables the transient `[ble: press RET to continue]` placeholder prompt, and uses an immediate-attach compatibility shim so the first `RET` is not consumed by deferred attach.
 
 `za tool install --dry-run` and `za tool update --dry-run` resolve the target version and source policy, preview activation/shell-init changes, and make no filesystem changes.
 

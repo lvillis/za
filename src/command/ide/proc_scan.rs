@@ -381,7 +381,7 @@ fn looks_like_zed_remote_server(executable: &str) -> bool {
     Path::new(executable)
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.contains("zed-remote-server"))
+        .is_some_and(|name| name.starts_with("zed-remote-server"))
 }
 
 fn option_path(args: &[String], name: &str) -> Option<PathBuf> {
@@ -389,11 +389,12 @@ fn option_path(args: &[String], name: &str) -> Option<PathBuf> {
 }
 
 fn option_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    let inline_prefix = format!("{name}=");
     for (index, arg) in args.iter().enumerate() {
         if arg == name {
             return args.get(index + 1).map(String::as_str);
         }
-        if let Some(value) = arg.strip_prefix(&format!("{name}="))
+        if let Some(value) = arg.strip_prefix(&inline_prefix)
             && !value.is_empty()
         {
             return Some(value);
@@ -632,14 +633,13 @@ pub(super) fn extract_jetbrains_server_session(
 }
 
 fn looks_like_jetbrains_executable(executable: &str) -> bool {
-    let lower = executable.to_ascii_lowercase();
-    if lower.contains("jetbrains") {
-        return true;
-    }
     let Some(name) = Path::new(executable).file_name().and_then(|n| n.to_str()) else {
         return false;
     };
     let name = name.to_ascii_lowercase();
+    if name.contains("jetbrains") {
+        return true;
+    }
     const KNOWN: [&str; 12] = [
         "rustrover",
         "idea",
@@ -907,17 +907,18 @@ mod tests {
     #[test]
     fn extract_zed_run_session_reads_workspace_and_paths() {
         let args = vec![
-            "/root/.zed_server/zed-remote-server-stable-1.2.6+stable.280.abc".to_string(),
+            "/home/dev/.zed_server/zed-remote-server-stable-1.2.6+stable.280.abc".to_string(),
             "run".to_string(),
             "--log-file".to_string(),
-            "/root/.local/share/zed/logs/server-workspace-9.log".to_string(),
+            "/home/dev/.local/share/zed/logs/server-workspace-9.log".to_string(),
             "--pid-file".to_string(),
-            "/root/.local/share/zed/server_state/workspace-9/server.pid".to_string(),
-            "--stdin-socket=/root/.local/share/zed/server_state/workspace-9/stdin.sock".to_string(),
+            "/home/dev/.local/share/zed/server_state/workspace-9/server.pid".to_string(),
+            "--stdin-socket=/home/dev/.local/share/zed/server_state/workspace-9/stdin.sock"
+                .to_string(),
             "--stdout-socket".to_string(),
-            "/root/.local/share/zed/server_state/workspace-9/stdout.sock".to_string(),
+            "/home/dev/.local/share/zed/server_state/workspace-9/stdout.sock".to_string(),
             "--stderr-socket".to_string(),
-            "/root/.local/share/zed/server_state/workspace-9/stderr.sock".to_string(),
+            "/home/dev/.local/share/zed/server_state/workspace-9/stderr.sock".to_string(),
         ];
 
         let session = extract_zed_run_session(&args).expect("zed run session");
@@ -926,7 +927,7 @@ mod tests {
         assert_eq!(
             session.log_file.as_deref(),
             Some(Path::new(
-                "/root/.local/share/zed/logs/server-workspace-9.log"
+                "/home/dev/.local/share/zed/logs/server-workspace-9.log"
             ))
         );
         assert!(session.stdin_socket.is_some());
@@ -947,6 +948,22 @@ mod tests {
     }
 
     #[test]
+    fn process_matchers_check_executable_name_not_parent_path_noise() {
+        assert!(looks_like_zed_remote_server(
+            "/home/dev/.zed_server/zed-remote-server-stable-1.2.6+stable.280.abc"
+        ));
+        assert!(!looks_like_zed_remote_server(
+            "/workspace/zed-remote-server-notes/server"
+        ));
+        assert!(looks_like_jetbrains_executable(
+            "/home/dev/.local/share/JetBrains/Toolbox/apps/rustrover/bin/rustrover"
+        ));
+        assert!(!looks_like_jetbrains_executable(
+            "/workspace/jetbrains-notes/bin/server"
+        ));
+    }
+
+    #[test]
     fn extract_zed_proxy_workspace_reads_identifier() {
         let args = vec![
             ".zed_server/zed-remote-server-stable-1.2.6+stable.280.abc".to_string(),
@@ -964,16 +981,23 @@ mod tests {
     #[test]
     fn resolve_zed_project_paths_prefers_rpc_then_log_then_workspace_placeholder() {
         assert_eq!(
-            resolve_zed_project_paths(vec!["/opt/app/live".to_string()], None, Some("workspace-9")),
-            (vec!["/opt/app/live".to_string()], RemoteProjectSource::Rpc)
+            resolve_zed_project_paths(
+                vec!["/workspace/live".to_string()],
+                None,
+                Some("workspace-9")
+            ),
+            (
+                vec!["/workspace/live".to_string()],
+                RemoteProjectSource::Rpc
+            )
         );
         let log_project = ZedLogProject {
-            path: "/opt/app/log".to_string(),
+            path: "/workspace/log".to_string(),
             modified_millis: 42,
         };
         assert_eq!(
             resolve_zed_project_paths(Vec::new(), Some(&log_project), None),
-            (vec!["/opt/app/log".to_string()], RemoteProjectSource::Log)
+            (vec!["/workspace/log".to_string()], RemoteProjectSource::Log)
         );
         assert_eq!(
             resolve_zed_project_paths(Vec::new(), None, Some("workspace-9")),
@@ -988,7 +1012,7 @@ mod tests {
     fn parse_zed_remote_version_reads_semver_from_binary_name() {
         assert_eq!(
             parse_zed_remote_version(
-                "/root/.zed_server/zed-remote-server-stable-1.2.6+stable.280.abc"
+                "/home/dev/.zed_server/zed-remote-server-stable-1.2.6+stable.280.abc"
             )
             .as_deref(),
             Some("1.2.6")
@@ -998,22 +1022,22 @@ mod tests {
     #[test]
     fn parse_zed_project_from_log_prefers_git_repository_root() {
         let raw = r#"{"message":"(remote server) starting language server process. binary path: \"/bin/node\", working directory: \"/root\", args: []"}
-{"message":"(remote server) opening git repository at \"/opt/app/zed-jenkinsfile/.git\" using git binary \"/usr/bin/git\""}"#;
+{"message":"(remote server) opening git repository at \"/workspace/sample-zed-project/.git\" using git binary \"/usr/bin/git\""}"#;
 
         assert_eq!(
             parse_zed_project_from_log(raw).as_deref(),
-            Some("/opt/app/zed-jenkinsfile")
+            Some("/workspace/sample-zed-project")
         );
     }
 
     #[test]
     fn parse_zed_project_from_log_falls_back_to_plausible_workdir() {
         let raw = r#"{"message":"(remote server) starting language server process. binary path: \"/bin/node\", working directory: \"/root\", args: []"}
-{"message":"(remote server) starting language server process. binary path: \"/bin/rust-analyzer\", working directory: \"/opt/app/plain\", args: []"}"#;
+{"message":"(remote server) starting language server process. binary path: \"/bin/rust-analyzer\", working directory: \"/workspace/plain\", args: []"}"#;
 
         assert_eq!(
             parse_zed_project_from_log(raw).as_deref(),
-            Some("/opt/app/plain")
+            Some("/workspace/plain")
         );
     }
 }

@@ -788,11 +788,11 @@ mod tests {
 
     #[test]
     fn workspace_hash_is_stable_hex() {
-        let hash = workspace_hash(Path::new("/opt/app/za"));
+        let hash = workspace_hash(Path::new("/workspace/sample-repo"));
         assert_eq!(hash.len(), 64);
         assert_eq!(
             &hash[..SESSION_HASH_LEN],
-            &workspace_hash(Path::new("/opt/app/za"))[..SESSION_HASH_LEN]
+            &workspace_hash(Path::new("/workspace/sample-repo"))[..SESSION_HASH_LEN]
         );
     }
 
@@ -863,10 +863,10 @@ mod tests {
     #[test]
     fn parse_tmux_sessions_reads_expected_fields() {
         let sessions = parse_tmux_sessions(
-            "za-codex-za-123\t1700000000\t1700000300\t1\nza-codex-api-456\t1700000100\t1700000200\t0\n",
+            "za-codex-sample-123\t1700000000\t1700000300\t1\nza-codex-api-456\t1700000100\t1700000200\t0\n",
         )
         .expect("must parse");
-        let first = sessions.get("za-codex-za-123").expect("first session");
+        let first = sessions.get("za-codex-sample-123").expect("first session");
         assert_eq!(first.created_unix, Some(1_700_000_000));
         assert_eq!(first.activity_unix, Some(1_700_000_300));
         assert_eq!(first.attached_clients, 1);
@@ -914,15 +914,15 @@ mod tests {
 
     #[test]
     fn tmux_codex_status_left_hides_internal_session_name() {
-        let left = tmux_codex_status_left("ttd-pro-cli", Path::new("/opt/app/ttd-pro-cli"))
+        let left = tmux_codex_status_left("sample-service", Path::new("/workspace/sample-service"))
             .expect("must render status-left");
         assert!(left.starts_with("#("));
         assert!(left.ends_with(" "));
         assert!(left.contains("codex-status"));
-        assert!(left.contains("/opt/app/ttd-pro-cli"));
+        assert!(left.contains("/workspace/sample-service"));
         assert!(left.contains(".sh"));
         assert!(left.contains(".loc"));
-        assert!(!left.starts_with("[ttd-pro-cli]"));
+        assert!(!left.starts_with("[sample-service]"));
         assert!(!left.contains("za-codex"));
         assert_eq!(
             tmux_codex_status_left_length().expect("must compute status-left length"),
@@ -933,7 +933,7 @@ mod tests {
     #[test]
     fn tmux_codex_status_left_omits_workspace_label() {
         let left =
-            tmux_codex_status_left("repo#1", Path::new("/opt/app/repo#1")).expect("must render");
+            tmux_codex_status_left("repo#1", Path::new("/workspace/repo#1")).expect("must render");
         assert!(left.starts_with("#("));
         assert!(!left.starts_with("[repo#1]"));
         assert!(!left.contains("repo##1"));
@@ -1038,8 +1038,8 @@ mod tests {
     #[test]
     fn render_stop_message_explains_tmux_missing_cleanup() {
         let message = render_stop_message(&CodexStopOutput {
-            session_name: "za-codex-za-123".to_string(),
-            workspace_root: "/opt/app/za".to_string(),
+            session_name: "za-codex-sample-123".to_string(),
+            workspace_root: "/workspace/sample-repo".to_string(),
             stopped: false,
             metadata_removed: true,
             tmux_available: false,
@@ -1048,15 +1048,15 @@ mod tests {
         });
         assert_eq!(
             message,
-            "Codex session `za-codex-za-123` is stopped; cleaned local record. (`tmux` is unavailable, so no running session could be checked.)"
+            "Codex session `za-codex-sample-123` is stopped; cleaned local record. (`tmux` is unavailable, so no running session could be checked.)"
         );
     }
 
     #[test]
     fn render_stop_message_uses_completion_tone_for_stale_record() {
         let message = render_stop_message(&CodexStopOutput {
-            session_name: "za-codex-tier-rs-b2e778148163".to_string(),
-            workspace_root: "/opt/app/tier-rs".to_string(),
+            session_name: "za-codex-sample-worker-b2e778148163".to_string(),
+            workspace_root: "/workspace/sample-worker".to_string(),
             stopped: false,
             metadata_removed: true,
             tmux_available: true,
@@ -1065,15 +1065,15 @@ mod tests {
         });
         assert_eq!(
             message,
-            "Codex session `za-codex-tier-rs-b2e778148163` is stopped; cleaned local record."
+            "Codex session `za-codex-sample-worker-b2e778148163` is stopped; cleaned local record."
         );
     }
 
     #[test]
     fn render_stop_message_reports_empty_tmux_server_cleanup() {
         let message = render_stop_message(&CodexStopOutput {
-            session_name: "za-codex-tier-rs-b2e778148163".to_string(),
-            workspace_root: "/opt/app/tier-rs".to_string(),
+            session_name: "za-codex-sample-worker-b2e778148163".to_string(),
+            workspace_root: "/workspace/sample-worker".to_string(),
             stopped: false,
             metadata_removed: true,
             tmux_available: true,
@@ -1082,15 +1082,15 @@ mod tests {
         });
         assert_eq!(
             message,
-            "Codex session `za-codex-tier-rs-b2e778148163` is stopped; cleaned local record. Removed empty tmux server."
+            "Codex session `za-codex-sample-worker-b2e778148163` is stopped; cleaned local record. Removed empty tmux server."
         );
     }
 
     #[test]
     fn render_stop_message_uses_already_stopped_for_empty_state() {
         let message = render_stop_message(&CodexStopOutput {
-            session_name: "za-codex-tier-rs-b2e778148163".to_string(),
-            workspace_root: "/opt/app/tier-rs".to_string(),
+            session_name: "za-codex-sample-worker-b2e778148163".to_string(),
+            workspace_root: "/workspace/sample-worker".to_string(),
             stopped: false,
             metadata_removed: false,
             tmux_available: true,
@@ -1110,7 +1110,7 @@ mod tests {
     #[test]
     fn tmux_missing_session_or_server_is_treated_as_absent() {
         assert!(is_tmux_session_absent(
-            "can't find session: za-codex-za-123"
+            "can't find session: za-codex-sample-123"
         ));
         assert!(is_tmux_session_absent(
             "error connecting to /tmp/tmux-0/default (No such file or directory)"
@@ -1144,7 +1144,7 @@ mod tests {
             "za-codex-current-123".to_string(),
             SessionRecord {
                 session_name: "za-codex-current-123".to_string(),
-                workspace_root: "/opt/app/current".to_string(),
+                workspace_root: "/workspace/current".to_string(),
                 workspace_label: "current".to_string(),
                 workspace_hash: "hash-current".to_string(),
                 created_at_unix: 1_700_000_000,
@@ -1213,7 +1213,7 @@ mod tests {
                     modified_unix,
                     summary: Some(CodexSessionSummary {
                         session_id: "cached-session".to_string(),
-                        workspace_root: "/opt/app/za".to_string(),
+                        workspace_root: "/workspace/sample-repo".to_string(),
                         modified_unix,
                         model: Some("gpt-5.4".to_string()),
                         effort: Some("xhigh".to_string()),
@@ -1224,8 +1224,8 @@ mod tests {
             ..CodexPsCache::default()
         };
         let records = vec![SessionRecord {
-            session_name: "za-codex-za-123".to_string(),
-            workspace_root: "/opt/app/za".to_string(),
+            session_name: "za-codex-sample-123".to_string(),
+            workspace_root: "/workspace/sample-repo".to_string(),
             workspace_label: "za".to_string(),
             workspace_hash: "hash".to_string(),
             created_at_unix: 1_700_000_000,
@@ -1237,7 +1237,9 @@ mod tests {
             load_codex_session_summaries(&records, &dir.path.join("codex/sessions"), &mut cache)
                 .expect("must load summaries");
 
-        let summary = summaries.get("/opt/app/za").expect("cached summary");
+        let summary = summaries
+            .get("/workspace/sample-repo")
+            .expect("cached summary");
         assert_eq!(summary.session_id, "cached-session");
         assert_eq!(summary.model.as_deref(), Some("gpt-5.4"));
         assert_eq!(summary.effort.as_deref(), Some("xhigh"));
@@ -1283,9 +1285,9 @@ mod tests {
 
     #[test]
     fn summarize_codex_session_lines_extracts_id_model_effort_and_context_left() {
-        let workspaces = BTreeMap::from([("/opt/app/za".to_string(), 1_700_000_000)]);
+        let workspaces = BTreeMap::from([("/workspace/sample-repo".to_string(), 1_700_000_000)]);
         let raw = concat!(
-            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"019cc38e-4d75-7052-b96a-b3a1e36b1868\",\"cwd\":\"/opt/app/za\"}}\n",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"019cc38e-4d75-7052-b96a-b3a1e36b1868\",\"cwd\":\"/workspace/sample-repo\"}}\n",
             "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5.4\",\"effort\":\"xhigh\"}}\n",
             "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"total_tokens\":181807},\"model_context_window\":258400}}}\n"
         );
@@ -1293,7 +1295,7 @@ mod tests {
             .expect("must parse")
             .expect("must match workspace");
         assert_eq!(summary.session_id, "019cc38e-4d75-7052-b96a-b3a1e36b1868");
-        assert_eq!(summary.workspace_root, "/opt/app/za");
+        assert_eq!(summary.workspace_root, "/workspace/sample-repo");
         assert_eq!(summary.model.as_deref(), Some("gpt-5.4"));
         assert_eq!(summary.effort.as_deref(), Some("xhigh"));
         let pct = summary
@@ -1436,8 +1438,8 @@ mod tests {
     #[test]
     fn managed_tracker_matching_prefers_session_started_near_record_creation() {
         let record = SessionRecord {
-            session_name: "za-codex-za-123".to_string(),
-            workspace_root: "/opt/app/za".to_string(),
+            session_name: "za-codex-sample-123".to_string(),
+            workspace_root: "/workspace/sample-repo".to_string(),
             workspace_label: "za".to_string(),
             workspace_hash: "hash".to_string(),
             created_at_unix: 1_700_000_000,
@@ -1450,7 +1452,7 @@ mod tests {
             modified_unix: 1_700_000_020,
             state: FileSessionState {
                 session_id: Some("managed-id".to_string()),
-                workspace_root: Some("/opt/app/za".to_string()),
+                workspace_root: Some("/workspace/sample-repo".to_string()),
                 started_unix: Some(1_700_000_010),
                 ..FileSessionState::default()
             },
@@ -1461,7 +1463,7 @@ mod tests {
             modified_unix: 1_700_010_000,
             state: FileSessionState {
                 session_id: Some("direct-id".to_string()),
-                workspace_root: Some("/opt/app/za".to_string()),
+                workspace_root: Some("/workspace/sample-repo".to_string()),
                 started_unix: Some(1_700_010_000),
                 ..FileSessionState::default()
             },
@@ -1475,8 +1477,8 @@ mod tests {
     #[test]
     fn managed_tracker_matching_prefers_activity_after_record_creation() {
         let record = SessionRecord {
-            session_name: "za-codex-za-123".to_string(),
-            workspace_root: "/opt/app/za".to_string(),
+            session_name: "za-codex-sample-123".to_string(),
+            workspace_root: "/workspace/sample-repo".to_string(),
             workspace_label: "za".to_string(),
             workspace_hash: "hash".to_string(),
             created_at_unix: 1_700_000_300,
@@ -1489,7 +1491,7 @@ mod tests {
             modified_unix: 1_700_000_340,
             state: FileSessionState {
                 session_id: Some("resumed-id".to_string()),
-                workspace_root: Some("/opt/app/za".to_string()),
+                workspace_root: Some("/workspace/sample-repo".to_string()),
                 started_unix: Some(1_699_999_000),
                 last_activity_unix: Some(1_700_000_340),
                 ..FileSessionState::default()
@@ -1501,7 +1503,7 @@ mod tests {
             modified_unix: 1_700_000_295,
             state: FileSessionState {
                 session_id: Some("previous-id".to_string()),
-                workspace_root: Some("/opt/app/za".to_string()),
+                workspace_root: Some("/workspace/sample-repo".to_string()),
                 started_unix: Some(1_700_000_295),
                 last_activity_unix: Some(1_700_000_295),
                 ..FileSessionState::default()
@@ -1516,8 +1518,8 @@ mod tests {
     #[test]
     fn managed_tracker_matching_falls_back_to_most_recent_workspace_tracker() {
         let record = SessionRecord {
-            session_name: "za-codex-za-123".to_string(),
-            workspace_root: "/opt/app/za".to_string(),
+            session_name: "za-codex-sample-123".to_string(),
+            workspace_root: "/workspace/sample-repo".to_string(),
             workspace_label: "za".to_string(),
             workspace_hash: "hash".to_string(),
             created_at_unix: 1_700_100_000,
@@ -1530,7 +1532,7 @@ mod tests {
             modified_unix: 1_700_000_100,
             state: FileSessionState {
                 session_id: Some("older-id".to_string()),
-                workspace_root: Some("/opt/app/za".to_string()),
+                workspace_root: Some("/workspace/sample-repo".to_string()),
                 last_activity_unix: Some(1_700_000_100),
                 ..FileSessionState::default()
             },
@@ -1541,7 +1543,7 @@ mod tests {
             modified_unix: 1_700_000_200,
             state: FileSessionState {
                 session_id: Some("latest-id".to_string()),
-                workspace_root: Some("/opt/app/za".to_string()),
+                workspace_root: Some("/workspace/sample-repo".to_string()),
                 last_activity_unix: Some(1_700_000_200),
                 ..FileSessionState::default()
             },
@@ -1560,7 +1562,7 @@ mod tests {
             modified_unix: 1_700_000_100,
             state: FileSessionState {
                 session_id: Some("older-id".to_string()),
-                workspace_root: Some("/opt/app/za".to_string()),
+                workspace_root: Some("/workspace/sample-repo".to_string()),
                 model: Some("gpt-5.4".to_string()),
                 effort: Some("xhigh".to_string()),
                 last_activity_unix: Some(1_700_000_100),
@@ -1574,7 +1576,7 @@ mod tests {
                 OtelSessionState {
                     model: Some("gpt-5.4".to_string()),
                     effort: Some("xhigh".to_string()),
-                    workspace_root: Some("/opt/app/za".to_string()),
+                    workspace_root: Some("/workspace/sample-repo".to_string()),
                     last_activity_unix: Some(super::current_unix_seconds()),
                     last_event_name: Some("codex.conversation_turn_complete".to_string()),
                     otel_events: 3,
@@ -1587,8 +1589,8 @@ mod tests {
             ..OtelLiveState::default()
         };
         let managed_records = vec![SessionRecord {
-            session_name: "za-codex-za-123".to_string(),
-            workspace_root: "/opt/app/za".to_string(),
+            session_name: "za-codex-sample-123".to_string(),
+            workspace_root: "/workspace/sample-repo".to_string(),
             workspace_label: "za".to_string(),
             workspace_hash: "hash".to_string(),
             created_at_unix: 1_700_000_000,
@@ -1596,7 +1598,7 @@ mod tests {
             launcher_args: Vec::new(),
         }];
         let tmux_sessions = BTreeMap::from([(
-            "za-codex-za-123".to_string(),
+            "za-codex-sample-123".to_string(),
             TmuxSessionInfo {
                 created_unix: Some(1_700_000_000),
                 activity_unix: Some(super::current_unix_seconds()),
@@ -1605,7 +1607,7 @@ mod tests {
         )]);
 
         let rows = build_top_rows(TopRowsInput {
-            current_workspace_root: "/opt/app/za",
+            current_workspace_root: "/workspace/sample-repo",
             show_all: false,
             show_history: false,
             trackers: &trackers,
@@ -1624,12 +1626,12 @@ mod tests {
     #[test]
     fn rebind_stream_session_switches_to_live_workspace_session_when_current_id_has_no_otel() {
         let now = super::current_unix_seconds();
-        let mut app = CodexTopApp::new(PathBuf::from("/opt/app/za"), false, false);
+        let mut app = CodexTopApp::new(PathBuf::from("/workspace/sample-repo"), false, false);
         app.rows = vec![CodexTopRow {
-            key: "managed:za-codex-za-123".to_string(),
+            key: "managed:za-codex-sample-123".to_string(),
             session_id: Some("latest-id".to_string()),
-            managed_session_name: Some("za-codex-za-123".to_string()),
-            workspace_root: "/opt/app/za".to_string(),
+            managed_session_name: Some("za-codex-sample-123".to_string()),
+            workspace_root: "/workspace/sample-repo".to_string(),
             model: Some("gpt-5.4".to_string()),
             effort: Some("xhigh".to_string()),
             context_left_percent: None,
@@ -1654,7 +1656,7 @@ mod tests {
             OtelSessionState {
                 model: Some("gpt-5.4".to_string()),
                 effort: Some("xhigh".to_string()),
-                workspace_root: Some("/opt/app/za".to_string()),
+                workspace_root: Some("/workspace/sample-repo".to_string()),
                 last_activity_unix: Some(now),
                 last_event_name: Some("codex.conversation_turn_complete".to_string()),
                 otel_events: 2,
@@ -1685,7 +1687,7 @@ mod tests {
         );
         app.view = TopView::Stream(TopStreamState {
             session_id: "older-id".to_string(),
-            workspace_root: "/opt/app/za".to_string(),
+            workspace_root: "/workspace/sample-repo".to_string(),
             model: Some("gpt-5.4".to_string()),
             effort: Some("xhigh".to_string()),
             tmux_running: false,
@@ -1717,9 +1719,9 @@ mod tests {
 
     #[test]
     fn summarize_codex_session_lines_handles_whitespace_and_reordered_json_fields() {
-        let workspaces = BTreeMap::from([("/opt/app/za".to_string(), 1_700_000_000)]);
+        let workspaces = BTreeMap::from([("/workspace/sample-repo".to_string(), 1_700_000_000)]);
         let raw = concat!(
-            "{\"payload\":{\"cwd\":\"/opt/app/za\",\"id\":\"019cc38e-4d75-7052-b96a-b3a1e36b1868\"},\"type\": \"session_meta\"}\n",
+            "{\"payload\":{\"cwd\":\"/workspace/sample-repo\",\"id\":\"019cc38e-4d75-7052-b96a-b3a1e36b1868\"},\"type\": \"session_meta\"}\n",
             "{\"payload\":{\"effort\":\"xhigh\",\"model\":\"gpt-5.4\"}, \"type\": \"turn_context\"}\n",
             "{\"type\":\"event_msg\", \"payload\":{\"info\":{\"model_context_window\":258400,\"last_token_usage\":{\"total_tokens\":181807}},\"type\": \"token_count\"}}\n"
         );

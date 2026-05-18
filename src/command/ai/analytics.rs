@@ -508,7 +508,7 @@ mod tests {
             schema_version: 1,
             recorded_at_unix_ms,
             agent: "codex".to_string(),
-            workspace: "/opt/app/za".to_string(),
+            workspace: "/workspace/sample-repo".to_string(),
             route: route.to_string(),
             source_command: route.to_string(),
             raw_bytes: 1200,
@@ -548,7 +548,7 @@ mod tests {
                 legacy_path.with_file_name("analytics.jsonl.migrated"),
             ],
             30,
-            Some("/opt/app/za"),
+            Some("/workspace/sample-repo"),
         )
         .expect("load records");
 
