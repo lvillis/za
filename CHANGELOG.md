@@ -1,9 +1,18 @@
+## [0.1.77] - 2026-05-18
+
+### 🚀 Features
+
+- Improve dependency audits and remote IDE inspection
 ## [0.1.76] - 2026-05-17
 
 ### 🐛 Bug Fixes
 
 - Ci
 - *(ide)* Treat connected Zed sessions as live
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.76
 ## [0.1.75] - 2026-05-17
 
 ### 🚀 Features
