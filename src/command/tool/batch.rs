@@ -174,15 +174,17 @@ pub(super) fn run_tool_batch(
             }
         }
         .dry_run(dry_run)
-        .emit_stages(!compact_mode);
+        .emit_stages(!compact_mode)
+        .emit_plan_stage(compact_mode)
+        .download_display(if compact_mode {
+            source::DownloadDisplay::Compact
+        } else {
+            source::DownloadDisplay::Detailed
+        });
 
         match install(home, resolved_spec, options) {
             Ok(result) => {
                 summary = summary.record(result.outcome);
-                if compact_mode && result.outcome != InstallOutcome::Unchanged {
-                    let (stage, message) = render_compact_batch_result(kind, &result, dry_run);
-                    print_tool_stage(stage, message);
-                }
             }
             Err(err) => {
                 summary.failed += 1;
@@ -313,81 +315,6 @@ fn batch_start_message(kind: ToolBatchKind, total: usize, source_label: Option<&
             None => format!("syncing {total} tool(s)"),
         },
     }
-}
-
-pub(crate) fn render_compact_batch_result(
-    kind: ToolBatchKind,
-    result: &InstallResult,
-    dry_run: bool,
-) -> (&'static str, String) {
-    let name = styled_tool_ref(&result.tool.name);
-    match result.outcome {
-        InstallOutcome::Updated | InstallOutcome::Installed => {
-            let stage = batch_kind_stage(kind);
-            let message = match result.previous_active.as_deref() {
-                Some(previous)
-                    if normalize_version(previous) != normalize_version(&result.tool.version) =>
-                {
-                    if dry_run {
-                        format!(
-                            "{name} {} {} {} {}",
-                            tty_style::dim(previous),
-                            tty_style::dim("->"),
-                            styled_tool_version(&result.tool.version),
-                            tty_style::dim("(dry-run)")
-                        )
-                    } else {
-                        format!(
-                            "{name} {} {} {}",
-                            tty_style::dim(previous),
-                            tty_style::dim("->"),
-                            styled_tool_version(&result.tool.version)
-                        )
-                    }
-                }
-                _ => {
-                    if dry_run {
-                        format!(
-                            "{name} {} {}",
-                            styled_tool_version(&result.tool.version),
-                            tty_style::dim("(dry-run)")
-                        )
-                    } else {
-                        format!("{name} {}", styled_tool_version(&result.tool.version))
-                    }
-                }
-            };
-            (stage, message)
-        }
-        InstallOutcome::Repaired => (
-            "repair",
-            if dry_run {
-                format!(
-                    "{name} {} {}",
-                    tty_style::warning(&result.tool.version),
-                    tty_style::dim("(dry-run)")
-                )
-            } else {
-                format!("{name} {}", tty_style::warning(&result.tool.version))
-            },
-        ),
-        InstallOutcome::Unchanged => (
-            batch_kind_stage(kind),
-            format!(
-                "{name} {} {}",
-                tty_style::dim("already at"),
-                tty_style::dim(&result.tool.version)
-            ),
-        ),
-    }
-}
-
-fn styled_tool_ref(name: &str) -> String {
-    tty_style::header(format!("`{name}`"))
-}
-
-fn styled_tool_version(version: &str) -> String {
-    tty_style::active(version)
 }
 
 pub(crate) fn render_batch_summary(

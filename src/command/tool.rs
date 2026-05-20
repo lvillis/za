@@ -80,8 +80,8 @@ const BLESH_BASH_INIT_BOTTOM_START_MARKER: &str = "# >>> za ble.sh (bash bottom)
 const BLESH_BASH_INIT_BOTTOM_END_MARKER: &str = "# <<< za ble.sh (bash bottom) <<<";
 const PROXY_HINT: &str =
     "if your network requires a proxy, set HTTPS_PROXY/HTTP_PROXY (and optional NO_PROXY)";
-const TOOL_UPDATE_CACHE_SCHEMA_VERSION: u32 = 1;
-const TOOL_UPDATE_CACHE_FILE_NAME: &str = "tool-latest-cache-v1.json";
+const TOOL_UPDATE_CACHE_SCHEMA_VERSION: u32 = 2;
+const TOOL_UPDATE_CACHE_FILE_NAME: &str = "tool-latest-cache-v2.json";
 const TOOL_UPDATE_CACHE_TTL_SECS: u64 = 10 * 60;
 const TOOL_UPDATE_JOBS_MULTIPLIER: usize = 2;
 const TOOL_UPDATE_JOBS_MIN: usize = 2;
@@ -274,14 +274,36 @@ enum ToolScope {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolScopeRequest {
+    Auto,
+    Global,
+    User,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ToolUpdateChannel {
     Stable,
     CodexAlpha,
 }
 
+impl ToolScopeRequest {
+    pub fn from_flags(user: bool, global: bool) -> Result<Self> {
+        match (user, global) {
+            (true, true) => bail!("`--user` and `--global` are mutually exclusive"),
+            (true, false) => Ok(Self::User),
+            (false, true) => Ok(Self::Global),
+            (false, false) => Ok(Self::Auto),
+        }
+    }
+}
+
 impl ToolScope {
-    fn from_flags(user: bool) -> Self {
-        if user { Self::User } else { Self::Global }
+    fn resolve(request: ToolScopeRequest) -> Self {
+        match request {
+            ToolScopeRequest::Global => Self::Global,
+            ToolScopeRequest::User => Self::User,
+            ToolScopeRequest::Auto => default_tool_scope(),
+        }
     }
 
     fn label(self) -> &'static str {
@@ -292,9 +314,56 @@ impl ToolScope {
     }
 }
 
-fn ensure_tool_home_ready(home: &ToolHome, scope: ToolScope) -> Result<ToolLock> {
+#[cfg(unix)]
+fn default_tool_scope() -> ToolScope {
+    if rustix::process::geteuid().as_raw() == 0 {
+        ToolScope::Global
+    } else {
+        ToolScope::User
+    }
+}
+
+#[cfg(not(unix))]
+fn default_tool_scope() -> ToolScope {
+    ToolScope::User
+}
+
+fn detect_current_za_scope() -> Option<ToolScope> {
+    let executable = env::current_exe().ok()?;
+    let user_home = ToolHome::for_scope(ToolScope::User).ok()?;
+    let global_home = ToolHome::for_scope(ToolScope::Global).ok()?;
+    classify_tool_executable_scope(&executable, "za", &user_home, &global_home)
+}
+
+fn classify_tool_executable_scope(
+    executable: &Path,
+    name: &str,
+    user_home: &ToolHome,
+    global_home: &ToolHome,
+) -> Option<ToolScope> {
+    if tool_home_owns_executable(user_home, name, executable) {
+        return Some(ToolScope::User);
+    }
+    if tool_home_owns_executable(global_home, name, executable) {
+        return Some(ToolScope::Global);
+    }
+    None
+}
+
+fn tool_home_owns_executable(home: &ToolHome, name: &str, executable: &Path) -> bool {
+    let executable = normalize_existing_path(executable);
+    let active_bin = normalize_existing_path(&home.bin_path(name));
+    let store_root = normalize_existing_path(&home.name_dir(name));
+    executable == active_bin || executable.starts_with(store_root)
+}
+
+fn normalize_existing_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn ensure_tool_home_ready(home: &ToolHome) -> Result<ToolLock> {
     if let Err(err) = home.ensure_layout() {
-        if scope == ToolScope::Global {
+        if home.scope == ToolScope::Global {
             return Err(err).with_context(|| {
                 "cannot initialize global tool directories. retry with `za tool --user ...` or run with elevated privileges"
                     .to_string()
@@ -304,7 +373,7 @@ fn ensure_tool_home_ready(home: &ToolHome, scope: ToolScope) -> Result<ToolLock>
     }
     match ToolLock::acquire(home) {
         Ok(lock) => Ok(lock),
-        Err(err) if scope == ToolScope::Global => Err(err).with_context(|| {
+        Err(err) if home.scope == ToolScope::Global => Err(err).with_context(|| {
             "cannot acquire global tool lock. retry with `za tool --user ...` or run with elevated privileges"
                 .to_string()
         }),
@@ -312,11 +381,11 @@ fn ensure_tool_home_ready(home: &ToolHome, scope: ToolScope) -> Result<ToolLock>
     }
 }
 
-fn run_mutating_tool_command<F>(home: &ToolHome, scope: ToolScope, action: F) -> Result<i32>
+fn run_mutating_tool_command<F>(home: &ToolHome, action: F) -> Result<i32>
 where
     F: FnOnce() -> Result<()>,
 {
-    let _lock = ensure_tool_home_ready(home, scope)?;
+    let _lock = ensure_tool_home_ready(home)?;
     action()?;
     Ok(0)
 }
@@ -355,11 +424,10 @@ fn run_ls_command(
     list_installed(home, json)
 }
 
-pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
+pub fn run(cmd: ToolCommands, scope_request: ToolScopeRequest) -> Result<i32> {
     prepare_interruptible_tool_operation()?;
 
-    let scope = ToolScope::from_flags(user);
-    let home = ToolHome::detect(scope)?;
+    let home = ToolHome::detect(scope_request)?;
     cleanup_legacy_current_dir_artifacts(&home)?;
 
     match cmd {
@@ -407,7 +475,7 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
                 Ok(0)
             } else {
                 let home_for_action = home.clone();
-                run_mutating_tool_command(&home, scope, move || {
+                run_mutating_tool_command(&home, move || {
                     install_tools(
                         &home_for_action,
                         &tools,
@@ -433,7 +501,7 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
                 Ok(0)
             } else {
                 let home_for_action = home.clone();
-                run_mutating_tool_command(&home, scope, move || {
+                run_mutating_tool_command(&home, move || {
                     update_tools(
                         &home_for_action,
                         all,
@@ -456,7 +524,7 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
                 Ok(0)
             } else {
                 let home_for_action = home.clone();
-                run_mutating_tool_command(&home, scope, move || {
+                run_mutating_tool_command(&home, move || {
                     sync_manifest(&home_for_action, &file, false, verbose)
                 })
             }
@@ -464,7 +532,7 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
         ToolCommands::Doctor { tools, json } => run_doctor(&home, &tools, json),
         ToolCommands::Uninstall { tool, version } => {
             let home_for_action = home.clone();
-            run_mutating_tool_command(&home, scope, move || {
+            run_mutating_tool_command(&home, move || {
                 uninstall(
                     &home_for_action,
                     ToolSpec::from_args(&tool, version.as_deref())?,
@@ -484,7 +552,7 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
         } => list_outdated(&home, &tools, json, fail_on_updates, fail_on_check_errors),
         ToolCommands::Adopt { tool } => {
             let home_for_action = home.clone();
-            run_mutating_tool_command(&home, scope, move || {
+            run_mutating_tool_command(&home, move || {
                 install_tools(
                     &home_for_action,
                     std::slice::from_ref(&tool),
@@ -499,11 +567,14 @@ pub fn run(cmd: ToolCommands, user: bool) -> Result<i32> {
     }
 }
 
-pub fn update_self(user: bool, check: bool, version: Option<String>) -> Result<i32> {
+pub fn update_self(
+    scope_request: ToolScopeRequest,
+    check: bool,
+    version: Option<String>,
+) -> Result<i32> {
     prepare_interruptible_tool_operation()?;
 
-    let scope = ToolScope::from_flags(user);
-    let home = ToolHome::detect(scope)?;
+    let home = ToolHome::detect_for_self_update(scope_request)?;
     cleanup_legacy_current_dir_artifacts(&home)?;
 
     if check {
@@ -511,7 +582,7 @@ pub fn update_self(user: bool, check: bool, version: Option<String>) -> Result<i
     }
 
     if let Err(err) = home.ensure_layout() {
-        if scope == ToolScope::Global {
+        if home.scope == ToolScope::Global {
             return Err(err).with_context(|| {
                 "cannot initialize global tool directories. retry with `za update --user` or run with elevated privileges"
                     .to_string()
@@ -521,7 +592,7 @@ pub fn update_self(user: bool, check: bool, version: Option<String>) -> Result<i
     }
     let _lock = match ToolLock::acquire(&home) {
         Ok(lock) => lock,
-        Err(err) if scope == ToolScope::Global => {
+        Err(err) if home.scope == ToolScope::Global => {
             return Err(err).with_context(|| {
                 "cannot acquire global tool lock. retry with `za update --user` or run with elevated privileges"
                     .to_string()
@@ -727,6 +798,8 @@ struct InstallOptions {
     proxy_scope: za_config::ProxyScope,
     dry_run: bool,
     emit_stages: bool,
+    emit_plan_stage: bool,
+    download_display: source::DownloadDisplay,
 }
 
 impl InstallOptions {
@@ -738,6 +811,8 @@ impl InstallOptions {
             proxy_scope,
             dry_run: false,
             emit_stages: true,
+            emit_plan_stage: false,
+            download_display: source::DownloadDisplay::Detailed,
         }
     }
 
@@ -749,6 +824,8 @@ impl InstallOptions {
             proxy_scope,
             dry_run: false,
             emit_stages: true,
+            emit_plan_stage: false,
+            download_display: source::DownloadDisplay::Detailed,
         }
     }
 
@@ -760,6 +837,8 @@ impl InstallOptions {
             proxy_scope,
             dry_run: false,
             emit_stages: true,
+            emit_plan_stage: false,
+            download_display: source::DownloadDisplay::Detailed,
         }
     }
 
@@ -777,6 +856,16 @@ impl InstallOptions {
         self.emit_stages = emit_stages;
         self
     }
+
+    fn emit_plan_stage(mut self, emit_plan_stage: bool) -> Self {
+        self.emit_plan_stage = emit_plan_stage;
+        self
+    }
+
+    fn download_display(mut self, download_display: source::DownloadDisplay) -> Self {
+        self.download_display = download_display;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -791,7 +880,6 @@ enum InstallOutcome {
 struct InstallResult {
     tool: ToolRef,
     outcome: InstallOutcome,
-    previous_active: Option<String>,
 }
 
 #[derive(Debug)]
@@ -977,7 +1065,21 @@ struct ToolHome {
 }
 
 impl ToolHome {
-    fn detect(scope: ToolScope) -> Result<Self> {
+    fn detect(scope_request: ToolScopeRequest) -> Result<Self> {
+        let scope = ToolScope::resolve(scope_request);
+        Self::for_scope(scope)
+    }
+
+    fn detect_for_self_update(scope_request: ToolScopeRequest) -> Result<Self> {
+        let scope = match scope_request {
+            ToolScopeRequest::Auto => detect_current_za_scope().unwrap_or_else(default_tool_scope),
+            ToolScopeRequest::Global => ToolScope::Global,
+            ToolScopeRequest::User => ToolScope::User,
+        };
+        Self::for_scope(scope)
+    }
+
+    fn for_scope(scope: ToolScope) -> Result<Self> {
         match scope {
             ToolScope::Global => Ok(Self {
                 scope,
@@ -1258,51 +1360,22 @@ fn install(
         }
     };
 
-    if options.action == ToolAction::Update {
-        match planned_outcome {
-            InstallOutcome::Unchanged => {
-                print_tool_stage_if(
-                    options.emit_stages,
-                    "update",
-                    format!("`{}` already at {} (no changes)", tool.name, tool.version),
-                );
-                if options.dry_run && options.emit_stages {
-                    print_tool_stage("next", "no changes needed");
-                }
-                return Ok(InstallResult {
-                    tool,
-                    outcome: InstallOutcome::Unchanged,
-                    previous_active,
-                });
-            }
-            InstallOutcome::Repaired if current_matches_target => {
-                print_tool_stage_if(
-                    options.emit_stages,
-                    "repair",
-                    format!("`{}` {}", tool.name, tool.version),
-                );
-            }
-            InstallOutcome::Repaired => {
-                print_tool_stage_if(
-                    options.emit_stages,
-                    "repair",
-                    format!("`{}` -> {}", tool.name, tool.version),
-                );
-            }
-            InstallOutcome::Updated => match previous_active.as_deref() {
-                Some(current) => print_tool_stage_if(
-                    options.emit_stages,
-                    "update",
-                    format!("`{}` {} -> {}", tool.name, current, tool.version),
-                ),
-                None => print_tool_stage_if(
-                    options.emit_stages,
-                    "update",
-                    format!("`{}` -> {}", tool.name, tool.version),
-                ),
-            },
-            InstallOutcome::Installed => {}
+    emit_install_plan_stage(
+        &tool,
+        previous_active.as_deref(),
+        planned_outcome,
+        current_matches_target,
+        options,
+    );
+
+    if options.action == ToolAction::Update && planned_outcome == InstallOutcome::Unchanged {
+        if options.dry_run && options.emit_stages {
+            print_tool_stage("next", "no changes needed");
         }
+        return Ok(InstallResult {
+            tool,
+            outcome: InstallOutcome::Unchanged,
+        });
     }
 
     if options.dry_run {
@@ -1310,7 +1383,6 @@ fn install(
         return Ok(InstallResult {
             tool,
             outcome: planned_outcome,
-            previous_active,
         });
     }
 
@@ -1337,7 +1409,11 @@ fn install(
                 "source",
                 format!("fetching `{}` {}", tool.name, tool.version),
             );
-            let src = match resolve_install_source(&tool, options.proxy_scope) {
+            let src = match resolve_install_source(
+                &tool,
+                options.proxy_scope,
+                options.download_display,
+            ) {
                 Ok(src) => src,
                 Err(err) => {
                     return Err(match install_source_failure_guidance(&err) {
@@ -1378,6 +1454,7 @@ fn install(
             home.active_path(&tool.name).display()
         ),
     );
+    emit_user_path_hint(home, &tool, options);
     ensure_post_activation_integrations(home, &tool, options.emit_stages)?;
     if options.prune_after_activation {
         let removed = prune_non_active_versions(home, &tool)?;
@@ -1397,8 +1474,128 @@ fn install(
     Ok(InstallResult {
         tool,
         outcome: planned_outcome,
-        previous_active,
     })
+}
+
+fn emit_user_path_hint(home: &ToolHome, tool: &ToolRef, options: InstallOptions) {
+    if home.scope != ToolScope::User || tool_layout_for_name(&tool.name) != ToolLayout::Binary {
+        return;
+    }
+    if path_env_contains_dir(&home.bin_dir) {
+        return;
+    }
+    let enabled = options.emit_stages || options.emit_plan_stage;
+    print_tool_stage_if(
+        enabled,
+        "next",
+        format!(
+            "{} is not in PATH; add it for direct `{}` usage, or run through `za run {}`",
+            home.bin_dir.display(),
+            tool.name,
+            tool.name
+        ),
+    );
+}
+
+fn path_env_contains_dir(dir: &Path) -> bool {
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&path).any(|entry| entry == dir)
+}
+
+fn emit_install_plan_stage(
+    tool: &ToolRef,
+    previous_active: Option<&str>,
+    planned_outcome: InstallOutcome,
+    current_matches_target: bool,
+    options: InstallOptions,
+) {
+    if options.emit_stages {
+        emit_detailed_install_plan_stage(
+            tool,
+            previous_active,
+            planned_outcome,
+            current_matches_target,
+            options,
+        );
+        return;
+    }
+
+    if !options.emit_plan_stage {
+        return;
+    }
+
+    let Some((stage, mut message)) = compact_install_plan(tool, previous_active, planned_outcome)
+    else {
+        return;
+    };
+    if options.dry_run {
+        message.push_str(" (dry-run)");
+    }
+    print_tool_stage(stage, message);
+}
+
+fn emit_detailed_install_plan_stage(
+    tool: &ToolRef,
+    previous_active: Option<&str>,
+    planned_outcome: InstallOutcome,
+    current_matches_target: bool,
+    options: InstallOptions,
+) {
+    if options.action != ToolAction::Update {
+        return;
+    }
+
+    match planned_outcome {
+        InstallOutcome::Unchanged => {
+            print_tool_stage(
+                "update",
+                format!("`{}` already at {} (no changes)", tool.name, tool.version),
+            );
+        }
+        InstallOutcome::Repaired if current_matches_target => {
+            print_tool_stage("repair", format!("`{}` {}", tool.name, tool.version));
+        }
+        InstallOutcome::Repaired => {
+            print_tool_stage("repair", format!("`{}` -> {}", tool.name, tool.version));
+        }
+        InstallOutcome::Updated => match previous_active {
+            Some(current) => print_tool_stage(
+                "update",
+                format!("`{}` {} -> {}", tool.name, current, tool.version),
+            ),
+            None => print_tool_stage("update", format!("`{}` -> {}", tool.name, tool.version)),
+        },
+        InstallOutcome::Installed => {}
+    }
+}
+
+fn compact_install_plan(
+    tool: &ToolRef,
+    previous_active: Option<&str>,
+    planned_outcome: InstallOutcome,
+) -> Option<(&'static str, String)> {
+    match planned_outcome {
+        InstallOutcome::Installed => Some(("install", format!("`{}` {}", tool.name, tool.version))),
+        InstallOutcome::Updated => Some((
+            "update",
+            match previous_active {
+                Some(current) => format!("`{}` {} -> {}", tool.name, current, tool.version),
+                None => format!("`{}` -> {}", tool.name, tool.version),
+            },
+        )),
+        InstallOutcome::Repaired => Some((
+            "repair",
+            match previous_active {
+                Some(current) if normalize_version(current) != normalize_version(&tool.version) => {
+                    format!("`{}` {} -> {}", tool.name, current, tool.version)
+                }
+                _ => format!("`{}` {}", tool.name, tool.version),
+            },
+        )),
+        InstallOutcome::Unchanged => None,
+    }
 }
 
 fn preview_install(

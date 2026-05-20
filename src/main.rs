@@ -105,14 +105,22 @@ fn main() -> Result<()> {
         },
         cli::Commands::Pin { cmd } => exit_with(command::pin::run(cmd)?),
         cli::Commands::Port { cmd } => exit_with(command::port::run(cmd)?),
-        cli::Commands::Tool { user, cmd } => exit_with(command::tool::run(cmd, user)?),
+        cli::Commands::Tool { user, global, cmd } => exit_with(command::tool::run(
+            cmd,
+            command::tool::ToolScopeRequest::from_flags(user, global)?,
+        )?),
         cli::Commands::Run { tool, args } => exit_with(command::run::run(&tool, &args)?),
         cli::Commands::Codex { cmd, args } => exit_with(command::codex::run(cmd, &args)?),
         cli::Commands::Update {
             user,
+            global,
             check,
             version,
-        } => exit_with(command::tool::update_self(user, check, version)?),
+        } => exit_with(command::tool::update_self(
+            command::tool::ToolScopeRequest::from_flags(user, global)?,
+            check,
+            version,
+        )?),
         cli::Commands::Config { cmd } => command::za_config::run(cmd),
         cli::Commands::Ide { cmd } => exit_with(command::ide::run(cmd)?),
         cli::Commands::Gh { cmd } => match cmd {

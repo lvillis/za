@@ -66,9 +66,12 @@ pub enum Commands {
     },
     /// Manage CLI tools in the current scope
     Tool {
-        /// Use user-level paths (`~/.local/...`) instead of system-level paths.
-        #[arg(long)]
+        /// Use user-level paths instead of auto-detecting the scope.
+        #[arg(long, conflicts_with = "global")]
         user: bool,
+        /// Use system-level paths instead of auto-detecting the scope.
+        #[arg(long, conflicts_with = "user")]
+        global: bool,
         #[command(subcommand)]
         cmd: ToolCommands,
     },
@@ -90,9 +93,12 @@ pub enum Commands {
     },
     /// Update the za binary
     Update {
-        /// Install to user-level paths (`~/.local/...`) instead of system-level paths.
-        #[arg(long)]
+        /// Install to user-level paths instead of auto-detecting the scope.
+        #[arg(long, conflicts_with = "global")]
         user: bool,
+        /// Install to system-level paths instead of auto-detecting the scope.
+        #[arg(long, conflicts_with = "user")]
+        global: bool,
         /// Only check whether an update is available.
         #[arg(long)]
         check: bool,
@@ -1208,8 +1214,9 @@ mod tests {
         let cli = Cli::try_parse_from(["za", "tool", "install", "codex", "--version", "0.105.0"])
             .expect("must parse");
         match cli.cmd {
-            Commands::Tool { user, cmd } => {
+            Commands::Tool { user, global, cmd } => {
                 assert!(!user);
+                assert!(!global);
                 assert!(matches!(
                     cmd,
                     ToolCommands::Install {
@@ -1230,8 +1237,9 @@ mod tests {
         let cli =
             Cli::try_parse_from(["za", "tool", "install", "just", "cross"]).expect("must parse");
         match cli.cmd {
-            Commands::Tool { user, cmd } => {
+            Commands::Tool { user, global, cmd } => {
                 assert!(!user);
+                assert!(!global);
                 assert!(matches!(
                     cmd,
                     ToolCommands::Install {
@@ -1252,8 +1260,9 @@ mod tests {
         let cli = Cli::try_parse_from(["za", "tool", "--user", "update", "codex", "rg"])
             .expect("must parse");
         match cli.cmd {
-            Commands::Tool { user, cmd } => {
+            Commands::Tool { user, global, cmd } => {
                 assert!(user);
+                assert!(!global);
                 assert!(matches!(
                     cmd,
                     ToolCommands::Update {
@@ -1268,6 +1277,53 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn tool_global_flag_is_explicit_and_mutually_exclusive() {
+        let cli =
+            Cli::try_parse_from(["za", "tool", "--global", "update", "codex"]).expect("must parse");
+        match cli.cmd {
+            Commands::Tool { user, global, cmd } => {
+                assert!(!user);
+                assert!(global);
+                assert!(matches!(
+                    cmd,
+                    ToolCommands::Update {
+                        all: false,
+                        tools,
+                        version: None,
+                        alpha: false,
+                        dry_run: false,
+                        verbose: false,
+                    } if tools == vec!["codex"]
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        assert!(Cli::try_parse_from(["za", "tool", "--user", "--global", "ls"]).is_err());
+    }
+
+    #[test]
+    fn update_global_flag_is_explicit_and_mutually_exclusive() {
+        let cli = Cli::try_parse_from(["za", "update", "--global", "--check"]).expect("must parse");
+        match cli.cmd {
+            Commands::Update {
+                user,
+                global,
+                check,
+                version,
+            } => {
+                assert!(!user);
+                assert!(global);
+                assert!(check);
+                assert_eq!(version, None);
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        assert!(Cli::try_parse_from(["za", "update", "--user", "--global"]).is_err());
     }
 
     #[test]
@@ -1430,8 +1486,9 @@ mod tests {
     fn tool_update_parses_all_flag() {
         let cli = Cli::try_parse_from(["za", "tool", "update", "--all"]).expect("must parse");
         match cli.cmd {
-            Commands::Tool { user, cmd } => {
+            Commands::Tool { user, global, cmd } => {
                 assert!(!user);
+                assert!(!global);
                 assert!(matches!(
                     cmd,
                     ToolCommands::Update {
@@ -1453,8 +1510,9 @@ mod tests {
         let cli = Cli::try_parse_from(["za", "tool", "update", "--all", "--verbose"])
             .expect("must parse");
         match cli.cmd {
-            Commands::Tool { user, cmd } => {
+            Commands::Tool { user, global, cmd } => {
                 assert!(!user);
+                assert!(!global);
                 assert!(matches!(
                     cmd,
                     ToolCommands::Update {
@@ -1484,8 +1542,9 @@ mod tests {
         ])
         .expect("must parse");
         match cli.cmd {
-            Commands::Tool { user, cmd } => {
+            Commands::Tool { user, global, cmd } => {
                 assert!(!user);
+                assert!(!global);
                 assert!(matches!(
                     cmd,
                     ToolCommands::Sync {

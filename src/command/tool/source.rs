@@ -47,6 +47,14 @@ struct DownloadProbe {
     range_supported: bool,
 }
 
+struct SingleStreamDownload<'a> {
+    client: &'a Client,
+    path_and_query: &'a str,
+    url: &'a str,
+    asset_path: &'a Path,
+    total_bytes: Option<u64>,
+}
+
 enum ParallelDownloadError {
     Unsupported,
     Failed(anyhow::Error),
@@ -55,6 +63,18 @@ enum ParallelDownloadError {
 enum DownloadExtractionMode<'a> {
     KeepArchive,
     PrimaryEntry(&'a ToolRef),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DownloadDisplay {
+    Detailed,
+    Compact,
+}
+
+impl DownloadDisplay {
+    fn is_detailed(self) -> bool {
+        matches!(self, Self::Detailed)
+    }
 }
 
 pub(super) fn unregister_temp_dir(path: &Path) {
@@ -170,6 +190,7 @@ pub(super) fn resolve_requested_version(
 pub(super) fn resolve_install_source(
     tool: &ToolRef,
     proxy_scope: za_config::ProxyScope,
+    display: DownloadDisplay,
 ) -> Result<PullSource> {
     ensure_not_interrupted()?;
 
@@ -180,7 +201,7 @@ pub(super) fn resolve_install_source(
     let mut errors = Vec::new();
 
     if let Some(release) = policy.github_release {
-        match download_from_github_release(tool, policy.layout, release, proxy_scope) {
+        match download_from_github_release(tool, policy.layout, release, proxy_scope, display) {
             Ok(src) => return Ok(src),
             Err(err) => errors.push(format!("github release: {err:#}")),
         }
@@ -257,17 +278,11 @@ pub(super) fn fetch_latest_version_from_github_release(
     proxy_scope: za_config::ProxyScope,
 ) -> Result<String> {
     match release_policy.track {
-        GithubReleaseTrack::VersionedTags => {
-            let release = fetch_github_release(
-                release_policy.project_label,
-                &format!(
-                    "/repos/{}/{}/releases/latest",
-                    release_policy.owner, release_policy.repo
-                ),
-                proxy_scope,
-            )?;
-            parse_release_version(&release.tag_name, release_policy.tag_prefix)
-        }
+        GithubReleaseTrack::VersionedTags => fetch_latest_stable_version_from_github_release(
+            tool_policy,
+            release_policy,
+            proxy_scope,
+        ),
         GithubReleaseTrack::RollingTagAssets {
             tag,
             asset_prefix,
@@ -291,6 +306,20 @@ pub(super) fn fetch_latest_version_from_github_release(
             )
         }
     }
+}
+
+fn fetch_latest_stable_version_from_github_release(
+    tool_policy: ToolPolicy,
+    release_policy: GithubReleasePolicy,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<String> {
+    let releases = fetch_versioned_release_candidates(release_policy, None, proxy_scope)?;
+    latest_stable_version_for_tags(&releases, release_policy.tag_prefix).with_context(|| {
+        format!(
+            "resolve latest stable release for `{}`",
+            tool_policy.canonical_name
+        )
+    })
 }
 
 pub(super) fn fetch_latest_codex_alpha_version(
@@ -321,6 +350,21 @@ fn fetch_latest_prerelease_version_from_github_release(
         );
     }
 
+    let releases = fetch_versioned_release_candidates(release_policy, Some(channel), proxy_scope)?;
+    latest_prerelease_version_for_channel(&releases, release_policy.tag_prefix, channel)
+        .with_context(|| {
+            format!(
+                "resolve latest {channel} pre-release for `{}`",
+                tool_policy.canonical_name
+            )
+        })
+}
+
+fn fetch_versioned_release_candidates(
+    release_policy: GithubReleasePolicy,
+    prerelease_channel: Option<&str>,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<Vec<GithubRelease>> {
     let mut releases = Vec::new();
     for page in 1..=GITHUB_RELEASE_SCAN_MAX_PAGES {
         let path = format!(
@@ -330,22 +374,34 @@ fn fetch_latest_prerelease_version_from_github_release(
         let mut page_releases =
             fetch_github_releases(release_policy.project_label, &path, proxy_scope)?;
         let is_last_page = page_releases.len() < GITHUB_RELEASE_SCAN_PER_PAGE;
-        let page_has_channel_release = page_releases.iter().any(|release| {
-            release_matches_prerelease_channel(release, release_policy.tag_prefix, channel)
+        let page_has_candidate = page_releases.iter().any(|release| {
+            if let Some(channel) = prerelease_channel {
+                release_matches_prerelease_channel(release, release_policy.tag_prefix, channel)
+            } else {
+                release_matches_stable_versioned_tag(release, release_policy.tag_prefix)
+            }
         });
         releases.append(&mut page_releases);
-        if page_has_channel_release || is_last_page {
+        if page_has_candidate || is_last_page {
             break;
         }
     }
 
-    latest_prerelease_version_for_channel(&releases, release_policy.tag_prefix, channel)
-        .with_context(|| {
-            format!(
-                "resolve latest {channel} pre-release for `{}`",
-                tool_policy.canonical_name
-            )
+    Ok(releases)
+}
+
+fn latest_stable_version_for_tags(releases: &[GithubRelease], tag_prefix: &str) -> Result<String> {
+    releases
+        .iter()
+        .filter(|release| release_matches_stable_versioned_tag(release, tag_prefix))
+        .filter_map(|release| {
+            let version = parse_release_version(&release.tag_name, tag_prefix).ok()?;
+            let parsed = Version::parse(&version).ok()?;
+            Some((parsed, version))
         })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, version)| version)
+        .ok_or_else(|| anyhow!("no stable release was found"))
 }
 
 fn latest_prerelease_version_for_channel(
@@ -383,6 +439,19 @@ fn release_matches_prerelease_channel(
     prerelease_channel_matches(&parsed, channel)
 }
 
+fn release_matches_stable_versioned_tag(release: &GithubRelease, tag_prefix: &str) -> bool {
+    if release.prerelease || release.draft {
+        return false;
+    }
+    let Ok(version) = parse_release_version(&release.tag_name, tag_prefix) else {
+        return false;
+    };
+    let Ok(parsed) = Version::parse(&version) else {
+        return false;
+    };
+    parsed.pre.is_empty()
+}
+
 fn prerelease_channel_matches(version: &Version, channel: &str) -> bool {
     version
         .pre
@@ -397,6 +466,7 @@ fn download_from_github_release(
     layout: ToolLayout,
     release_policy: GithubReleasePolicy,
     proxy_scope: za_config::ProxyScope,
+    display: DownloadDisplay,
 ) -> Result<PullSource> {
     let (asset, expected_sha256) = resolve_github_release_asset(tool, release_policy, proxy_scope)?;
 
@@ -409,6 +479,7 @@ fn download_from_github_release(
         expected_sha256.as_deref(),
         proxy_scope,
         extraction,
+        display,
     )
 }
 
@@ -987,6 +1058,7 @@ fn download_from_url(
     expected_sha256: Option<&str>,
     proxy_scope: za_config::ProxyScope,
     extraction: DownloadExtractionMode<'_>,
+    display: DownloadDisplay,
 ) -> Result<PullSource> {
     ensure_not_interrupted()?;
     let download_root = unique_temp_dir(TEMP_DIR_PREFIX_DOWNLOAD)?;
@@ -998,11 +1070,13 @@ fn download_from_url(
 
         let client = build_http_client(&url_parts.base_url, "za-tool-manager", true, proxy_scope)
             .context("build HTTP client")?;
-        print_download_stage(
-            interactive,
-            "download",
-            format!("probing server capabilities for `{asset_name}`"),
-        );
+        if display.is_detailed() {
+            print_download_stage(
+                interactive,
+                "download",
+                format!("probing server capabilities for `{asset_name}`"),
+            );
+        }
         let probe = probe_parallel_download_support(&client, &url_parts.path_and_query).unwrap_or(
             DownloadProbe {
                 total_bytes: 0,
@@ -1012,15 +1086,17 @@ fn download_from_url(
         let total_bytes = (probe.total_bytes > 0).then_some(probe.total_bytes);
 
         if let Some(plan) = build_parallel_download_plan(probe.total_bytes, probe.range_supported) {
-            print_download_stage(
-                interactive,
-                "download",
-                format!(
-                    "parallel transfer ({} parts, {})",
-                    plan.parts,
-                    format_bytes_u64(plan.total_bytes)
-                ),
-            );
+            if display.is_detailed() {
+                print_download_stage(
+                    interactive,
+                    "download",
+                    format!(
+                        "parallel transfer ({} parts, {})",
+                        plan.parts,
+                        format_bytes_u64(plan.total_bytes)
+                    ),
+                );
+            }
             match download_to_path_parallel(&url_parts, url, &asset_path, proxy_scope, plan) {
                 Ok(()) => {}
                 Err(ParallelDownloadError::Unsupported) => {
@@ -1029,11 +1105,14 @@ fn download_from_url(
                         format!(
                             "range transfer unavailable for `{asset_name}`; falling back to single stream"
                         ),
-                        &client,
-                        &url_parts.path_and_query,
-                        url,
-                        &asset_path,
-                        total_bytes,
+                        SingleStreamDownload {
+                            client: &client,
+                            path_and_query: &url_parts.path_and_query,
+                            url,
+                            asset_path: &asset_path,
+                            total_bytes,
+                        },
+                        display,
                     )?;
                 }
                 Err(ParallelDownloadError::Failed(err)) => {
@@ -1043,16 +1122,21 @@ fn download_from_url(
                             "parallel transfer interrupted for `{asset_name}` after {}; falling back to single stream",
                             summarize_retryable_error(&err)
                         ),
-                        &client,
-                        &url_parts.path_and_query,
-                        url,
-                        &asset_path,
-                        total_bytes,
+                        SingleStreamDownload {
+                            client: &client,
+                            path_and_query: &url_parts.path_and_query,
+                            url,
+                            asset_path: &asset_path,
+                            total_bytes,
+                        },
+                        display,
                     )?;
                 }
             }
         } else {
-            print_download_stage(interactive, "download", "single-stream transfer");
+            if display.is_detailed() {
+                print_download_stage(interactive, "download", "single-stream transfer");
+            }
             download_to_path_single(
                 &client,
                 &url_parts.path_and_query,
@@ -1065,7 +1149,9 @@ fn download_from_url(
 
         if let Some(expected_sha256) = expected_sha256 {
             verify_sha256_file(&asset_path, expected_sha256)?;
-            print_download_stage(interactive, "verify", "sha256 ok");
+            if display.is_detailed() {
+                print_download_stage(interactive, "verify", "sha256 ok");
+            }
         }
 
         let (artifact, resolved_path) = match extraction {
@@ -1077,7 +1163,9 @@ fn download_from_url(
             }
             DownloadExtractionMode::PrimaryEntry(tool) => {
                 let resolved_path = if detect_archive_kind(&asset_name).is_some() {
-                    print_download_stage(interactive, "extract", &asset_name);
+                    if display.is_detailed() {
+                        print_download_stage(interactive, "extract", &asset_name);
+                    }
                     extract_archive_primary_entry(tool, &asset_path, &download_root)?
                 } else {
                     asset_path
@@ -1108,18 +1196,23 @@ fn download_from_url(
 fn retry_single_stream_after_parallel_failure(
     interactive: bool,
     reason: String,
-    client: &Client,
-    path_and_query: &str,
-    url: &str,
-    asset_path: &Path,
-    total_bytes: Option<u64>,
+    request: SingleStreamDownload<'_>,
+    display: DownloadDisplay,
 ) -> Result<()> {
     if interactive {
         finish_download_tty_line();
     }
     print_download_stage(interactive, "download", reason);
-    print_download_stage(interactive, "download", "single-stream transfer");
-    download_to_path_single(client, path_and_query, url, asset_path, total_bytes)
+    if display.is_detailed() {
+        print_download_stage(interactive, "download", "single-stream transfer");
+    }
+    download_to_path_single(
+        request.client,
+        request.path_and_query,
+        request.url,
+        request.asset_path,
+        request.total_bytes,
+    )
 }
 
 fn build_download_request<'a>(
@@ -1873,11 +1966,12 @@ fn unique_temp_dir(prefix: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DownloadExtractionMode, DownloadRange, GithubRelease, ParallelDownloadPlan,
-        TEMP_DIR_PREFIX_DOWNLOAD, build_parallel_download_plan, download_from_url,
-        latest_prerelease_version_for_channel, matched_temp_prefix, parse_content_range_total,
-        parse_temp_dir_pid, prerelease_channel_matches, process_is_alive,
-        retry_transient_http_operation, split_download_ranges,
+        DownloadDisplay, DownloadExtractionMode, DownloadRange, GithubRelease,
+        ParallelDownloadPlan, TEMP_DIR_PREFIX_DOWNLOAD, build_parallel_download_plan,
+        download_from_url, latest_prerelease_version_for_channel, latest_stable_version_for_tags,
+        matched_temp_prefix, parse_content_range_total, parse_temp_dir_pid,
+        prerelease_channel_matches, process_is_alive, retry_transient_http_operation,
+        split_download_ranges,
     };
     use crate::command::za_config;
     use semver::Version;
@@ -1926,6 +2020,22 @@ mod tests {
             latest_prerelease_version_for_channel(&releases, "rust-v", "alpha")
                 .expect("latest alpha"),
             "0.129.0-alpha.10"
+        );
+    }
+
+    #[test]
+    fn latest_stable_version_for_tags_prefers_highest_matching_semver() {
+        let releases = vec![
+            github_release("rust-v0.131.0", false, false),
+            github_release("rust-v0.132.0-alpha.1", true, false),
+            github_release("rust-v0.132.0", false, false),
+            github_release("rusty-v8-v147.4.0", true, false),
+            github_release("rust-v0.133.0", false, true),
+        ];
+
+        assert_eq!(
+            latest_stable_version_for_tags(&releases, "rust-v").expect("latest stable"),
+            "0.132.0"
         );
     }
 
@@ -2090,6 +2200,7 @@ mod tests {
             None,
             za_config::ProxyScope::Tool,
             DownloadExtractionMode::KeepArchive,
+            DownloadDisplay::Detailed,
         )
         .expect("single-stream retry should succeed");
         let downloaded = std::fs::read(&pull.path).expect("read downloaded asset");
@@ -2136,6 +2247,7 @@ mod tests {
             None,
             za_config::ProxyScope::Tool,
             DownloadExtractionMode::KeepArchive,
+            DownloadDisplay::Detailed,
         )
         .expect("download succeeds after single-stream fallback");
         let downloaded = std::fs::read(&pull.path).expect("read downloaded asset");

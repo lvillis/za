@@ -6,16 +6,16 @@ use super::{
     BLESH_BASH_INIT_BOTTOM_END_MARKER, BLESH_BASH_INIT_BOTTOM_START_MARKER,
     BLESH_BASH_INIT_TOP_END_MARKER, BLESH_BASH_INIT_TOP_START_MARKER,
     IDE_TERMINAL_BASH_HELPER_END_MARKER, IDE_TERMINAL_BASH_HELPER_START_MARKER, InstallOutcome,
-    InstallResult, LatestCheck, ManagedBlockPosition, ManagedFileChange,
-    STARSHIP_BASH_INIT_END_MARKER, STARSHIP_BASH_INIT_START_MARKER, TOOL_UPDATE_CACHE_TTL_SECS,
-    ToolBatchKind, ToolBatchSummary, ToolHome, ToolRef, ToolScope, ToolSpec, ToolUpdateChannel,
-    canonical_tool_name, cleanup_legacy_current_dir_artifacts, collect_managed_tool_names,
-    command_candidates, extract_version_from_text, find_tool_policy, latest_check_progress_message,
-    list_update_status, load_sync_specs_from_manifest, normalize_requested_tool_names,
-    normalize_version, prune_non_active_versions, render_batch_summary,
-    render_compact_batch_result, resolve_update_channel_request, source, starship_bash_init_block,
-    supported_tool_names_csv, tool_update_cache_entry_is_fresh, unsupported_tool_message,
-    upsert_managed_block,
+    LatestCheck, ManagedBlockPosition, ManagedFileChange, STARSHIP_BASH_INIT_END_MARKER,
+    STARSHIP_BASH_INIT_START_MARKER, TOOL_UPDATE_CACHE_TTL_SECS, ToolBatchKind, ToolBatchSummary,
+    ToolHome, ToolRef, ToolScope, ToolScopeRequest, ToolSpec, ToolUpdateChannel,
+    canonical_tool_name, classify_tool_executable_scope, cleanup_legacy_current_dir_artifacts,
+    collect_managed_tool_names, command_candidates, compact_install_plan,
+    extract_version_from_text, find_tool_policy, latest_check_progress_message, list_update_status,
+    load_sync_specs_from_manifest, normalize_requested_tool_names, normalize_version,
+    prune_non_active_versions, render_batch_summary, resolve_update_channel_request, source,
+    starship_bash_init_block, supported_tool_names_csv, tool_update_cache_entry_is_fresh,
+    unsupported_tool_message, upsert_managed_block,
 };
 use std::{fs, time::Duration};
 
@@ -28,6 +28,88 @@ fn parse_tool_ref_ok() {
     let tool = ToolRef::parse("codex-cli@0.21.0").expect("valid ref");
     assert_eq!(tool.name, "codex-cli");
     assert_eq!(tool.version, "0.21.0");
+}
+
+#[test]
+fn tool_scope_request_respects_explicit_flags() {
+    assert_eq!(
+        ToolScopeRequest::from_flags(false, false).expect("auto scope"),
+        ToolScopeRequest::Auto
+    );
+    assert_eq!(
+        ToolScopeRequest::from_flags(true, false).expect("user scope"),
+        ToolScopeRequest::User
+    );
+    assert_eq!(
+        ToolScopeRequest::from_flags(false, true).expect("global scope"),
+        ToolScopeRequest::Global
+    );
+    assert!(ToolScopeRequest::from_flags(true, true).is_err());
+}
+
+#[test]
+fn explicit_tool_scope_detects_expected_roots() {
+    let global = ToolHome::detect(ToolScopeRequest::Global).expect("global home");
+    assert_eq!(global.scope, ToolScope::Global);
+    assert_eq!(
+        global.store_dir,
+        std::path::Path::new("/var/lib/za/tools/store")
+    );
+    assert_eq!(global.bin_dir, std::path::Path::new("/usr/local/bin"));
+
+    let user = ToolHome::detect(ToolScopeRequest::User).expect("user home");
+    assert_eq!(user.scope, ToolScope::User);
+    assert!(user.store_dir.ends_with("za/tools/store"));
+    assert!(user.current_dir.ends_with("za/tools/current"));
+}
+
+#[test]
+fn self_update_scope_prefers_owner_of_current_executable() {
+    let root = std::env::temp_dir().join(format!(
+        "za-test-self-update-scope-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let user_home = ToolHome {
+        scope: ToolScope::User,
+        store_dir: root.join("user/store"),
+        current_dir: root.join("user/current"),
+        bin_dir: root.join("user/bin"),
+    };
+    let global_home = ToolHome {
+        scope: ToolScope::Global,
+        store_dir: root.join("global/store"),
+        current_dir: root.join("global/current"),
+        bin_dir: root.join("global/bin"),
+    };
+
+    assert_eq!(
+        classify_tool_executable_scope(&user_home.bin_path("za"), "za", &user_home, &global_home),
+        Some(ToolScope::User)
+    );
+    assert_eq!(
+        classify_tool_executable_scope(
+            &global_home.name_dir("za").join("0.1.0/za"),
+            "za",
+            &user_home,
+            &global_home
+        ),
+        Some(ToolScope::Global)
+    );
+    assert_eq!(
+        classify_tool_executable_scope(
+            &root.join("target/debug/za"),
+            "za",
+            &user_home,
+            &global_home
+        ),
+        None
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -317,34 +399,28 @@ fn render_batch_summary_uses_dry_run_wording() {
 }
 
 #[test]
-fn render_compact_batch_result_shows_updated_versions() {
-    let result = InstallResult {
-        tool: ToolRef {
-            name: "codex".to_string(),
-            version: "0.118.0".to_string(),
-        },
-        outcome: InstallOutcome::Updated,
-        previous_active: Some("0.117.0".to_string()),
+fn compact_install_plan_shows_update_versions() {
+    let tool = ToolRef {
+        name: "codex".to_string(),
+        version: "0.118.0".to_string(),
     };
+
     assert_eq!(
-        render_compact_batch_result(ToolBatchKind::Update, &result, false),
-        ("update", "`codex` 0.117.0 -> 0.118.0".to_string())
+        compact_install_plan(&tool, Some("0.117.0"), InstallOutcome::Updated),
+        Some(("update", "`codex` 0.117.0 -> 0.118.0".to_string()))
     );
 }
 
 #[test]
-fn render_compact_batch_result_shows_repair_concisely() {
-    let result = InstallResult {
-        tool: ToolRef {
-            name: "ble.sh".to_string(),
-            version: "nightly-20260310+b99cadb".to_string(),
-        },
-        outcome: InstallOutcome::Repaired,
-        previous_active: Some("nightly-20260310+b99cadb".to_string()),
+fn compact_install_plan_hides_unchanged_tools() {
+    let tool = ToolRef {
+        name: "codex".to_string(),
+        version: "0.118.0".to_string(),
     };
+
     assert_eq!(
-        render_compact_batch_result(ToolBatchKind::Update, &result, false),
-        ("repair", "`ble.sh` nightly-20260310+b99cadb".to_string())
+        compact_install_plan(&tool, Some("0.118.0"), InstallOutcome::Unchanged),
+        None
     );
 }
 
