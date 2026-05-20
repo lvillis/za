@@ -6,16 +6,17 @@ use super::{
     BLESH_BASH_INIT_BOTTOM_END_MARKER, BLESH_BASH_INIT_BOTTOM_START_MARKER,
     BLESH_BASH_INIT_TOP_END_MARKER, BLESH_BASH_INIT_TOP_START_MARKER,
     IDE_TERMINAL_BASH_HELPER_END_MARKER, IDE_TERMINAL_BASH_HELPER_START_MARKER, InstallOutcome,
-    LatestCheck, ManagedBlockPosition, ManagedFileChange, STARSHIP_BASH_INIT_END_MARKER,
-    STARSHIP_BASH_INIT_START_MARKER, TOOL_UPDATE_CACHE_TTL_SECS, ToolBatchKind, ToolBatchSummary,
-    ToolHome, ToolRef, ToolScope, ToolScopeRequest, ToolSpec, ToolUpdateChannel,
-    canonical_tool_name, classify_tool_executable_scope, cleanup_legacy_current_dir_artifacts,
-    collect_managed_tool_names, command_candidates, compact_install_plan,
-    extract_version_from_text, find_tool_policy, latest_check_progress_message, list_update_status,
+    LatestCheck, LatestResolutionMode, ManagedBlockPosition, ManagedFileChange,
+    STARSHIP_BASH_INIT_END_MARKER, STARSHIP_BASH_INIT_START_MARKER, TOOL_UPDATE_CACHE_TTL_SECS,
+    ToolBatchKind, ToolBatchSummary, ToolHome, ToolRef, ToolScope, ToolScopeRequest, ToolSpec,
+    ToolUpdateChannel, canonical_tool_name, classify_tool_executable_scope,
+    cleanup_legacy_current_dir_artifacts, collect_managed_tool_names, command_candidates,
+    compact_install_plan, extract_version_from_text, find_tool_policy,
+    latest_check_progress_message, latest_resolution_mode_for_batch, list_update_status,
     load_sync_specs_from_manifest, normalize_requested_tool_names, normalize_version,
-    prune_non_active_versions, render_batch_summary, resolve_update_channel_request, source,
-    starship_bash_init_block, supported_tool_names_csv, tool_update_cache_entry_is_fresh,
-    unsupported_tool_message, upsert_managed_block,
+    prune_non_active_versions, render_batch_summary, resolve_update_channel_request,
+    should_parallel_materialize_batch, source, starship_bash_init_block, supported_tool_names_csv,
+    tool_update_cache_entry_is_fresh, unsupported_tool_message, upsert_managed_block,
 };
 use std::{fs, time::Duration};
 
@@ -222,6 +223,49 @@ fn update_alpha_channel_rejects_ambiguous_or_non_codex_requests() {
             .is_err()
     );
     assert!(resolve_update_channel_request(false, &["rg".to_string()], None, true).is_err());
+}
+
+#[test]
+fn batch_latest_resolution_scans_only_single_codex_stable_request() {
+    let single_codex = vec![ToolSpec::from_args("codex", None).expect("codex spec")];
+    assert_eq!(
+        latest_resolution_mode_for_batch(&single_codex, ToolUpdateChannel::Stable),
+        LatestResolutionMode::Exact
+    );
+
+    let single_alias = vec![ToolSpec::from_args("codex-cli", None).expect("codex alias spec")];
+    assert_eq!(
+        latest_resolution_mode_for_batch(&single_alias, ToolUpdateChannel::Stable),
+        LatestResolutionMode::Exact
+    );
+
+    let multi = vec![
+        ToolSpec::from_args("codex", None).expect("codex spec"),
+        ToolSpec::from_args("rg", None).expect("rg spec"),
+    ];
+    assert_eq!(
+        latest_resolution_mode_for_batch(&multi, ToolUpdateChannel::Stable),
+        LatestResolutionMode::Fast
+    );
+
+    let single_non_codex = vec![ToolSpec::from_args("rg", None).expect("rg spec")];
+    assert_eq!(
+        latest_resolution_mode_for_batch(&single_non_codex, ToolUpdateChannel::Stable),
+        LatestResolutionMode::Fast
+    );
+
+    assert_eq!(
+        latest_resolution_mode_for_batch(&single_codex, ToolUpdateChannel::CodexAlpha),
+        LatestResolutionMode::Exact
+    );
+}
+
+#[test]
+fn batch_materialize_parallelism_is_limited_to_compact_real_batches() {
+    assert!(should_parallel_materialize_batch(2, false, false));
+    assert!(!should_parallel_materialize_batch(1, false, false));
+    assert!(!should_parallel_materialize_batch(2, true, false));
+    assert!(!should_parallel_materialize_batch(2, false, true));
 }
 
 #[test]

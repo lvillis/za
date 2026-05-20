@@ -69,11 +69,16 @@ enum DownloadExtractionMode<'a> {
 pub(super) enum DownloadDisplay {
     Detailed,
     Compact,
+    Quiet,
 }
 
 impl DownloadDisplay {
     fn is_detailed(self) -> bool {
         matches!(self, Self::Detailed)
+    }
+
+    fn shows_progress(self) -> bool {
+        !matches!(self, Self::Quiet)
     }
 }
 
@@ -277,6 +282,48 @@ pub(super) fn fetch_latest_version_from_github_release(
     release_policy: GithubReleasePolicy,
     proxy_scope: za_config::ProxyScope,
 ) -> Result<String> {
+    fetch_exact_latest_version_from_github_release(tool_policy, release_policy, proxy_scope)
+}
+
+pub(super) fn fetch_fast_latest_version_from_github_release(
+    tool_policy: ToolPolicy,
+    release_policy: GithubReleasePolicy,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<String> {
+    match release_policy.track {
+        GithubReleaseTrack::VersionedTags => {
+            fetch_latest_stable_version_from_github_latest(tool_policy, release_policy, proxy_scope)
+        }
+        GithubReleaseTrack::RollingTagAssets {
+            tag,
+            asset_prefix,
+            asset_suffix,
+            version_prefix,
+        } => {
+            let release = fetch_github_release(
+                release_policy.project_label,
+                &format!(
+                    "/repos/{}/{}/releases/tags/{tag}",
+                    release_policy.owner, release_policy.repo
+                ),
+                proxy_scope,
+            )?;
+            latest_rolling_asset_version(
+                &release,
+                tool_policy,
+                asset_prefix,
+                asset_suffix,
+                version_prefix,
+            )
+        }
+    }
+}
+
+fn fetch_exact_latest_version_from_github_release(
+    tool_policy: ToolPolicy,
+    release_policy: GithubReleasePolicy,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<String> {
     match release_policy.track {
         GithubReleaseTrack::VersionedTags => fetch_latest_stable_version_from_github_release(
             tool_policy,
@@ -320,6 +367,29 @@ fn fetch_latest_stable_version_from_github_release(
             tool_policy.canonical_name
         )
     })
+}
+
+fn fetch_latest_stable_version_from_github_latest(
+    tool_policy: ToolPolicy,
+    release_policy: GithubReleasePolicy,
+    proxy_scope: za_config::ProxyScope,
+) -> Result<String> {
+    let release = fetch_github_release(
+        release_policy.project_label,
+        &format!(
+            "/repos/{}/{}/releases/latest",
+            release_policy.owner, release_policy.repo
+        ),
+        proxy_scope,
+    )?;
+    latest_stable_version_for_latest_release(&release, release_policy.tag_prefix).with_context(
+        || {
+            format!(
+                "resolve latest GitHub release for `{}`",
+                tool_policy.canonical_name
+            )
+        },
+    )
 }
 
 pub(super) fn fetch_latest_codex_alpha_version(
@@ -402,6 +472,36 @@ fn latest_stable_version_for_tags(releases: &[GithubRelease], tag_prefix: &str) 
         .max_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, version)| version)
         .ok_or_else(|| anyhow!("no stable release was found"))
+}
+
+fn latest_stable_version_for_latest_release(
+    release: &GithubRelease,
+    tag_prefix: &str,
+) -> Result<String> {
+    if release.prerelease || release.draft {
+        bail!("latest GitHub release `{}` is not stable", release.tag_name);
+    }
+    if !tag_prefix.is_empty() && !release.tag_name.starts_with(tag_prefix) {
+        bail!(
+            "latest GitHub release tag `{}` does not match expected prefix `{tag_prefix}`",
+            release.tag_name
+        );
+    }
+
+    let version = parse_release_version(&release.tag_name, tag_prefix)?;
+    let parsed = Version::parse(&version).with_context(|| {
+        format!(
+            "latest GitHub release tag `{}` is not semver",
+            release.tag_name
+        )
+    })?;
+    if !parsed.pre.is_empty() {
+        bail!(
+            "latest GitHub release `{}` is a pre-release",
+            release.tag_name
+        );
+    }
+    Ok(version)
 }
 
 fn latest_prerelease_version_for_channel(
@@ -1066,7 +1166,7 @@ fn download_from_url(
         let url_parts = parse_url_parts(url)?;
         let asset_name = url_parts.file_name.clone();
         let asset_path = download_root.join(&asset_name);
-        let interactive = io::stderr().is_terminal();
+        let interactive = display.shows_progress() && io::stderr().is_terminal();
 
         let client = build_http_client(&url_parts.base_url, "za-tool-manager", true, proxy_scope)
             .context("build HTTP client")?;
@@ -1097,7 +1197,14 @@ fn download_from_url(
                     ),
                 );
             }
-            match download_to_path_parallel(&url_parts, url, &asset_path, proxy_scope, plan) {
+            match download_to_path_parallel(
+                &url_parts,
+                url,
+                &asset_path,
+                proxy_scope,
+                plan,
+                display,
+            ) {
                 Ok(()) => {}
                 Err(ParallelDownloadError::Unsupported) => {
                     retry_single_stream_after_parallel_failure(
@@ -1143,6 +1250,7 @@ fn download_from_url(
                 url,
                 &asset_path,
                 total_bytes,
+                display,
             )?;
         }
         ensure_not_interrupted()?;
@@ -1202,7 +1310,9 @@ fn retry_single_stream_after_parallel_failure(
     if interactive {
         finish_download_tty_line();
     }
-    print_download_stage(interactive, "download", reason);
+    if display.shows_progress() {
+        print_download_stage(interactive, "download", reason);
+    }
     if display.is_detailed() {
         print_download_stage(interactive, "download", "single-stream transfer");
     }
@@ -1212,6 +1322,7 @@ fn retry_single_stream_after_parallel_failure(
         request.url,
         request.asset_path,
         request.total_bytes,
+        display,
     )
 }
 
@@ -1300,8 +1411,9 @@ fn download_to_path_single(
     url: &str,
     asset_path: &Path,
     known_total_bytes: Option<u64>,
+    display: DownloadDisplay,
 ) -> Result<()> {
-    let interactive = io::stderr().is_terminal();
+    let interactive = display.shows_progress() && io::stderr().is_terminal();
     let asset_label = asset_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1309,7 +1421,14 @@ fn download_to_path_single(
         .to_string();
 
     retry_transient_http_operation(interactive, "download", &format!("`{asset_label}`"), || {
-        download_to_path_single_once(client, path_and_query, url, asset_path, known_total_bytes)
+        download_to_path_single_once(
+            client,
+            path_and_query,
+            url,
+            asset_path,
+            known_total_bytes,
+            display,
+        )
     })
 }
 
@@ -1319,6 +1438,7 @@ fn download_to_path_single_once(
     url: &str,
     asset_path: &Path,
     known_total_bytes: Option<u64>,
+    display: DownloadDisplay,
 ) -> Result<()> {
     let req = build_download_request(client, path_and_query, None)?;
     let mut resp = req
@@ -1348,8 +1468,9 @@ fn download_to_path_single_once(
     let mut downloaded = 0_u64;
     let start = Instant::now();
     let mut last_report = Instant::now();
-    let use_tty_line = io::stderr().is_terminal();
-    if use_tty_line {
+    let use_progress = display.shows_progress();
+    let use_tty_line = use_progress && io::stderr().is_terminal();
+    if use_progress && use_tty_line {
         eprint!(
             "\r\x1b[2K{}",
             render_download_progress_line(downloaded, total_bytes, start.elapsed(), true)
@@ -1367,23 +1488,27 @@ fn download_to_path_single_once(
         out.write_all(&chunk[..read])
             .with_context(|| format!("write downloaded file {}", asset_path.display()))?;
         downloaded = downloaded.saturating_add(read as u64);
+        if use_progress {
+            report_download_progress(
+                downloaded,
+                total_bytes,
+                start.elapsed(),
+                &mut last_report,
+                false,
+                use_tty_line,
+            );
+        }
+    }
+    if use_progress {
         report_download_progress(
             downloaded,
             total_bytes,
             start.elapsed(),
             &mut last_report,
-            false,
+            true,
             use_tty_line,
         );
     }
-    report_download_progress(
-        downloaded,
-        total_bytes,
-        start.elapsed(),
-        &mut last_report,
-        true,
-        use_tty_line,
-    );
     if let Some(total_bytes) = total_bytes
         && downloaded != total_bytes
     {
@@ -1404,6 +1529,7 @@ fn download_to_path_parallel(
     asset_path: &Path,
     proxy_scope: za_config::ProxyScope,
     plan: ParallelDownloadPlan,
+    display: DownloadDisplay,
 ) -> Result<(), ParallelDownloadError> {
     let part_paths = split_download_ranges(plan)
         .into_iter()
@@ -1420,15 +1546,18 @@ fn download_to_path_parallel(
     let progress = Arc::new(AtomicU64::new(0));
     let reporter_stop = Arc::new(AtomicBool::new(false));
     let total_bytes = Some(plan.total_bytes);
-    let use_tty_line = io::stderr().is_terminal();
+    let use_progress = display.shows_progress();
+    let use_tty_line = use_progress && io::stderr().is_terminal();
 
-    let reporter = spawn_parallel_download_reporter(
-        Arc::clone(&progress),
-        Arc::clone(&reporter_stop),
-        total_bytes,
-        start,
-        use_tty_line,
-    );
+    let mut reporter = use_progress.then(|| {
+        spawn_parallel_download_reporter(
+            Arc::clone(&progress),
+            Arc::clone(&reporter_stop),
+            total_bytes,
+            start,
+            use_tty_line,
+        )
+    });
 
     let handles = part_paths
         .clone()
@@ -1461,13 +1590,17 @@ fn download_to_path_parallel(
             Ok(Ok((index, part_path))) => ordered_parts[index] = part_path,
             Ok(Err(err)) => {
                 reporter_stop.store(true, Ordering::SeqCst);
-                let _ = reporter.join();
+                if let Some(reporter) = reporter.take() {
+                    let _ = reporter.join();
+                }
                 cleanup_parallel_part_files(&part_paths);
                 return Err(err);
             }
             Err(_) => {
                 reporter_stop.store(true, Ordering::SeqCst);
-                let _ = reporter.join();
+                if let Some(reporter) = reporter.take() {
+                    let _ = reporter.join();
+                }
                 cleanup_parallel_part_files(&part_paths);
                 return Err(ParallelDownloadError::Failed(anyhow!(
                     "parallel download worker panicked for `{url}`"
@@ -1477,16 +1610,20 @@ fn download_to_path_parallel(
     }
 
     reporter_stop.store(true, Ordering::SeqCst);
-    let _ = reporter.join();
-    let mut last_report = Instant::now();
-    report_download_progress(
-        progress.load(Ordering::SeqCst),
-        total_bytes,
-        start.elapsed(),
-        &mut last_report,
-        true,
-        use_tty_line,
-    );
+    if let Some(reporter) = reporter.take() {
+        let _ = reporter.join();
+    }
+    if use_progress {
+        let mut last_report = Instant::now();
+        report_download_progress(
+            progress.load(Ordering::SeqCst),
+            total_bytes,
+            start.elapsed(),
+            &mut last_report,
+            true,
+            use_tty_line,
+        );
+    }
 
     merge_parallel_part_files(&ordered_parts, asset_path).map_err(ParallelDownloadError::Failed)?;
     cleanup_parallel_part_files(&part_paths);
@@ -1968,7 +2105,8 @@ mod tests {
     use super::{
         DownloadDisplay, DownloadExtractionMode, DownloadRange, GithubRelease,
         ParallelDownloadPlan, TEMP_DIR_PREFIX_DOWNLOAD, build_parallel_download_plan,
-        download_from_url, latest_prerelease_version_for_channel, latest_stable_version_for_tags,
+        download_from_url, latest_prerelease_version_for_channel,
+        latest_stable_version_for_latest_release, latest_stable_version_for_tags,
         matched_temp_prefix, parse_content_range_total, parse_temp_dir_pid,
         prerelease_channel_matches, process_is_alive, retry_transient_http_operation,
         split_download_ranges,
@@ -2036,6 +2174,32 @@ mod tests {
         assert_eq!(
             latest_stable_version_for_tags(&releases, "rust-v").expect("latest stable"),
             "0.132.0"
+        );
+    }
+
+    #[test]
+    fn latest_stable_version_for_latest_release_requires_expected_prefix() {
+        assert_eq!(
+            latest_stable_version_for_latest_release(
+                &github_release("rust-v0.132.0", false, false),
+                "rust-v",
+            )
+            .expect("latest release"),
+            "0.132.0"
+        );
+        assert!(
+            latest_stable_version_for_latest_release(
+                &github_release("v0.132.0", false, false),
+                "rust-v",
+            )
+            .is_err()
+        );
+        assert!(
+            latest_stable_version_for_latest_release(
+                &github_release("rust-v0.132.0-alpha.1", true, false),
+                "rust-v",
+            )
+            .is_err()
         );
     }
 

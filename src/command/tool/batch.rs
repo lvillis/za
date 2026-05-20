@@ -131,8 +131,10 @@ pub(super) fn run_tool_batch(
     let total = specs.len();
     let batch_mode = total > 1 || matches!(kind, ToolBatchKind::Update | ToolBatchKind::Sync);
     let compact_mode = batch_mode && !verbose;
+    let parallel_materialize = should_parallel_materialize_batch(total, dry_run, verbose);
     let mut summary = ToolBatchSummary::default();
     let mut failed_tools = Vec::new();
+    let mut materialize_tasks = Vec::new();
 
     if compact_mode {
         print_tool_stage(
@@ -182,6 +184,45 @@ pub(super) fn run_tool_batch(
             source::DownloadDisplay::Detailed
         });
 
+        if parallel_materialize {
+            match plan_install(home, resolved_spec, options) {
+                Ok(plan) => {
+                    emit_install_plan_stage(
+                        &plan.tool,
+                        plan.previous_active.as_deref(),
+                        plan.planned_outcome,
+                        plan.current_matches_target,
+                        options,
+                    );
+                    if update_plan_is_unchanged(&plan, options) {
+                        summary = summary.record(InstallOutcome::Unchanged);
+                        continue;
+                    }
+                    materialize_tasks.push(BatchInstallTask {
+                        index: idx,
+                        requested_name: requested.name.clone(),
+                        plan,
+                        materialize_options: options
+                            .emit_stages(false)
+                            .emit_plan_stage(false)
+                            .download_display(source::DownloadDisplay::Quiet),
+                        activate_options: options,
+                    });
+                }
+                Err(err) => {
+                    summary.failed += 1;
+                    failed_tools.push(requested.name.clone());
+                    let message = if compact_mode {
+                        summarize_tool_update_error(&err.to_string())
+                    } else {
+                        err.to_string()
+                    };
+                    print_tool_stage("fail", format!("`{}` {message}", requested.name));
+                }
+            }
+            continue;
+        }
+
         match install(home, resolved_spec, options) {
             Ok(result) => {
                 summary = summary.record(result.outcome);
@@ -202,6 +243,48 @@ pub(super) fn run_tool_batch(
         }
     }
 
+    if parallel_materialize && !materialize_tasks.is_empty() {
+        for result in materialize_tool_batch_parallel(home, kind, materialize_tasks) {
+            if let Some(err) = result.error {
+                summary.failed += 1;
+                failed_tools.push(result.requested_name.clone());
+                let message = if compact_mode {
+                    summarize_tool_update_error(&err.to_string())
+                } else {
+                    err.to_string()
+                };
+                print_tool_stage("fail", format!("`{}` {message}", result.requested_name));
+                continue;
+            }
+
+            let Some(plan) = result.plan else {
+                summary.failed += 1;
+                failed_tools.push(result.requested_name.clone());
+                print_tool_stage(
+                    "fail",
+                    format!(
+                        "`{}` internal materialize result missing",
+                        result.requested_name
+                    ),
+                );
+                continue;
+            };
+            match activate_install_plan(home, &plan, result.activate_options) {
+                Ok(()) => summary = summary.record(plan.planned_outcome),
+                Err(err) => {
+                    summary.failed += 1;
+                    failed_tools.push(result.requested_name.clone());
+                    let message = if compact_mode {
+                        summarize_tool_update_error(&err.to_string())
+                    } else {
+                        err.to_string()
+                    };
+                    print_tool_stage("fail", format!("`{}` {message}", result.requested_name));
+                }
+            }
+        }
+    }
+
     if batch_mode {
         print_tool_stage("done", render_batch_summary(kind, summary, dry_run));
     }
@@ -216,6 +299,114 @@ pub(super) fn run_tool_batch(
         failed_tools.len(),
         failed_tools.join(", ")
     )
+}
+
+#[derive(Clone)]
+struct BatchInstallTask {
+    index: usize,
+    requested_name: String,
+    plan: InstallPlan,
+    materialize_options: InstallOptions,
+    activate_options: InstallOptions,
+}
+
+struct BatchInstallResult {
+    index: usize,
+    requested_name: String,
+    plan: Option<InstallPlan>,
+    activate_options: InstallOptions,
+    error: Option<anyhow::Error>,
+}
+
+pub(super) fn should_parallel_materialize_batch(
+    total: usize,
+    dry_run: bool,
+    verbose: bool,
+) -> bool {
+    total > 1 && !dry_run && !verbose
+}
+
+fn materialize_tool_batch_parallel(
+    home: &ToolHome,
+    kind: ToolBatchKind,
+    tasks: Vec<BatchInstallTask>,
+) -> Vec<BatchInstallResult> {
+    let worker_count = materialize_worker_count(tasks.len());
+    let queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
+    let out: Arc<Mutex<Vec<BatchInstallResult>>> = Arc::new(Mutex::new(Vec::new()));
+    let progress = new_tool_progress_bar(
+        batch_kind_stage(kind),
+        queue.lock().map(|guard| guard.len()).unwrap_or(0),
+        "preparing tool payloads",
+    );
+
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let home = home.clone();
+            let queue = Arc::clone(&queue);
+            let out = Arc::clone(&out);
+            let progress = progress.clone();
+            scope.spawn(move || {
+                loop {
+                    let task = match queue.lock() {
+                        Ok(mut guard) => guard.pop_front(),
+                        Err(_) => None,
+                    };
+                    let Some(task) = task else {
+                        break;
+                    };
+                    if let Some(progress) = progress.as_ref() {
+                        progress.set_message(task.plan.tool.name.clone());
+                    }
+                    let result =
+                        match materialize_install_plan(&home, &task.plan, task.materialize_options)
+                        {
+                            Ok(()) => BatchInstallResult {
+                                index: task.index,
+                                requested_name: task.requested_name,
+                                plan: Some(task.plan),
+                                activate_options: task.activate_options,
+                                error: None,
+                            },
+                            Err(err) => BatchInstallResult {
+                                index: task.index,
+                                requested_name: task.requested_name,
+                                plan: None,
+                                activate_options: task.activate_options,
+                                error: Some(err),
+                            },
+                        };
+                    if let Some(progress) = progress.as_ref() {
+                        progress.inc(1);
+                    }
+                    if let Ok(mut guard) = out.lock() {
+                        guard.push(result);
+                    } else {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(progress) = progress {
+        progress.finish_and_clear();
+    }
+
+    let mut results = out
+        .lock()
+        .map(|mut guard| std::mem::take(&mut *guard))
+        .unwrap_or_default();
+    results.sort_by_key(|result| result.index);
+    results
+}
+
+fn materialize_worker_count(task_count: usize) -> usize {
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(TOOL_UPDATE_JOBS_MIN)
+        .clamp(TOOL_UPDATE_JOBS_MIN, TOOL_MATERIALIZE_JOBS_MAX)
+        .min(task_count.max(1))
 }
 
 pub(super) fn resolve_update_channel_request(
@@ -264,8 +455,25 @@ fn resolve_batch_latest_lookup(
             .collect::<HashMap<_, _>>();
         return Ok(Some(latest_by_name));
     }
-    let lookup = resolve_latest_checks_for_names(&unresolved_names)?;
+    let lookup = resolve_latest_checks_for_names_with_mode(
+        &unresolved_names,
+        latest_resolution_mode_for_batch(specs, update_channel),
+    )?;
     Ok(Some(lookup.latest_by_name))
+}
+
+pub(super) fn latest_resolution_mode_for_batch(
+    specs: &[ToolSpec],
+    update_channel: ToolUpdateChannel,
+) -> LatestResolutionMode {
+    if update_channel != ToolUpdateChannel::Stable {
+        return LatestResolutionMode::Exact;
+    }
+    if specs.len() == 1 && canonical_tool_name(&specs[0].name) == "codex" {
+        LatestResolutionMode::Exact
+    } else {
+        LatestResolutionMode::Fast
+    }
 }
 
 fn resolve_batch_tool_spec(

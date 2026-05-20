@@ -7,6 +7,12 @@ pub(super) enum LatestCheck {
     Error(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LatestResolutionMode {
+    Exact,
+    Fast,
+}
+
 pub(super) fn list_update_status(installed_version: &str, latest: &LatestCheck) -> String {
     match latest {
         LatestCheck::Latest(remote)
@@ -910,6 +916,13 @@ fn print_unmanaged_binaries_text(unmanaged: &[UnmanagedBinary]) {
 }
 
 pub(super) fn resolve_latest_checks_for_names(names: &[String]) -> Result<LatestLookup> {
+    resolve_latest_checks_for_names_with_mode(names, LatestResolutionMode::Exact)
+}
+
+pub(super) fn resolve_latest_checks_for_names_with_mode(
+    names: &[String],
+    mode: LatestResolutionMode,
+) -> Result<LatestLookup> {
     let mut latest_by_name: HashMap<String, LatestCheck> = HashMap::new();
     let mut policy_tasks = Vec::new();
     let mut policy_seen: HashMap<&'static str, ()> = HashMap::new();
@@ -929,7 +942,8 @@ pub(super) fn resolve_latest_checks_for_names(names: &[String]) -> Result<Latest
             continue;
         }
         policy_seen.insert(policy.canonical_name, ());
-        if let Some(latest) = cache.get_latest_if_fresh(policy.canonical_name, now_unix_secs) {
+        let cache_key = latest_cache_key(policy.canonical_name, mode);
+        if let Some(latest) = cache.get_latest_if_fresh(&cache_key, now_unix_secs) {
             latest_by_name.insert(
                 policy.canonical_name.to_string(),
                 LatestCheck::Latest(latest),
@@ -940,10 +954,14 @@ pub(super) fn resolve_latest_checks_for_names(names: &[String]) -> Result<Latest
     }
 
     if !policy_tasks.is_empty() {
-        let fetched = fetch_latest_checks_parallel(policy_tasks);
+        let fetched = fetch_latest_checks_parallel(policy_tasks, mode);
         for (canonical_name, latest_check) in fetched {
             if let LatestCheck::Latest(version) = &latest_check {
-                cache.put_latest(canonical_name, version.clone(), now_unix_secs);
+                cache.put_latest(
+                    &latest_cache_key(canonical_name, mode),
+                    version.clone(),
+                    now_unix_secs,
+                );
             }
             latest_by_name.insert(canonical_name.to_string(), latest_check);
         }
@@ -975,14 +993,24 @@ pub(super) fn resolve_latest_checks_for_names(names: &[String]) -> Result<Latest
     })
 }
 
-fn fetch_latest_checks_parallel(policies: Vec<ToolPolicy>) -> HashMap<&'static str, LatestCheck> {
+fn latest_cache_key(canonical_name: &str, mode: LatestResolutionMode) -> String {
+    match mode {
+        LatestResolutionMode::Exact => format!("{canonical_name}:exact"),
+        LatestResolutionMode::Fast => format!("{canonical_name}:fast"),
+    }
+}
+
+fn fetch_latest_checks_parallel(
+    policies: Vec<ToolPolicy>,
+    mode: LatestResolutionMode,
+) -> HashMap<&'static str, LatestCheck> {
     let worker_count = normalize_tool_update_jobs(default_tool_update_jobs(), policies.len());
     let queue = Arc::new(Mutex::new(VecDeque::from(policies)));
     let out: Arc<Mutex<HashMap<&'static str, LatestCheck>>> = Arc::new(Mutex::new(HashMap::new()));
     let progress = new_tool_progress_bar(
         "update",
         queue.lock().map(|guard| guard.len()).unwrap_or(0),
-        "checking upstream releases",
+        "checking upstream versions",
     );
 
     thread::scope(|scope| {
@@ -999,7 +1027,7 @@ fn fetch_latest_checks_parallel(policies: Vec<ToolPolicy>) -> HashMap<&'static s
                     let Some(policy) = task else {
                         break;
                     };
-                    let latest = resolve_latest_for_policy(policy);
+                    let latest = resolve_latest_for_policy(policy, mode);
                     if let Some(progress) = progress.as_ref() {
                         progress.set_message(latest_check_progress_message(policy, &latest));
                         progress.inc(1);
@@ -1023,15 +1051,23 @@ fn fetch_latest_checks_parallel(policies: Vec<ToolPolicy>) -> HashMap<&'static s
         .unwrap_or_else(|_| HashMap::new())
 }
 
-fn resolve_latest_for_policy(policy: ToolPolicy) -> LatestCheck {
+fn resolve_latest_for_policy(policy: ToolPolicy, mode: LatestResolutionMode) -> LatestCheck {
     let Some(release) = policy.github_release else {
         return LatestCheck::Unsupported;
     };
-    match source::fetch_latest_version_from_github_release(
-        policy,
-        release,
-        za_config::ProxyScope::Tool,
-    ) {
+    let result = match mode {
+        LatestResolutionMode::Exact => source::fetch_latest_version_from_github_release(
+            policy,
+            release,
+            za_config::ProxyScope::Tool,
+        ),
+        LatestResolutionMode::Fast => source::fetch_fast_latest_version_from_github_release(
+            policy,
+            release,
+            za_config::ProxyScope::Tool,
+        ),
+    };
+    match result {
         Ok(version) => LatestCheck::Latest(version),
         Err(err) => LatestCheck::Error(format!("{err:#}")),
     }

@@ -38,8 +38,8 @@ use std::{
 
 use self::doctor::run_doctor;
 use self::listing::{
-    LatestCheck, UnmanagedBinary, list_installed, list_outdated, resolve_latest_checks_for_names,
-    show_catalog, show_tool,
+    LatestCheck, LatestResolutionMode, UnmanagedBinary, list_installed, list_outdated,
+    resolve_latest_checks_for_names_with_mode, show_catalog, show_tool,
 };
 #[cfg(test)]
 use self::listing::{
@@ -80,12 +80,13 @@ const BLESH_BASH_INIT_BOTTOM_START_MARKER: &str = "# >>> za ble.sh (bash bottom)
 const BLESH_BASH_INIT_BOTTOM_END_MARKER: &str = "# <<< za ble.sh (bash bottom) <<<";
 const PROXY_HINT: &str =
     "if your network requires a proxy, set HTTPS_PROXY/HTTP_PROXY (and optional NO_PROXY)";
-const TOOL_UPDATE_CACHE_SCHEMA_VERSION: u32 = 2;
-const TOOL_UPDATE_CACHE_FILE_NAME: &str = "tool-latest-cache-v2.json";
+const TOOL_UPDATE_CACHE_SCHEMA_VERSION: u32 = 3;
+const TOOL_UPDATE_CACHE_FILE_NAME: &str = "tool-latest-cache-v3.json";
 const TOOL_UPDATE_CACHE_TTL_SECS: u64 = 10 * 60;
 const TOOL_UPDATE_JOBS_MULTIPLIER: usize = 2;
 const TOOL_UPDATE_JOBS_MIN: usize = 2;
 const TOOL_UPDATE_JOBS_MAX: usize = 8;
+const TOOL_MATERIALIZE_JOBS_MAX: usize = 2;
 const TOOL_EXIT_UPDATES_AVAILABLE: i32 = 20;
 const TOOL_EXIT_UPDATE_CHECK_FAILED: i32 = 21;
 
@@ -882,6 +883,16 @@ struct InstallResult {
     outcome: InstallOutcome,
 }
 
+#[derive(Debug, Clone)]
+struct InstallPlan {
+    tool: ToolRef,
+    adoption: Option<AdoptionCandidate>,
+    previous_active: Option<String>,
+    already_installed: bool,
+    planned_outcome: InstallOutcome,
+    current_matches_target: bool,
+}
+
 #[derive(Debug)]
 enum PullArtifactKind {
     File,
@@ -1288,11 +1299,49 @@ fn select_extracted_payload_root(unpack_dir: &Path) -> Result<PathBuf> {
     }
 }
 
-fn install(
+fn install(home: &ToolHome, requested: ToolSpec, options: InstallOptions) -> Result<InstallResult> {
+    let plan = plan_install(home, requested, options)?;
+
+    emit_install_plan_stage(
+        &plan.tool,
+        plan.previous_active.as_deref(),
+        plan.planned_outcome,
+        plan.current_matches_target,
+        options,
+    );
+
+    if update_plan_is_unchanged(&plan, options) {
+        if options.dry_run && options.emit_stages {
+            print_tool_stage("next", "no changes needed");
+        }
+        return Ok(InstallResult {
+            tool: plan.tool,
+            outcome: InstallOutcome::Unchanged,
+        });
+    }
+
+    if options.dry_run {
+        preview_install(home, &plan, options)?;
+        return Ok(InstallResult {
+            tool: plan.tool,
+            outcome: plan.planned_outcome,
+        });
+    }
+
+    materialize_install_plan(home, &plan, options)?;
+    activate_install_plan(home, &plan, options)?;
+
+    Ok(InstallResult {
+        tool: plan.tool,
+        outcome: plan.planned_outcome,
+    })
+}
+
+fn plan_install(
     home: &ToolHome,
     mut requested: ToolSpec,
     options: InstallOptions,
-) -> Result<InstallResult> {
+) -> Result<InstallPlan> {
     ensure_not_interrupted()?;
 
     requested.name = canonical_tool_name(&requested.name);
@@ -1360,38 +1409,35 @@ fn install(
         }
     };
 
-    emit_install_plan_stage(
-        &tool,
-        previous_active.as_deref(),
+    Ok(InstallPlan {
+        tool,
+        adoption,
+        previous_active,
+        already_installed,
         planned_outcome,
         current_matches_target,
-        options,
-    );
+    })
+}
 
-    if options.action == ToolAction::Update && planned_outcome == InstallOutcome::Unchanged {
-        if options.dry_run && options.emit_stages {
-            print_tool_stage("next", "no changes needed");
-        }
-        return Ok(InstallResult {
-            tool,
-            outcome: InstallOutcome::Unchanged,
-        });
-    }
+fn update_plan_is_unchanged(plan: &InstallPlan, options: InstallOptions) -> bool {
+    options.action == ToolAction::Update && plan.planned_outcome == InstallOutcome::Unchanged
+}
 
-    if options.dry_run {
-        preview_install(home, &tool, adoption.as_ref(), already_installed, options)?;
-        return Ok(InstallResult {
-            tool,
-            outcome: planned_outcome,
-        });
-    }
-
-    if !already_installed {
+fn materialize_install_plan(
+    home: &ToolHome,
+    plan: &InstallPlan,
+    options: InstallOptions,
+) -> Result<()> {
+    let tool = &plan.tool;
+    if !plan.already_installed {
+        let dst = home.install_path(tool);
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let source = if let Some(adopted) = adoption.filter(|a| a.version == tool.version) {
+        let source = if let Some(adopted) =
+            plan.adoption.as_ref().filter(|a| a.version == tool.version)
+        {
             print_tool_stage_if(
                 options.emit_stages,
                 "source",
@@ -1409,42 +1455,47 @@ fn install(
                 "source",
                 format!("fetching `{}` {}", tool.name, tool.version),
             );
-            let src = match resolve_install_source(
-                &tool,
-                options.proxy_scope,
-                options.download_display,
-            ) {
-                Ok(src) => src,
-                Err(err) => {
-                    return Err(match install_source_failure_guidance(&err) {
-                        Some(guidance) => err.context(guidance),
-                        None => err,
-                    });
-                }
-            };
+            let src =
+                match resolve_install_source(tool, options.proxy_scope, options.download_display) {
+                    Ok(src) => src,
+                    Err(err) => {
+                        return Err(match install_source_failure_guidance(&err) {
+                            Some(guidance) => err.context(guidance),
+                            None => err,
+                        });
+                    }
+                };
             ensure_not_interrupted()?;
-            materialize_pulled_tool(home, &tool, &src)?;
+            materialize_pulled_tool(home, tool, &src)?;
             InstallSource {
                 kind: src.kind,
                 detail: src.resolved_by.clone(),
             }
         };
-        write_manifest(home, &tool, &source)?;
+        write_manifest(home, tool, &source)?;
         print_tool_stage_if(
             options.emit_stages,
             "install",
             format!("{} from {}", tool.image(), source.detail),
         );
     } else {
-        ensure_manifest(home, &tool)?;
+        ensure_manifest(home, tool)?;
         print_tool_stage_if(
             options.emit_stages,
             "install",
             format!("already installed {}", tool.image()),
         );
     }
+    Ok(())
+}
 
-    activate_tool(home, &tool)?;
+fn activate_install_plan(
+    home: &ToolHome,
+    plan: &InstallPlan,
+    options: InstallOptions,
+) -> Result<()> {
+    let tool = &plan.tool;
+    activate_tool(home, tool)?;
     print_tool_stage_if(
         options.emit_stages,
         "activate",
@@ -1454,10 +1505,10 @@ fn install(
             home.active_path(&tool.name).display()
         ),
     );
-    emit_user_path_hint(home, &tool, options);
-    ensure_post_activation_integrations(home, &tool, options.emit_stages)?;
+    emit_user_path_hint(home, tool, options);
+    ensure_post_activation_integrations(home, tool, options.emit_stages)?;
     if options.prune_after_activation {
-        let removed = prune_non_active_versions(home, &tool)?;
+        let removed = prune_non_active_versions(home, tool)?;
         if !removed.is_empty() {
             print_tool_stage_if(
                 options.emit_stages,
@@ -1470,11 +1521,7 @@ fn install(
             );
         }
     }
-
-    Ok(InstallResult {
-        tool,
-        outcome: planned_outcome,
-    })
+    Ok(())
 }
 
 fn emit_user_path_hint(home: &ToolHome, tool: &ToolRef, options: InstallOptions) {
@@ -1598,15 +1645,10 @@ fn compact_install_plan(
     }
 }
 
-fn preview_install(
-    home: &ToolHome,
-    tool: &ToolRef,
-    adoption: Option<&AdoptionCandidate>,
-    already_installed: bool,
-    options: InstallOptions,
-) -> Result<()> {
-    if !already_installed {
-        if let Some(adopted) = adoption.filter(|a| a.version == tool.version) {
+fn preview_install(home: &ToolHome, plan: &InstallPlan, options: InstallOptions) -> Result<()> {
+    let tool = &plan.tool;
+    if !plan.already_installed {
+        if let Some(adopted) = plan.adoption.as_ref().filter(|a| a.version == tool.version) {
             print_tool_stage_if(
                 options.emit_stages,
                 "source",
