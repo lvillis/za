@@ -1,8 +1,17 @@
+## [0.1.79] - 2026-05-20
+
+### ⚡ Performance
+
+- *(tool)* Parallelize batch updates and fast-path latest checks
 ## [0.1.78] - 2026-05-20
 
 ### 🚀 Features
 
 - *(tool)* Improve update resolution and tool scope selection
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.78
 ## [0.1.77] - 2026-05-18
 
 ### 🚀 Features
