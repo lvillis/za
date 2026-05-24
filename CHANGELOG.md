@@ -1,8 +1,17 @@
+## [0.1.81] - 2026-05-24
+
+### 🚀 Features
+
+- *(deps)* Audit GitHub Action version drift
 ## [0.1.80] - 2026-05-24
 
 ### 🚀 Features
 
 - *(codex)* Add app-server backed compact command
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.80
 ## [0.1.79] - 2026-05-20
 
 ### ⚡ Performance
