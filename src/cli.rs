@@ -852,6 +852,24 @@ pub enum CodexCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Compact the current workspace Codex conversation, then resume it
+    Compact {
+        /// Temporary model used only for the compaction turn.
+        #[arg(long, default_value = "gpt-5.3-codex")]
+        model: String,
+        /// Temporary reasoning effort used only for the compaction turn.
+        #[arg(long, default_value = "low")]
+        effort: String,
+        /// Stop waiting after this many seconds.
+        #[arg(long, value_name = "SECS", default_value_t = 180)]
+        timeout: u64,
+        /// Do not start `za codex resume` after a successful compaction.
+        #[arg(long)]
+        no_resume: bool,
+        /// Print app-server RPC progress for debugging.
+        #[arg(long)]
+        verbose: bool,
+    },
     /// List Codex sessions
     Ps {
         /// Print JSON output for scripting.
@@ -2226,6 +2244,58 @@ mod tests {
                         json: true,
                         all: true
                     })
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn codex_compact_parses_defaults_and_overrides() {
+        let cli = Cli::try_parse_from(["za", "codex", "compact"]).expect("must parse");
+        match cli.cmd {
+            Commands::Codex { cmd, args } => {
+                assert!(args.is_empty());
+                assert!(matches!(
+                    cmd,
+                    Some(CodexCommands::Compact {
+                        model,
+                        effort,
+                        timeout: 180,
+                        no_resume: false,
+                        verbose: false,
+                    }) if model == "gpt-5.3-codex" && effort == "low"
+                ));
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "za",
+            "codex",
+            "compact",
+            "--model",
+            "gpt-test",
+            "--effort",
+            "medium",
+            "--timeout",
+            "9",
+            "--no-resume",
+            "--verbose",
+        ])
+        .expect("must parse");
+        match cli.cmd {
+            Commands::Codex { cmd, args } => {
+                assert!(args.is_empty());
+                assert!(matches!(
+                    cmd,
+                    Some(CodexCommands::Compact {
+                        model,
+                        effort,
+                        timeout: 9,
+                        no_resume: true,
+                        verbose: true,
+                    }) if model == "gpt-test" && effort == "medium"
                 ));
             }
             _ => panic!("unexpected command"),

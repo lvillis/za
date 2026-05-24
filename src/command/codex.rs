@@ -1,9 +1,11 @@
 //! Manage long-lived Codex work sessions backed by tmux.
 
+mod compact;
 mod session_state;
 mod tmux;
 mod top;
 
+use self::compact::*;
 use self::session_state::*;
 use self::tmux::*;
 use self::top::*;
@@ -59,6 +61,19 @@ pub fn run(cmd: Option<CodexCommands>, passthrough_args: &[String]) -> Result<i3
         Some(CodexCommands::Attach) => run_attach(),
         Some(CodexCommands::Exec { args }) => run_exec(&args),
         Some(CodexCommands::Resume { args }) => run_resume(&args),
+        Some(CodexCommands::Compact {
+            model,
+            effort,
+            timeout,
+            no_resume,
+            verbose,
+        }) => run_compact(CompactOptions {
+            model,
+            effort,
+            timeout,
+            no_resume,
+            verbose,
+        }),
         Some(CodexCommands::Ps { json, all }) => run_ps(json, all),
         Some(CodexCommands::Top { all, history }) => run_top(all, history),
         Some(CodexCommands::Stop { json, all }) => run_stop(json, all),
