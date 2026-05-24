@@ -1,8 +1,17 @@
+## [0.1.80] - 2026-05-24
+
+### 🚀 Features
+
+- *(codex)* Add app-server backed compact command
 ## [0.1.79] - 2026-05-20
 
 ### ⚡ Performance
 
 - *(tool)* Parallelize batch updates and fast-path latest checks
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.79
 ## [0.1.78] - 2026-05-20
 
 ### 🚀 Features
