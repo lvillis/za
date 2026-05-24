@@ -4,9 +4,11 @@ use super::latest::{
 };
 use super::render::{render_latest_lines, render_latest_toml, render_report_lines};
 use super::{
-    AuditSummary, CargoDependency, CargoMetadata, CargoPackage, CargoResolve, CargoResolveDepKind,
-    CargoResolveNode, CargoResolveNodeDep, DepAuditRecord, DependencyUpdatePlan, RiskLevel,
-    collect_dependency_inventory, collect_dependency_specs, derive_auto_jobs,
+    ActionAuditRecord, ActionLocation, ActionUpdatePlan, AuditSummary, CargoDependency,
+    CargoMetadata, CargoPackage, CargoResolve, CargoResolveDepKind, CargoResolveNode,
+    CargoResolveNodeDep, DepAuditRecord, DependencyUpdatePlan, RiskLevel, WorkflowActionSpec,
+    build_action_audit_record, collect_dependency_inventory, collect_dependency_specs,
+    derive_auto_jobs, latest_stable_action_tag, parse_action_tag_version, parse_workflow_uses_line,
 };
 use std::path::Path;
 
@@ -149,7 +151,7 @@ fn render_report_lines_default_focuses_on_attention() {
         ),
     ];
 
-    let lines = render_report_lines(manifest, &summary, &records, false);
+    let lines = render_report_lines(manifest, &summary, &records, &[], false);
     let output = lines.join("\n");
     assert!(output.contains("HIGH   Cargo.toml  3 deps  1 high · 1 unknown · 1 low"));
     assert!(output.contains("\nattention\n"));
@@ -185,7 +187,7 @@ fn render_report_lines_default_surfaces_low_risk_version_updates() {
         ),
     ];
 
-    let lines = render_report_lines(manifest, &summary, &records, false);
+    let lines = render_report_lines(manifest, &summary, &records, &[], false);
     let output = lines.join("\n");
     assert!(output.contains("OK     Cargo.toml  2 deps  2 low · 1 update"));
     assert!(output.contains("\nattention\n"));
@@ -220,7 +222,7 @@ fn render_report_lines_verbose_includes_baseline_and_manifest() {
         ),
     ];
 
-    let lines = render_report_lines(manifest, &summary, &records, true);
+    let lines = render_report_lines(manifest, &summary, &records, &[], true);
     let output = lines.join("\n");
     assert!(output.contains("MED    Cargo.toml  2 deps  1 medium · 1 low"));
     assert!(output.contains("\nattention\n"));
@@ -242,10 +244,112 @@ fn render_report_lines_summarizes_skipped_internal_dependencies() {
     };
     let records = vec![sample_record("bytes", RiskLevel::Low, &[])];
 
-    let lines = render_report_lines(manifest, &summary, &records, false);
+    let lines = render_report_lines(manifest, &summary, &records, &[], false);
     let output = lines.join("\n");
 
     assert!(output.contains("OK     Cargo.toml  1 deps  1 low · 2 internal skipped"));
+}
+
+#[test]
+fn render_report_lines_surfaces_workflow_action_updates() {
+    let manifest = Path::new("/tmp/work/Cargo.toml");
+    let summary = AuditSummary {
+        high: 0,
+        medium: 0,
+        low: 1,
+        unknown: 0,
+        skipped_local: 0,
+    };
+    let records = vec![sample_record("bytes", RiskLevel::Low, &[])];
+    let actions = vec![
+        sample_action_record(
+            "actions/checkout",
+            "v4",
+            Some("v6"),
+            ActionUpdatePlan::Bump,
+            "newer action tag available",
+        ),
+        sample_action_record(
+            "Swatinem/rust-cache",
+            "v2",
+            Some("v2"),
+            ActionUpdatePlan::Keep,
+            "current ref is up to date",
+        ),
+    ];
+
+    let lines = render_report_lines(manifest, &summary, &records, &actions, false);
+    let output = lines.join("\n");
+
+    assert!(output.contains("1 action update"));
+    assert!(output.contains("\nactions\n"));
+    assert!(output.contains("actions/checkout"));
+    assert!(output.contains("newer-tag"));
+    assert!(output.contains("1 action entry hidden; use `--verbose` to show all"));
+    assert!(!output.contains("Swatinem/rust-cache"));
+}
+
+#[test]
+fn workflow_action_version_selection_uses_highest_stable_tag() {
+    let tags = vec![
+        "v4".to_string(),
+        "v6".to_string(),
+        "v5.1.0".to_string(),
+        "v7.0.0-beta.1".to_string(),
+    ];
+
+    assert_eq!(
+        latest_stable_action_tag(&tags).map(|tag| tag.tag),
+        Some("v6".to_string())
+    );
+    assert_eq!(
+        parse_action_tag_version("v4").map(|tag| tag.version.to_string()),
+        Some("4.0.0".to_string())
+    );
+}
+
+#[test]
+fn build_action_audit_record_classifies_version_refs() {
+    let spec = sample_workflow_action_spec("actions/checkout", "v4");
+    let record = build_action_audit_record(spec, Ok(vec!["v4".to_string(), "v6".to_string()]));
+
+    assert_eq!(record.latest_ref.as_deref(), Some("v6"));
+    assert_eq!(record.update_plan, ActionUpdatePlan::Bump);
+    assert_eq!(record.note.as_deref(), Some("newer action tag available"));
+}
+
+#[test]
+fn build_action_audit_record_keeps_major_refs_on_same_major() {
+    let spec = sample_workflow_action_spec("actions/checkout", "v6");
+    let record = build_action_audit_record(spec, Ok(vec!["v6".to_string(), "v6.0.2".to_string()]));
+
+    assert_eq!(record.latest_ref.as_deref(), Some("v6.0.2"));
+    assert_eq!(record.update_plan, ActionUpdatePlan::Keep);
+    assert_eq!(record.note.as_deref(), Some("current ref is up to date"));
+}
+
+#[test]
+fn build_action_audit_record_keeps_sha_pinned_refs() {
+    let spec = sample_workflow_action_spec(
+        "actions/checkout",
+        "0123456789abcdef0123456789abcdef01234567",
+    );
+    let record = build_action_audit_record(spec, Ok(vec!["v6".to_string()]));
+
+    assert_eq!(record.latest_ref, None);
+    assert_eq!(record.update_plan, ActionUpdatePlan::Keep);
+    assert_eq!(record.note.as_deref(), Some("sha-pinned"));
+}
+
+#[test]
+fn parse_workflow_uses_line_reads_quoted_remote_actions() {
+    let spec = parse_workflow_uses_line("  - uses: 'actions/checkout@v6' # pinned major")
+        .expect("must parse action");
+
+    assert_eq!(spec.action, "actions/checkout");
+    assert_eq!(spec.owner, "actions");
+    assert_eq!(spec.repo, "checkout");
+    assert_eq!(spec.ref_name, "v6");
 }
 
 #[test]
@@ -417,6 +521,51 @@ fn sample_record(name: &str, risk: RiskLevel, notes: &[&str]) -> DepAuditRecord 
     }
 }
 
+fn sample_action_record(
+    action: &str,
+    current_ref: &str,
+    latest_ref: Option<&str>,
+    update_plan: ActionUpdatePlan,
+    note: &str,
+) -> ActionAuditRecord {
+    let mut parts = action.split('/');
+    let owner = parts.next().unwrap_or_default().to_string();
+    let repo = parts.next().unwrap_or_default().to_string();
+    let rest = parts.collect::<Vec<_>>();
+    ActionAuditRecord {
+        action: action.to_string(),
+        owner,
+        repo,
+        path: (!rest.is_empty()).then(|| rest.join("/")),
+        current_ref: current_ref.to_string(),
+        latest_ref: latest_ref.map(ToOwned::to_owned),
+        update_plan,
+        note: Some(note.to_string()),
+        locations: vec![ActionLocation {
+            file: ".github/workflows/ci.yaml".to_string(),
+            line: 12,
+        }],
+    }
+}
+
+fn sample_workflow_action_spec(action: &str, ref_name: &str) -> WorkflowActionSpec {
+    let mut parts = action.split('/');
+    let owner = parts.next().unwrap_or_default().to_string();
+    let repo = parts.next().unwrap_or_default().to_string();
+    let rest = parts.collect::<Vec<_>>();
+    WorkflowActionSpec {
+        action: action.to_string(),
+        owner,
+        repo,
+        path: (!rest.is_empty()).then(|| rest.join("/")),
+        ref_name: ref_name.to_string(),
+        locations: vec![ActionLocation {
+            file: ".github/workflows/ci.yaml".to_string(),
+            line: 12,
+        }],
+    }
+}
+
 fn sample_metadata() -> CargoMetadata {
     CargoMetadata {
         packages: vec![
@@ -482,6 +631,7 @@ fn sample_metadata() -> CargoMetadata {
         ],
         workspace_members: vec!["pkg-root".to_string()],
         root: None,
+        workspace_root: Some("/tmp/work".into()),
         resolve: Some(CargoResolve {
             nodes: vec![CargoResolveNode {
                 id: "pkg-root".to_string(),
@@ -570,6 +720,7 @@ fn workspace_metadata() -> CargoMetadata {
         ],
         workspace_members: vec!["pkg-app".to_string(), "pkg-workspace-core".to_string()],
         root: Some("pkg-app".to_string()),
+        workspace_root: Some("/tmp/work".into()),
         resolve: Some(CargoResolve {
             nodes: vec![
                 CargoResolveNode {

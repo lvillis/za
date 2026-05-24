@@ -11,6 +11,7 @@ use crate::command::{render as text_render, style as tty_style, write_file_atomi
 use anyhow::{Context, Result, anyhow, bail};
 use humantime::format_rfc3339_seconds;
 use indicatif::{ProgressBar, ProgressStyle};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -28,9 +29,9 @@ use std::{
 
 use self::api::ApiClient;
 use self::model::{
-    AuditReport, AuditSummary, DepAuditRecord, DependencySpec, DependencySpecBuilder,
-    DependencyUpdatePlan, GitHubCacheEntry, RiskLevel, age_days_from_now, classify_risk,
-    github_repo_from_url, std_alternative,
+    ActionAuditRecord, ActionLocation, ActionUpdatePlan, AuditReport, AuditSummary, DepAuditRecord,
+    DependencySpec, DependencySpecBuilder, DependencyUpdatePlan, GitHubCacheEntry, RiskLevel,
+    age_days_from_now, classify_risk, github_repo_from_url, std_alternative,
 };
 use self::render::{build_summary, print_report, write_json_report};
 
@@ -41,10 +42,11 @@ const HTTP_BACKOFF_BASE_MS: u64 = 200;
 const AUTO_DEPS_JOBS_MULTIPLIER: usize = 2;
 const AUTO_DEPS_JOBS_MIN: usize = 4;
 const AUTO_DEPS_JOBS_MAX: usize = 16;
-const DEPS_CACHE_SCHEMA_VERSION: u32 = 1;
-const DEPS_CACHE_FILE_NAME: &str = "deps-cache-v1.json";
+const DEPS_CACHE_SCHEMA_VERSION: u32 = 2;
+const DEPS_CACHE_FILE_NAME: &str = "deps-cache-v2.json";
 const CRATES_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
 const GITHUB_CACHE_TTL_SECS: u64 = 60 * 60;
+const WORKFLOW_ACTION_REF_MAX_TAGS: usize = 100;
 
 pub struct DepsRunOptions {
     pub manifest_path: Option<PathBuf>,
@@ -88,9 +90,11 @@ pub fn run(opts: DepsRunOptions) -> Result<()> {
 
     let manifest_path = resolve_manifest_path(manifest_path, project_path)?;
     let metadata = cargo_metadata(&manifest_path)?;
+    let project_root = project_root_from_metadata(&metadata, &manifest_path)?;
     let inventory =
         collect_dependency_inventory(&metadata, include_dev, include_build, include_optional)?;
-    if inventory.specs.is_empty() {
+    let action_specs = collect_workflow_action_specs(&project_root)?;
+    if inventory.specs.is_empty() && action_specs.is_empty() {
         if inventory.skipped_local_count() > 0 {
             println!(
                 "No external dependencies found for audit; skipped {} internal/path {}.",
@@ -104,25 +108,29 @@ pub fn run(opts: DepsRunOptions) -> Result<()> {
     }
 
     let requested_jobs = jobs.unwrap_or_else(default_deps_jobs);
-    let worker_count = normalize_jobs(requested_jobs, inventory.specs.len());
+    let workload_count = inventory.specs.len() + action_specs.len();
+    let worker_count = normalize_jobs(requested_jobs, workload_count);
     println!(
-        "Auditing {} dependencies with {} workers...",
+        "Auditing {} dependencies{} with {} workers...",
         inventory.specs.len(),
+        render_action_audit_count(action_specs.len()),
         worker_count
     );
     let skipped_local = inventory.skipped_local_count();
     let api = Arc::new(ApiClient::new(github_token_override)?);
     let mut records = audit_dependencies(Arc::clone(&api), inventory.specs, worker_count)?;
+    let mut actions = audit_actions(Arc::clone(&api), action_specs, worker_count)?;
     sort_records(&mut records);
+    sort_action_records(&mut actions);
 
     let summary = build_summary(&records, skipped_local);
-    print_report(&manifest_path, &summary, &records, verbose);
+    print_report(&manifest_path, &summary, &records, &actions, verbose);
 
     if let Some(path) = json_out {
-        write_json_report(path, &manifest_path, &summary, &records)?;
+        write_json_report(path, &manifest_path, &summary, &records, &actions)?;
     }
 
-    api.flush_cache().context("flush dependency audit cache")?;
+    api.flush_cache()?;
 
     if fail_on_high && summary.high > 0 {
         bail!("dependency audit found {} high-risk entries", summary.high);
@@ -162,6 +170,20 @@ fn audit_dependencies(
         "dependency queue",
         "dependency records",
         |spec| api.audit_one(spec),
+    )
+}
+
+fn audit_actions(
+    api: Arc<ApiClient>,
+    specs: Vec<WorkflowActionSpec>,
+    jobs: usize,
+) -> Result<Vec<ActionAuditRecord>> {
+    run_work_queue(
+        specs,
+        jobs,
+        "workflow action queue",
+        "workflow action records",
+        |spec| api.audit_action(spec),
     )
 }
 
@@ -309,6 +331,19 @@ fn canonical_manifest_path(path: PathBuf) -> Result<PathBuf> {
         bail!("manifest path is not a file: {}", canonical.display());
     }
     Ok(canonical)
+}
+
+fn project_root_from_metadata(metadata: &CargoMetadata, manifest_path: &Path) -> Result<PathBuf> {
+    if let Some(root) = metadata.workspace_root.as_ref()
+        && !root.as_os_str().is_empty()
+    {
+        return fs::canonicalize(root)
+            .with_context(|| format!("cannot resolve workspace root {}", root.display()));
+    }
+    manifest_path
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("manifest path has no parent: {}", manifest_path.display()))
 }
 
 fn cargo_metadata(manifest_path: &Path) -> Result<CargoMetadata> {
@@ -669,8 +704,159 @@ fn dependency_label(count: usize) -> &'static str {
     }
 }
 
+fn render_action_audit_count(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        format!(" and {count} workflow {}", action_label(count))
+    }
+}
+
+fn action_label(count: usize) -> &'static str {
+    if count == 1 { "action" } else { "actions" }
+}
+
 fn join_set(set: &BTreeSet<String>) -> String {
     set.iter().cloned().collect::<Vec<_>>().join(",")
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowActionSpec {
+    action: String,
+    owner: String,
+    repo: String,
+    path: Option<String>,
+    ref_name: String,
+    locations: Vec<ActionLocation>,
+}
+
+impl WorkflowActionSpec {
+    fn key(&self) -> String {
+        format!("{}@{}", self.action, self.ref_name)
+    }
+}
+
+fn collect_workflow_action_specs(project_root: &Path) -> Result<Vec<WorkflowActionSpec>> {
+    let workflows_dir = project_root.join(".github").join("workflows");
+    if !workflows_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut grouped = BTreeMap::<String, WorkflowActionSpec>::new();
+    let mut files = fs::read_dir(&workflows_dir)
+        .with_context(|| format!("read workflow directory {}", workflows_dir.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("read workflow entries {}", workflows_dir.display()))?;
+    files.sort_by_key(|entry| entry.path());
+
+    for entry in files {
+        let path = entry.path();
+        if !is_workflow_yaml(&path) {
+            continue;
+        }
+        let content =
+            fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let display_path = path
+            .strip_prefix(project_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        for (line_index, line) in content.lines().enumerate() {
+            let Some(mut spec) = parse_workflow_uses_line(line) else {
+                continue;
+            };
+            spec.locations.push(ActionLocation {
+                file: display_path.clone(),
+                line: line_index + 1,
+            });
+            let key = spec.key();
+            if let Some(existing) = grouped.get_mut(&key) {
+                existing.locations.extend(spec.locations);
+            } else {
+                grouped.insert(key, spec);
+            }
+        }
+    }
+
+    Ok(grouped.into_values().collect())
+}
+
+fn is_workflow_yaml(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "yml" | "yaml"))
+}
+
+fn parse_workflow_uses_line(line: &str) -> Option<WorkflowActionSpec> {
+    let trimmed = line.trim_start();
+    let trimmed = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim_start();
+    let raw_value = trimmed.strip_prefix("uses:")?.trim();
+    let value = normalize_workflow_uses_value(raw_value)?;
+    if value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with("docker://")
+        || value.starts_with("${{")
+    {
+        return None;
+    }
+
+    let (action, ref_name) = value.rsplit_once('@')?;
+    if action.is_empty() || ref_name.is_empty() {
+        return None;
+    }
+    let mut parts = action.split('/');
+    let owner = valid_action_segment(parts.next()?)?;
+    let repo = valid_action_segment(parts.next()?)?;
+    let rest = parts.collect::<Vec<_>>();
+    if rest.iter().any(|part| valid_action_segment(part).is_none()) {
+        return None;
+    }
+
+    Some(WorkflowActionSpec {
+        action: action.to_string(),
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        path: (!rest.is_empty()).then(|| rest.join("/")),
+        ref_name: ref_name.to_string(),
+        locations: Vec::new(),
+    })
+}
+
+fn normalize_workflow_uses_value(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_comment = trimmed
+        .split_once(" #")
+        .map(|(value, _)| value)
+        .unwrap_or(trimmed)
+        .trim();
+    let value = strip_matching_quotes(without_comment).unwrap_or(without_comment);
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn strip_matching_quotes(value: &str) -> Option<&str> {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'')
+            || (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"'))
+    {
+        return Some(&value[1..value.len() - 1]);
+    }
+    None
+}
+
+fn valid_action_segment(segment: &str) -> Option<&str> {
+    let segment = segment.trim();
+    if segment.is_empty()
+        || segment
+            .bytes()
+            .any(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')))
+    {
+        return None;
+    }
+    Some(segment)
 }
 
 fn sort_records(records: &mut [DepAuditRecord]) {
@@ -687,11 +873,145 @@ fn update_plan_weight(record: &DepAuditRecord) -> u8 {
     record.update_plan.map_or(0, DependencyUpdatePlan::weight)
 }
 
+fn sort_action_records(records: &mut [ActionAuditRecord]) {
+    records.sort_by(|a, b| {
+        b.update_plan
+            .weight()
+            .cmp(&a.update_plan.weight())
+            .then_with(|| a.action.cmp(&b.action))
+            .then_with(|| a.current_ref.cmp(&b.current_ref))
+    });
+}
+
+fn build_action_audit_record(
+    spec: WorkflowActionSpec,
+    latest_tags: std::result::Result<Vec<String>, String>,
+) -> ActionAuditRecord {
+    let mut record = ActionAuditRecord {
+        action: spec.action,
+        owner: spec.owner,
+        repo: spec.repo,
+        path: spec.path,
+        current_ref: spec.ref_name,
+        latest_ref: None,
+        update_plan: ActionUpdatePlan::Review,
+        note: None,
+        locations: spec.locations,
+    };
+
+    if is_full_commit_sha(&record.current_ref) {
+        record.update_plan = ActionUpdatePlan::Keep;
+        record.note = Some("sha-pinned".to_string());
+        return record;
+    }
+
+    let tags = match latest_tags {
+        Ok(tags) => tags,
+        Err(err) => {
+            record.note = Some(format!("GitHub query failed: {err}"));
+            return record;
+        }
+    };
+    let Some(latest) = latest_stable_action_tag(&tags) else {
+        record.note = Some("no semver tags found".to_string());
+        return record;
+    };
+
+    record.latest_ref = Some(latest.tag.clone());
+    let Some(current) = parse_action_tag_version(&record.current_ref) else {
+        record.note = Some("floating or non-semver ref; review manually".to_string());
+        return record;
+    };
+
+    if current_action_ref_is_outdated(&current, &latest) {
+        record.update_plan = ActionUpdatePlan::Bump;
+        record.note = Some("newer action tag available".to_string());
+    } else {
+        record.update_plan = ActionUpdatePlan::Keep;
+        record.note = Some("current ref is up to date".to_string());
+    }
+    record
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ActionTagVersion {
+    tag: String,
+    version: Version,
+    precision: ActionTagPrecision,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ActionTagPrecision {
+    Major,
+    Minor,
+    Patch,
+}
+
+fn latest_stable_action_tag(tags: &[String]) -> Option<ActionTagVersion> {
+    tags.iter()
+        .filter_map(|tag| parse_action_tag_version(tag))
+        .filter(|version| version.version.pre.is_empty())
+        .max_by(|a, b| a.version.cmp(&b.version).then_with(|| a.tag.cmp(&b.tag)))
+}
+
+fn parse_action_tag_version(tag: &str) -> Option<ActionTagVersion> {
+    let raw = tag.trim();
+    let version = raw
+        .strip_prefix('v')
+        .or_else(|| raw.strip_prefix('V'))
+        .unwrap_or(raw);
+    let parts = version.split('.').collect::<Vec<_>>();
+    if !(1..=3).contains(&parts.len()) || parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    if parts
+        .iter()
+        .any(|part| part.bytes().any(|b| !b.is_ascii_digit()))
+    {
+        return None;
+    }
+
+    let normalized = match parts.len() {
+        1 => format!("{}.0.0", parts[0]),
+        2 => format!("{}.{}.0", parts[0], parts[1]),
+        3 => version.to_string(),
+        _ => return None,
+    };
+    let parsed = Version::parse(&normalized).ok()?;
+    Some(ActionTagVersion {
+        tag: raw.to_string(),
+        version: parsed,
+        precision: match parts.len() {
+            1 => ActionTagPrecision::Major,
+            2 => ActionTagPrecision::Minor,
+            3 => ActionTagPrecision::Patch,
+            _ => return None,
+        },
+    })
+}
+
+fn current_action_ref_is_outdated(current: &ActionTagVersion, latest: &ActionTagVersion) -> bool {
+    match current.precision {
+        ActionTagPrecision::Major => latest.version.major > current.version.major,
+        ActionTagPrecision::Minor => {
+            (latest.version.major, latest.version.minor)
+                > (current.version.major, current.version.minor)
+        }
+        ActionTagPrecision::Patch => latest.version > current.version,
+    }
+}
+
+fn is_full_commit_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 #[derive(Debug, Deserialize)]
 struct CargoMetadata {
     packages: Vec<CargoPackage>,
     workspace_members: Vec<String>,
     root: Option<String>,
+    #[serde(default)]
+    workspace_root: Option<PathBuf>,
     resolve: Option<CargoResolve>,
 }
 
@@ -808,6 +1128,11 @@ struct GitHubRepoResponse {
     stargazers_count: u64,
     archived: bool,
     pushed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubTagResponse {
+    name: String,
 }
 
 #[cfg(test)]

@@ -35,7 +35,7 @@ rustix = { version = "1.1.4", default-features = false, features = ["std", "proc
 # Filesystem scanning, filtering, and locking.
 ignore = { version = "0.4.25", default-features = false }
 regex = { version = "1.12.3", default-features = false, features = ["std", "unicode", "perf"] }
-sqlx = { version = "0.8.6", default-features = false, features = ["sqlite", "runtime-tokio"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "runtime-tokio"] }
 tokio = { version = "1.52.3", default-features = false, features = ["rt"] }
 
 # Serialization and integrity checks.
@@ -45,7 +45,7 @@ toml = { version = "1.1.2", default-features = false, features = ["parse", "serd
 graviola = { version = "0.3.4", default-features = false }
 
 # HTTP transport and TLS crypto provider.
-reqx = { version = "0.1.35", default-features = false, features = ["blocking-tls-rustls-ring"] }
+reqx = { version = "0.1.38", default-features = false, features = ["blocking-tls-rustls-ring"] }
 rustls = { version = "0.23.36", default-features = false, features = ["ring"] }
 
 # Archive extraction for downloaded binaries.

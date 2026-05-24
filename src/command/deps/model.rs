@@ -59,6 +59,47 @@ pub(super) struct AuditSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ActionLocation {
+    pub(super) file: String,
+    pub(super) line: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ActionAuditRecord {
+    pub(super) action: String,
+    pub(super) owner: String,
+    pub(super) repo: String,
+    pub(super) path: Option<String>,
+    pub(super) current_ref: String,
+    pub(super) latest_ref: Option<String>,
+    pub(super) update_plan: ActionUpdatePlan,
+    pub(super) note: Option<String>,
+    pub(super) locations: Vec<ActionLocation>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ActionUpdatePlan {
+    Keep,
+    Bump,
+    Review,
+}
+
+impl ActionUpdatePlan {
+    pub(super) fn needs_attention(self) -> bool {
+        !matches!(self, Self::Keep)
+    }
+
+    pub(super) fn weight(self) -> u8 {
+        match self {
+            Self::Review => 2,
+            Self::Bump => 1,
+            Self::Keep => 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct DepAuditRecord {
     pub(super) name: String,
     pub(super) requirement: String,
@@ -114,6 +155,8 @@ pub(super) struct AuditReport {
     pub(super) manifest_path: String,
     pub(super) summary: AuditSummary,
     pub(super) dependencies: Vec<DepAuditRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) actions: Vec<ActionAuditRecord>,
 }
 
 fn is_zero(value: &usize) -> bool {

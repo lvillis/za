@@ -12,6 +12,7 @@ pub(super) struct ApiClient {
     github_token: Option<String>,
     github_api_blocked: AtomicBool,
     github_cache: Mutex<BTreeMap<String, GitHubCacheEntry>>,
+    github_tags_cache: Mutex<BTreeMap<String, GitHubTagsCacheEntry>>,
     cache: Mutex<DepsCacheState>,
 }
 
@@ -22,6 +23,8 @@ struct DepsCacheFile {
     crates: BTreeMap<String, CachedCrateSnapshot>,
     #[serde(default)]
     github: BTreeMap<String, CachedGitHubSnapshot>,
+    #[serde(default)]
+    github_tags: BTreeMap<String, CachedGitHubTagsSnapshot>,
 }
 
 impl Default for DepsCacheFile {
@@ -30,6 +33,7 @@ impl Default for DepsCacheFile {
             schema_version: DEPS_CACHE_SCHEMA_VERSION,
             crates: BTreeMap::new(),
             github: BTreeMap::new(),
+            github_tags: BTreeMap::new(),
         }
     }
 }
@@ -46,6 +50,12 @@ struct CachedGitHubSnapshot {
     snapshot: GitHubRepoResponse,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedGitHubTagsSnapshot {
+    fetched_at_unix_secs: u64,
+    tags: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 struct DepsCacheState {
     path: Option<PathBuf>,
@@ -56,6 +66,21 @@ struct DepsCacheState {
 #[derive(Debug)]
 struct DepsCacheLock {
     _file: File,
+}
+
+#[derive(Clone)]
+enum GitHubTagsCacheEntry {
+    Hit(Vec<String>),
+    Miss(String),
+}
+
+impl GitHubTagsCacheEntry {
+    fn into_result(self) -> Result<Vec<String>> {
+        match self {
+            Self::Hit(tags) => Ok(tags),
+            Self::Miss(err) => bail!("{err}"),
+        }
+    }
 }
 
 const HTTPS_PROXY_ENV_KEYS: [&str; 6] = [
@@ -160,16 +185,21 @@ impl ApiClient {
             github_token,
             github_api_blocked: AtomicBool::new(false),
             github_cache: Mutex::new(BTreeMap::new()),
+            github_tags_cache: Mutex::new(BTreeMap::new()),
             cache: Mutex::new(DepsCacheState::load()),
         })
     }
 
     pub(super) fn flush_cache(&self) -> Result<()> {
-        let mut cache = self
+        let result = self
             .cache
             .lock()
-            .map_err(|_| anyhow!("dependency cache lock poisoned"))?;
-        cache.save_if_dirty()
+            .map_err(|_| anyhow!("dependency cache lock poisoned"))
+            .and_then(|mut cache| cache.save_if_dirty());
+        if let Err(err) = result {
+            eprintln!("warning: dependency cache write skipped: {err:#}");
+        }
+        Ok(())
     }
 
     pub(super) fn audit_one(&self, spec: DependencySpec) -> Result<DepAuditRecord> {
@@ -251,6 +281,13 @@ impl ApiClient {
         Ok(record)
     }
 
+    pub(super) fn audit_action(&self, spec: WorkflowActionSpec) -> Result<ActionAuditRecord> {
+        let latest_tags = self
+            .fetch_github_tags_cached(&spec.owner, &spec.repo)
+            .map_err(|err| err.to_string());
+        Ok(build_action_audit_record(spec, latest_tags))
+    }
+
     fn fetch_github_repo_cached(&self, owner: &str, repo: &str) -> Result<GitHubRepoResponse> {
         let key = format!("{owner}/{repo}");
         if let Some(snapshot) = self.cache_get_github(&key)? {
@@ -279,6 +316,39 @@ impl ApiClient {
         self.github_cache
             .lock()
             .map_err(|_| anyhow!("github cache lock poisoned"))?
+            .insert(key, entry.clone());
+
+        entry.into_result()
+    }
+
+    fn fetch_github_tags_cached(&self, owner: &str, repo: &str) -> Result<Vec<String>> {
+        let key = format!("{owner}/{repo}");
+        if let Some(tags) = self.cache_get_github_tags(&key)? {
+            return Ok(tags);
+        }
+
+        if let Some(entry) = self
+            .github_tags_cache
+            .lock()
+            .map_err(|_| anyhow!("github tags cache lock poisoned"))?
+            .get(&key)
+            .cloned()
+        {
+            return entry.into_result();
+        }
+
+        let fetched = self.fetch_github_tags(owner, repo);
+        let entry = match fetched {
+            Ok(tags) => {
+                self.cache_put_github_tags(&key, tags.clone())?;
+                GitHubTagsCacheEntry::Hit(tags)
+            }
+            Err(err) => GitHubTagsCacheEntry::Miss(err.to_string()),
+        };
+
+        self.github_tags_cache
+            .lock()
+            .map_err(|_| anyhow!("github tags cache lock poisoned"))?
             .insert(key, entry.clone());
 
         entry.into_result()
@@ -403,6 +473,68 @@ impl ApiClient {
         })
     }
 
+    fn fetch_github_tags(&self, owner: &str, repo: &str) -> Result<Vec<String>> {
+        if self.github_api_blocked.load(Ordering::Relaxed) {
+            bail!("skipped after GitHub API 403 (set GITHUB_TOKEN for stable quota)");
+        }
+
+        self.retry_with_backoff("request GitHub tags API", || {
+            let mut req = self.github_http.get(format!(
+                "/repos/{owner}/{repo}/tags?per_page={WORKFLOW_ACTION_REF_MAX_TAGS}"
+            ));
+            req = req
+                .try_header("user-agent", HTTP_USER_AGENT)
+                .map_err(|err| AttemptError::Fatal(anyhow!("set user-agent header: {err}")))?;
+            req = req
+                .try_header("accept", "application/vnd.github+json")
+                .map_err(|err| {
+                    AttemptError::Fatal(anyhow!("set accept header for GitHub request: {err}"))
+                })?;
+            if let Some(token) = self.github_token.as_deref() {
+                req = req
+                    .try_header("authorization", &format!("Bearer {token}"))
+                    .map_err(|err| {
+                        AttemptError::Fatal(anyhow!(
+                            "set authorization header for GitHub request: {err}"
+                        ))
+                    })?;
+            }
+
+            let response = req.send_response().map_err(|err| {
+                AttemptError::Retryable(anyhow!("request GitHub tags API failed: {err}"))
+            })?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = text_render::truncate_end(&response.text_lossy(), 200);
+                if status.as_u16() == 403 {
+                    self.github_api_blocked.store(true, Ordering::Relaxed);
+                    return Err(AttemptError::Fatal(anyhow!(
+                        "status {} (rate-limited or forbidden); body {}",
+                        status,
+                        body
+                    )));
+                }
+                if is_retryable_status(status.as_u16()) {
+                    return Err(AttemptError::Retryable(anyhow!(
+                        "status {} body {}",
+                        status,
+                        body
+                    )));
+                }
+                return Err(AttemptError::Fatal(anyhow!(
+                    "status {} body {}",
+                    status,
+                    body
+                )));
+            }
+
+            response
+                .json::<Vec<GitHubTagResponse>>()
+                .map(|tags| tags.into_iter().map(|tag| tag.name).collect())
+                .map_err(|err| AttemptError::Fatal(anyhow!("parse GitHub tags JSON: {err}")))
+        })
+    }
+
     fn cache_get_crate(&self, name: &str) -> Result<Option<CrateSnapshot>> {
         let now = now_unix_secs();
         let mut cache = self
@@ -461,6 +593,38 @@ impl ApiClient {
             CachedGitHubSnapshot {
                 fetched_at_unix_secs: now_unix_secs(),
                 snapshot,
+            },
+        );
+        cache.dirty = true;
+        Ok(())
+    }
+
+    fn cache_get_github_tags(&self, repo_key: &str) -> Result<Option<Vec<String>>> {
+        let now = now_unix_secs();
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow!("dependency cache lock poisoned"))?;
+        if let Some(entry) = cache.data.github_tags.get(repo_key) {
+            if now.saturating_sub(entry.fetched_at_unix_secs) <= GITHUB_CACHE_TTL_SECS {
+                return Ok(Some(entry.tags.clone()));
+            }
+            cache.data.github_tags.remove(repo_key);
+            cache.dirty = true;
+        }
+        Ok(None)
+    }
+
+    fn cache_put_github_tags(&self, repo_key: &str, tags: Vec<String>) -> Result<()> {
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow!("dependency cache lock poisoned"))?;
+        cache.data.github_tags.insert(
+            repo_key.to_string(),
+            CachedGitHubTagsSnapshot {
+                fetched_at_unix_secs: now_unix_secs(),
+                tags,
             },
         );
         cache.dirty = true;
