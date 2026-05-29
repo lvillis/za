@@ -1542,9 +1542,9 @@ checksum = "a96887878f22d7bad8a3b6dc5b7440e0ada9a245242924394987b21cf2210a4c"
 
 [[package]]
 name = "reqx"
-version = "0.1.38"
+version = "0.1.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec372a2e4b56feed9dddd8bfdf671e12d946f5fe2697a4fd765611ae231fcb32"
+checksum = "1b68e0c1bef29c29579e1013e3571af359f8f4e406e681aac061426f3401518a"
 dependencies = [
  "brotli",
  "bytes",
@@ -1562,6 +1562,7 @@ dependencies = [
  "tracing",
  "ureq",
  "url",
+ "webpki-root-certs",
  "zstd",
 ]
 

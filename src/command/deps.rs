@@ -18,7 +18,6 @@ use std::{
     env, fs,
     io::IsTerminal,
     path::{Path, PathBuf},
-    process::Command,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -89,7 +88,7 @@ pub fn run(opts: DepsRunOptions) -> Result<()> {
     } = opts;
 
     let manifest_path = resolve_manifest_path(manifest_path, project_path)?;
-    let metadata = cargo_metadata(&manifest_path)?;
+    let metadata = read_manifest_metadata(&manifest_path)?;
     let project_root = project_root_from_metadata(&metadata, &manifest_path)?;
     let inventory =
         collect_dependency_inventory(&metadata, include_dev, include_build, include_optional)?;
@@ -346,21 +345,327 @@ fn project_root_from_metadata(metadata: &CargoMetadata, manifest_path: &Path) ->
         .ok_or_else(|| anyhow!("manifest path has no parent: {}", manifest_path.display()))
 }
 
-fn cargo_metadata(manifest_path: &Path) -> Result<CargoMetadata> {
-    let output = Command::new("cargo")
-        .arg("metadata")
-        .arg("--format-version")
-        .arg("1")
-        .arg("--manifest-path")
-        .arg(manifest_path)
-        .output()
-        .context("run `cargo metadata`")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("`cargo metadata` failed: {}", stderr.trim());
+fn read_manifest_metadata(manifest_path: &Path) -> Result<CargoMetadata> {
+    let workspace_manifest_path = discover_workspace_manifest(manifest_path)?;
+    let workspace_manifest = read_cargo_manifest(&workspace_manifest_path)?;
+    let workspace_root = manifest_parent(&workspace_manifest_path)?.to_path_buf();
+    let workspace_dependencies = workspace_manifest
+        .workspace
+        .as_ref()
+        .map(|workspace| &workspace.dependencies);
+
+    let member_manifest_paths =
+        workspace_member_manifest_paths(&workspace_root, &workspace_manifest)?;
+    let selected_manifest_path = fs::canonicalize(manifest_path)
+        .with_context(|| format!("cannot resolve manifest path {}", manifest_path.display()))?;
+
+    let mut packages = Vec::new();
+    let mut workspace_members = Vec::new();
+    let mut root = None;
+
+    for path in member_manifest_paths {
+        let manifest = read_cargo_manifest(&path)?;
+        let Some(package) = manifest.package.as_ref() else {
+            continue;
+        };
+
+        let id = manifest_package_id(&path);
+        if path == selected_manifest_path {
+            root = Some(id.clone());
+        }
+        workspace_members.push(id.clone());
+        packages.push(CargoPackage {
+            id,
+            name: package.name.clone(),
+            source: None,
+            dependencies: collect_manifest_dependencies(&manifest, workspace_dependencies),
+        });
     }
-    serde_json::from_slice::<CargoMetadata>(&output.stdout)
-        .context("parse `cargo metadata` JSON output")
+
+    if root.is_none() && workspace_members.len() == 1 {
+        root = workspace_members.first().cloned();
+    }
+
+    Ok(CargoMetadata {
+        packages,
+        workspace_members,
+        root,
+        workspace_root: Some(workspace_root),
+        resolve: None,
+    })
+}
+
+fn discover_workspace_manifest(manifest_path: &Path) -> Result<PathBuf> {
+    let selected_manifest = fs::canonicalize(manifest_path)
+        .with_context(|| format!("cannot resolve manifest path {}", manifest_path.display()))?;
+    let mut dir = Some(manifest_parent(&selected_manifest)?);
+
+    while let Some(current_dir) = dir {
+        let candidate = current_dir.join("Cargo.toml");
+        if candidate.is_file() {
+            let candidate = fs::canonicalize(&candidate)
+                .with_context(|| format!("cannot resolve manifest path {}", candidate.display()))?;
+            let manifest = read_cargo_manifest(&candidate)?;
+            if manifest.workspace.is_some() {
+                if candidate == selected_manifest {
+                    return Ok(candidate);
+                }
+                let root = manifest_parent(&candidate)?;
+                if workspace_includes_manifest(root, &manifest, &selected_manifest)? {
+                    return Ok(candidate);
+                }
+            }
+        }
+        dir = current_dir.parent();
+    }
+
+    Ok(selected_manifest)
+}
+
+fn workspace_includes_manifest(
+    workspace_root: &Path,
+    manifest: &CargoManifest,
+    selected_manifest: &Path,
+) -> Result<bool> {
+    Ok(workspace_member_manifest_paths(workspace_root, manifest)?
+        .into_iter()
+        .any(|path| path == selected_manifest))
+}
+
+fn workspace_member_manifest_paths(
+    workspace_root: &Path,
+    manifest: &CargoManifest,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = BTreeSet::new();
+    if manifest.package.is_some() {
+        paths.insert(
+            fs::canonicalize(workspace_root.join("Cargo.toml")).with_context(|| {
+                format!(
+                    "cannot resolve manifest path {}",
+                    workspace_root.join("Cargo.toml").display()
+                )
+            })?,
+        );
+    }
+
+    let Some(workspace) = manifest.workspace.as_ref() else {
+        return Ok(paths.into_iter().collect());
+    };
+
+    let mut excluded = BTreeSet::new();
+    for pattern in &workspace.exclude {
+        for path in expand_workspace_member_pattern(workspace_root, pattern)? {
+            excluded.insert(path);
+        }
+    }
+
+    for pattern in &workspace.members {
+        for path in expand_workspace_member_pattern(workspace_root, pattern)? {
+            if !excluded.contains(&path) {
+                paths.insert(path);
+            }
+        }
+    }
+
+    Ok(paths.into_iter().collect())
+}
+
+fn expand_workspace_member_pattern(workspace_root: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
+    let parts = pattern
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    expand_workspace_pattern_parts(workspace_root, &parts, &mut candidates)?;
+
+    let mut manifests = Vec::new();
+    for candidate in candidates {
+        let manifest = if candidate.is_dir() {
+            candidate.join("Cargo.toml")
+        } else {
+            candidate
+        };
+        if manifest.is_file() {
+            manifests.push(
+                fs::canonicalize(&manifest).with_context(|| {
+                    format!("cannot resolve manifest path {}", manifest.display())
+                })?,
+            );
+        }
+    }
+    manifests.sort();
+    manifests.dedup();
+    Ok(manifests)
+}
+
+fn expand_workspace_pattern_parts(
+    current: &Path,
+    parts: &[&str],
+    out: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let Some((part, rest)) = parts.split_first() else {
+        out.push(current.to_path_buf());
+        return Ok(());
+    };
+
+    if part.contains('*') {
+        if !current.is_dir() {
+            return Ok(());
+        }
+        let mut entries = fs::read_dir(current)
+            .with_context(|| format!("read workspace directory {}", current.display()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("read workspace entries {}", current.display()))?;
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if wildcard_component_matches(part, name) {
+                expand_workspace_pattern_parts(&entry.path(), rest, out)?;
+            }
+        }
+        return Ok(());
+    }
+
+    expand_workspace_pattern_parts(&current.join(part), rest, out)
+}
+
+fn wildcard_component_matches(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+
+    let mut remainder = value;
+    let mut first = true;
+    for segment in pattern.split('*') {
+        if segment.is_empty() {
+            continue;
+        }
+        if first && !pattern.starts_with('*') {
+            let Some(stripped) = remainder.strip_prefix(segment) else {
+                return false;
+            };
+            remainder = stripped;
+        } else {
+            let Some(index) = remainder.find(segment) else {
+                return false;
+            };
+            remainder = &remainder[index + segment.len()..];
+        }
+        first = false;
+    }
+
+    pattern.ends_with('*') || remainder.is_empty()
+}
+
+fn read_cargo_manifest(path: &Path) -> Result<CargoManifest> {
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    toml::from_str::<CargoManifest>(&raw)
+        .with_context(|| format!("parse Cargo manifest {}", path.display()))
+}
+
+fn manifest_parent(manifest_path: &Path) -> Result<&Path> {
+    manifest_path
+        .parent()
+        .ok_or_else(|| anyhow!("manifest path has no parent: {}", manifest_path.display()))
+}
+
+fn manifest_package_id(manifest_path: &Path) -> String {
+    manifest_path.display().to_string()
+}
+
+fn collect_manifest_dependencies(
+    manifest: &CargoManifest,
+    workspace_dependencies: Option<&BTreeMap<String, ManifestDependency>>,
+) -> Vec<CargoDependency> {
+    let mut deps = Vec::new();
+    collect_manifest_dependency_table(
+        &mut deps,
+        &manifest.dependencies,
+        None,
+        workspace_dependencies,
+    );
+    collect_manifest_dependency_table(
+        &mut deps,
+        &manifest.dev_dependencies,
+        Some("dev"),
+        workspace_dependencies,
+    );
+    collect_manifest_dependency_table(
+        &mut deps,
+        &manifest.build_dependencies,
+        Some("build"),
+        workspace_dependencies,
+    );
+
+    for target in manifest.target.values() {
+        collect_manifest_dependency_table(
+            &mut deps,
+            &target.dependencies,
+            None,
+            workspace_dependencies,
+        );
+        collect_manifest_dependency_table(
+            &mut deps,
+            &target.dev_dependencies,
+            Some("dev"),
+            workspace_dependencies,
+        );
+        collect_manifest_dependency_table(
+            &mut deps,
+            &target.build_dependencies,
+            Some("build"),
+            workspace_dependencies,
+        );
+    }
+
+    deps
+}
+
+fn collect_manifest_dependency_table(
+    out: &mut Vec<CargoDependency>,
+    table: &BTreeMap<String, ManifestDependency>,
+    kind: Option<&str>,
+    workspace_dependencies: Option<&BTreeMap<String, ManifestDependency>>,
+) {
+    for (alias, dep) in table {
+        if let Some(resolved) = resolve_manifest_dependency(alias, dep, workspace_dependencies) {
+            out.push(CargoDependency {
+                name: resolved.name,
+                source: resolved
+                    .crates_io
+                    .then(|| "registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                req: resolved.req,
+                kind: kind.map(ToOwned::to_owned),
+                optional: resolved.optional,
+            });
+        }
+    }
+}
+
+fn resolve_manifest_dependency(
+    alias: &str,
+    dep: &ManifestDependency,
+    workspace_dependencies: Option<&BTreeMap<String, ManifestDependency>>,
+) -> Option<ResolvedManifestDependency> {
+    let attrs = ManifestDependencyAttrs::from_dependency(dep);
+    let attrs = if attrs.workspace {
+        let workspace_attrs = workspace_dependencies
+            .and_then(|deps| deps.get(alias))
+            .map(ManifestDependencyAttrs::from_dependency)?;
+        attrs.overlay_workspace(workspace_attrs)
+    } else {
+        attrs
+    };
+
+    Some(ResolvedManifestDependency {
+        name: attrs.package.unwrap_or_else(|| alias.to_string()),
+        req: attrs.version.unwrap_or_else(|| "*".to_string()),
+        crates_io: attrs.path.is_none() && attrs.git.is_none(),
+        optional: attrs.optional.unwrap_or(false),
+    })
 }
 
 fn collect_dependency_specs(
@@ -583,7 +888,7 @@ impl<'a> DependencyCollector<'a> {
     }
 
     fn declared_dependency_is_local(&self, dep: &CargoDependency) -> bool {
-        // `cargo metadata` leaves declaration `source` empty for path/workspace dependencies.
+        // Manifest parsing leaves `source` empty for path, workspace-local, and git deps.
         // Registry dependencies carry a concrete source even when they are inactive optional deps.
         dep.source.is_none()
     }
@@ -1003,6 +1308,117 @@ fn current_action_ref_is_outdated(current: &ActionTagVersion, latest: &ActionTag
 
 fn is_full_commit_sha(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CargoManifest {
+    #[serde(default)]
+    package: Option<ManifestPackage>,
+    #[serde(default)]
+    workspace: Option<ManifestWorkspace>,
+    #[serde(default, rename = "dependencies")]
+    dependencies: BTreeMap<String, ManifestDependency>,
+    #[serde(default, rename = "dev-dependencies")]
+    dev_dependencies: BTreeMap<String, ManifestDependency>,
+    #[serde(default, rename = "build-dependencies")]
+    build_dependencies: BTreeMap<String, ManifestDependency>,
+    #[serde(default)]
+    target: BTreeMap<String, ManifestTargetDependencies>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestPackage {
+    name: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ManifestWorkspace {
+    #[serde(default)]
+    members: Vec<String>,
+    #[serde(default)]
+    exclude: Vec<String>,
+    #[serde(default, rename = "dependencies")]
+    dependencies: BTreeMap<String, ManifestDependency>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ManifestTargetDependencies {
+    #[serde(default, rename = "dependencies")]
+    dependencies: BTreeMap<String, ManifestDependency>,
+    #[serde(default, rename = "dev-dependencies")]
+    dev_dependencies: BTreeMap<String, ManifestDependency>,
+    #[serde(default, rename = "build-dependencies")]
+    build_dependencies: BTreeMap<String, ManifestDependency>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ManifestDependency {
+    Simple(String),
+    Detailed(ManifestDependencyDetail),
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ManifestDependencyDetail {
+    #[serde(default)]
+    package: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    git: Option<String>,
+    #[serde(default)]
+    workspace: bool,
+    #[serde(default)]
+    optional: Option<bool>,
+}
+
+#[derive(Debug, Default)]
+struct ManifestDependencyAttrs {
+    package: Option<String>,
+    version: Option<String>,
+    path: Option<String>,
+    git: Option<String>,
+    workspace: bool,
+    optional: Option<bool>,
+}
+
+impl ManifestDependencyAttrs {
+    fn from_dependency(dep: &ManifestDependency) -> Self {
+        match dep {
+            ManifestDependency::Simple(version) => Self {
+                version: Some(version.clone()),
+                ..Self::default()
+            },
+            ManifestDependency::Detailed(detail) => Self {
+                package: detail.package.clone(),
+                version: detail.version.clone(),
+                path: detail.path.clone(),
+                git: detail.git.clone(),
+                workspace: detail.workspace,
+                optional: detail.optional,
+            },
+        }
+    }
+
+    fn overlay_workspace(self, workspace: Self) -> Self {
+        Self {
+            package: self.package.or(workspace.package),
+            version: self.version.or(workspace.version),
+            path: self.path.or(workspace.path),
+            git: self.git.or(workspace.git),
+            workspace: false,
+            optional: self.optional.or(workspace.optional),
+        }
+    }
+}
+
+struct ResolvedManifestDependency {
+    name: String,
+    req: String,
+    crates_io: bool,
+    optional: bool,
 }
 
 #[derive(Debug, Deserialize)]

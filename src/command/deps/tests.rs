@@ -9,8 +9,9 @@ use super::{
     CargoResolveNodeDep, DepAuditRecord, DependencyUpdatePlan, RiskLevel, WorkflowActionSpec,
     build_action_audit_record, collect_dependency_inventory, collect_dependency_specs,
     derive_auto_jobs, latest_stable_action_tag, parse_action_tag_version, parse_workflow_uses_line,
+    read_manifest_metadata,
 };
-use std::path::Path;
+use std::{fs, path::Path};
 
 #[test]
 fn auto_jobs_is_bounded() {
@@ -89,6 +90,74 @@ fn collect_dependency_inventory_skips_workspace_and_local_path_crates() {
 
     assert_eq!(names, vec!["serde", "tokio"]);
     assert_eq!(skipped, vec!["local-helper", "workspace-core"]);
+}
+
+#[test]
+fn read_manifest_metadata_scans_workspace_manifests_without_resolving_deps() {
+    let root = temp_root("deps-manifest-workspace");
+    fs::create_dir_all(root.join("crates/app")).expect("create app crate");
+    fs::create_dir_all(root.join("crates/local-helper")).expect("create local crate");
+
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"
+            [workspace]
+            members = ["crates/*"]
+
+            [workspace.dependencies]
+            anyhow = "1"
+            serde = "1"
+            local-helper = { path = "crates/local-helper" }
+        "#,
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        root.join("crates/app/Cargo.toml"),
+        r#"
+            [package]
+            name = "app"
+            version = "0.1.0"
+
+            [dependencies]
+            anyhow = { workspace = true }
+            serde = { workspace = true }
+            local-helper = { workspace = true }
+            runtime = { package = "tokio", version = "1" }
+            reqx = { version = "0.1", optional = true }
+
+            [target.'cfg(unix)'.dependencies]
+            regex = "1"
+        "#,
+    )
+    .expect("write app manifest");
+    fs::write(
+        root.join("crates/local-helper/Cargo.toml"),
+        r#"
+            [package]
+            name = "local-helper"
+            version = "0.1.0"
+        "#,
+    )
+    .expect("write local manifest");
+
+    let metadata = read_manifest_metadata(&root.join("Cargo.toml")).expect("read metadata");
+    assert!(metadata.resolve.is_none());
+
+    let inventory =
+        collect_dependency_inventory(&metadata, false, false, false).expect("collect deps");
+    let names = inventory
+        .specs
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect::<Vec<_>>();
+    let skipped = inventory
+        .skipped_local
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(names, vec!["anyhow", "regex", "serde", "tokio"]);
+    assert_eq!(skipped, vec!["local-helper"]);
 }
 
 #[test]
@@ -754,4 +823,17 @@ fn workspace_metadata() -> CargoMetadata {
 
 fn registry_source() -> String {
     "registry+https://github.com/rust-lang/crates.io-index".to_string()
+}
+
+fn temp_root(label: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!(
+        "za-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("create temp root");
+    root
 }

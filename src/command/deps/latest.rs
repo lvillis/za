@@ -174,7 +174,7 @@ pub(super) fn collect_latest_queries(
     let mut queries = BTreeMap::<String, LatestQuery>::new();
     let manifest_path = if manifest_path.is_some() || project_path.is_some() {
         let manifest_path = resolve_manifest_path(manifest_path, project_path)?;
-        let metadata = cargo_metadata(&manifest_path)?;
+        let metadata = read_manifest_metadata(&manifest_path)?;
         let specs =
             collect_dependency_specs(&metadata, include_dev, include_build, include_optional)?;
         for spec in specs {
