@@ -37,45 +37,65 @@ pub(super) fn render_report_lines(
     actions: &[ActionAuditRecord],
     verbose: bool,
 ) -> Vec<String> {
-    let mut lines = vec![render_report_summary_line(
-        manifest_path,
-        summary,
-        records,
-        actions,
-        records.len(),
-    )];
+    let dep_updates = records
+        .iter()
+        .filter(|record| record_is_version_update(record))
+        .collect::<Vec<_>>();
+    let action_updates = actions
+        .iter()
+        .filter(|record| record.update_plan == ActionUpdatePlan::Bump)
+        .collect::<Vec<_>>();
     let attention = records
         .iter()
-        .filter(|record| record_needs_attention(record))
+        .filter(|record| record_needs_attention(record) && !record_is_version_update(record))
         .collect::<Vec<_>>();
     let baseline = records
         .iter()
-        .filter(|record| !record_needs_attention(record))
+        .filter(|record| !record_needs_attention(record) && !record_is_version_update(record))
         .collect::<Vec<_>>();
-    let action_attention = actions
+    let action_reviews = actions
         .iter()
-        .filter(|record| action_needs_attention(record))
+        .filter(|record| record.update_plan == ActionUpdatePlan::Review)
         .collect::<Vec<_>>();
     let action_baseline = actions
         .iter()
         .filter(|record| !action_needs_attention(record))
         .collect::<Vec<_>>();
 
+    let mut lines = render_report_summary_lines(
+        manifest_path,
+        summary,
+        records,
+        actions,
+        baseline.len(),
+        action_baseline.len(),
+    );
+
+    if !dep_updates.is_empty() || !action_updates.is_empty() {
+        lines.push(String::new());
+        lines.push(tty_style::header("updates"));
+        lines.extend(render_update_table(
+            manifest_path,
+            &dep_updates,
+            &action_updates,
+        ));
+    }
+
     if !attention.is_empty() {
         lines.push(String::new());
         lines.push(tty_style::header("attention"));
         lines.extend(render_record_table(&attention));
     }
-    if !action_attention.is_empty() {
+    if !action_reviews.is_empty() {
         lines.push(String::new());
-        lines.push(tty_style::header("actions"));
-        lines.extend(render_action_table(&action_attention));
+        lines.push(tty_style::header("action review"));
+        lines.extend(render_action_table(&action_reviews));
     }
 
     if verbose {
         if !baseline.is_empty() {
             lines.push(String::new());
-            lines.push(tty_style::header("baseline"));
+            lines.push(tty_style::header("deps baseline"));
             lines.extend(render_record_table(&baseline));
         }
         if !action_baseline.is_empty() {
@@ -89,22 +109,9 @@ pub(super) fn render_report_lines(
             tty_style::dim("manifest"),
             manifest_path.display()
         ));
-    } else if !baseline.is_empty() {
+    } else if let Some(hidden) = render_hidden_summary(baseline.len(), action_baseline.len()) {
         lines.push(String::new());
-        lines.push(format!(
-            "{} baseline {} hidden; use `--verbose` to show all",
-            baseline.len(),
-            entry_label(baseline.len()),
-        ));
-    }
-
-    if !verbose && !action_attention.is_empty() && !action_baseline.is_empty() {
-        lines.push(String::new());
-        lines.push(format!(
-            "{} action {} hidden; use `--verbose` to show all",
-            action_baseline.len(),
-            entry_label(action_baseline.len()),
-        ));
+        lines.push(hidden);
     }
 
     lines
@@ -114,59 +121,112 @@ fn plural_suffix(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
 
-fn entry_label(count: usize) -> &'static str {
-    if count == 1 { "entry" } else { "entries" }
-}
-
 fn count_label(count: usize, noun: &str) -> String {
     format!("{} {}{}", count, noun, plural_suffix(count))
 }
 
-fn render_report_summary_line(
+fn render_report_summary_lines(
     manifest_path: &Path,
     summary: &AuditSummary,
     records: &[DepAuditRecord],
     actions: &[ActionAuditRecord],
-    total: usize,
-) -> String {
+    dep_baseline: usize,
+    action_baseline: usize,
+) -> Vec<String> {
     let manifest = manifest_path
         .file_name()
         .and_then(|name| name.to_str())
         .map(str::to_string)
         .unwrap_or_else(|| manifest_path.to_string_lossy().into_owned());
-    let verdict = style_report_verdict(
-        &format!("{:<5}", report_verdict(summary, actions)),
+    let dep_verdict = style_dependency_report_verdict(
+        &format!("{:<5}", dependency_report_verdict(summary)),
         summary,
-        actions,
     );
-    format!(
-        "{}  {}  {} {}  {}",
-        verdict,
-        tty_style::header(manifest),
-        tty_style::header(total.to_string()),
+    let mut lines = vec![format!(
+        "{}  {:<7}  {}  {} {}  {}",
+        dep_verdict,
+        tty_style::header("deps"),
+        tty_style::dim(manifest),
+        tty_style::header(records.len().to_string()),
         tty_style::dim("deps"),
-        render_summary_counts(summary, records, actions)
-    )
+        render_dependency_summary_counts(summary, records, dep_baseline)
+    )];
+
+    if !actions.is_empty() {
+        let action_verdict =
+            style_action_report_verdict(&format!("{:<5}", action_report_verdict(actions)), actions);
+        lines.push(format!(
+            "{}  {:<7}  {}  {} {}  {}",
+            action_verdict,
+            tty_style::header("actions"),
+            tty_style::dim("workflows"),
+            tty_style::header(actions.len().to_string()),
+            tty_style::dim("actions"),
+            render_action_summary_counts(actions, action_baseline)
+        ));
+    }
+
+    lines
 }
 
-fn report_verdict(summary: &AuditSummary, actions: &[ActionAuditRecord]) -> &'static str {
+fn dependency_report_verdict(summary: &AuditSummary) -> &'static str {
     if summary.high > 0 {
         "HIGH"
     } else if summary.medium > 0 {
         "MED"
-    } else if summary.unknown > 0 || action_attention_counts(actions).1 > 0 {
+    } else if summary.unknown > 0 {
         "WARN"
     } else {
         "OK"
     }
 }
 
-fn render_summary_counts(
+fn action_report_verdict(actions: &[ActionAuditRecord]) -> &'static str {
+    if action_attention_counts(actions).1 > 0 {
+        "WARN"
+    } else {
+        "OK"
+    }
+}
+
+fn render_hidden_summary(dep_baseline: usize, action_baseline: usize) -> Option<String> {
+    let mut parts = Vec::new();
+    if dep_baseline > 0 {
+        parts.push(format!(
+            "{} baseline dep{}",
+            dep_baseline,
+            plural_suffix(dep_baseline)
+        ));
+    }
+    if action_baseline > 0 {
+        parts.push(format!(
+            "{} baseline action{}",
+            action_baseline,
+            plural_suffix(action_baseline)
+        ));
+    }
+    (!parts.is_empty()).then(|| {
+        format!(
+            "{}  {}; use `--verbose` to show all",
+            tty_style::dim("hidden"),
+            parts.join(", ")
+        )
+    })
+}
+
+fn render_dependency_summary_counts(
     summary: &AuditSummary,
     records: &[DepAuditRecord],
-    actions: &[ActionAuditRecord],
+    baseline_count: usize,
 ) -> String {
     let mut parts = Vec::new();
+    let (bump_count, review_count) = version_attention_counts(records);
+    if bump_count > 0 {
+        parts.push(tty_style::active(count_label(bump_count, "update")));
+    }
+    if review_count > 0 {
+        parts.push(tty_style::warning(count_label(review_count, "review")));
+    }
     if summary.high > 0 {
         parts.push(tty_style::error(format!("{} high", summary.high)));
     }
@@ -176,8 +236,8 @@ fn render_summary_counts(
     if summary.unknown > 0 {
         parts.push(tty_style::active(format!("{} unknown", summary.unknown)));
     }
-    if summary.low > 0 {
-        parts.push(tty_style::dim(format!("{} low", summary.low)));
+    if baseline_count > 0 {
+        parts.push(tty_style::dim(format!("{baseline_count} baseline")));
     }
     if summary.skipped_local > 0 {
         parts.push(tty_style::dim(format!(
@@ -185,31 +245,170 @@ fn render_summary_counts(
             summary.skipped_local
         )));
     }
-    let (bump_count, review_count) = version_attention_counts(records);
-    if bump_count > 0 {
-        parts.push(tty_style::active(count_label(bump_count, "update")));
+    if parts.is_empty() {
+        tty_style::dim("no findings")
+    } else {
+        text_render::join_dim_bullets(&parts)
     }
-    if review_count > 0 {
-        parts.push(tty_style::warning(count_label(review_count, "review")));
-    }
+}
+
+fn render_action_summary_counts(actions: &[ActionAuditRecord], baseline_count: usize) -> String {
+    let mut parts = Vec::new();
     let (action_bump_count, action_review_count) = action_attention_counts(actions);
     if action_bump_count > 0 {
-        parts.push(tty_style::active(count_label(
-            action_bump_count,
-            "action update",
-        )));
+        parts.push(tty_style::active(count_label(action_bump_count, "update")));
     }
     if action_review_count > 0 {
         parts.push(tty_style::warning(count_label(
             action_review_count,
-            "action review",
+            "review",
         )));
+    }
+    if baseline_count > 0 {
+        parts.push(tty_style::dim(format!("{baseline_count} baseline")));
     }
     if parts.is_empty() {
         tty_style::dim("no findings")
     } else {
         text_render::join_dim_bullets(&parts)
     }
+}
+
+fn render_update_table(
+    manifest_path: &Path,
+    records: &[&DepAuditRecord],
+    actions: &[&ActionAuditRecord],
+) -> Vec<String> {
+    let manifest = manifest_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| manifest_path.to_string_lossy().into_owned());
+    let rows = records.len() + actions.len();
+    let name_width = records
+        .iter()
+        .map(|record| record.name.chars().count())
+        .chain(actions.iter().map(|record| record.action.chars().count()))
+        .max()
+        .unwrap_or(4)
+        .max("name".chars().count())
+        .min(32);
+    let current_width = records
+        .iter()
+        .map(|record| record.requirement.chars().count())
+        .chain(
+            actions
+                .iter()
+                .map(|record| record.current_ref.chars().count()),
+        )
+        .max()
+        .unwrap_or(7)
+        .max("current".chars().count())
+        .min(16);
+    let latest_width = records
+        .iter()
+        .map(|record| {
+            record
+                .latest_version
+                .as_deref()
+                .unwrap_or("-")
+                .chars()
+                .count()
+        })
+        .chain(
+            actions
+                .iter()
+                .map(|record| action_latest_label(record).chars().count()),
+        )
+        .max()
+        .unwrap_or(6)
+        .max("latest".chars().count())
+        .min(16);
+    let source_width = records
+        .iter()
+        .map(|_| manifest.chars().count())
+        .chain(
+            actions
+                .iter()
+                .map(|record| action_location_label(record).chars().count()),
+        )
+        .max()
+        .unwrap_or(6)
+        .max("source".chars().count())
+        .min(32);
+
+    let mut lines = Vec::with_capacity(rows + 1);
+    lines.push(tty_style::dim(format!(
+        "{:<6}  {:<name_width$}  {:<current_width$}  {:<latest_width$}  {:<source_width$}  note",
+        "kind", "name", "current", "latest", "source"
+    )));
+
+    for record in records {
+        let kind = tty_style::dim(format!("{:<6}", "crate"));
+        let name = tty_style::header(format!(
+            "{:<name_width$}",
+            text_render::truncate_end(&record.name, name_width)
+        ));
+        let current = tty_style::dim(format!(
+            "{:<current_width$}",
+            text_render::truncate_end(&record.requirement, current_width)
+        ));
+        let latest = style_dep_latest_cell(
+            &text_render::truncate_end(
+                record.latest_version.as_deref().unwrap_or("-"),
+                latest_width,
+            ),
+            latest_width,
+            record.latest_version.is_some(),
+        );
+        let source = tty_style::dim(format!(
+            "{:<source_width$}",
+            text_render::truncate_end(&manifest, source_width)
+        ));
+        lines.push(format!(
+            "{}  {}  {}  {}  {}  {}",
+            kind,
+            name,
+            current,
+            latest,
+            source,
+            summarize_record_note(record)
+        ));
+    }
+
+    for record in actions {
+        let kind = tty_style::dim(format!("{:<6}", "action"));
+        let name = tty_style::header(format!(
+            "{:<name_width$}",
+            text_render::truncate_end(&record.action, name_width)
+        ));
+        let current = tty_style::dim(format!(
+            "{:<current_width$}",
+            text_render::truncate_end(&record.current_ref, current_width)
+        ));
+        let latest_value = action_latest_label(record);
+        let latest = style_action_latest_cell(
+            &text_render::truncate_end(&latest_value, latest_width),
+            latest_width,
+            latest_value != "-",
+        );
+        let source_label = action_location_label(record);
+        let source = tty_style::dim(format!(
+            "{:<source_width$}",
+            text_render::truncate_end(&source_label, source_width)
+        ));
+        lines.push(format!(
+            "{}  {}  {}  {}  {}  {}",
+            kind,
+            name,
+            current,
+            latest,
+            source,
+            compact_action_note(record.note.as_deref())
+        ));
+    }
+
+    lines
 }
 
 fn render_record_table(records: &[&DepAuditRecord]) -> Vec<String> {
@@ -327,7 +526,7 @@ fn render_action_table(records: &[&ActionAuditRecord]) -> Vec<String> {
         .clamp(3, 16);
     let latest_width = records
         .iter()
-        .map(|record| record.latest_ref.as_deref().unwrap_or("-").chars().count())
+        .map(|record| action_latest_label(record).chars().count())
         .max()
         .unwrap_or(6)
         .clamp(6, 16);
@@ -353,10 +552,11 @@ fn render_action_table(records: &[&ActionAuditRecord]) -> Vec<String> {
             "{:<ref_width$}",
             text_render::truncate_end(&record.current_ref, ref_width)
         ));
+        let latest_value = action_latest_label(record);
         let latest = style_action_latest_cell(
-            &text_render::truncate_end(record.latest_ref.as_deref().unwrap_or("-"), latest_width),
+            &text_render::truncate_end(&latest_value, latest_width),
             latest_width,
-            record.latest_ref.is_some(),
+            latest_value != "-",
         );
         let file = tty_style::dim(format!(
             "{:<file_width$}",
@@ -409,6 +609,13 @@ fn record_needs_attention(record: &DepAuditRecord) -> bool {
             .is_some_and(DependencyUpdatePlan::needs_attention)
 }
 
+fn record_is_version_update(record: &DepAuditRecord) -> bool {
+    matches!(
+        record.update_plan,
+        Some(DependencyUpdatePlan::Add | DependencyUpdatePlan::Bump)
+    )
+}
+
 fn version_attention_counts(records: &[DepAuditRecord]) -> (usize, usize) {
     let mut bump_count = 0;
     let mut review_count = 0;
@@ -452,6 +659,15 @@ fn action_location_label(record: &ActionAuditRecord) -> String {
         first.line,
         record.locations.len() - 1
     )
+}
+
+fn action_latest_label(record: &ActionAuditRecord) -> String {
+    if record.update_plan == ActionUpdatePlan::Review
+        && record.note.as_deref() == Some("floating or non-semver ref; review manually")
+    {
+        return "-".to_string();
+    }
+    record.latest_ref.as_deref().unwrap_or("-").to_string()
 }
 
 fn summarize_record_note(record: &DepAuditRecord) -> String {
@@ -498,7 +714,7 @@ fn compact_action_note(note: Option<&str>) -> String {
         return "no-tags".to_string();
     }
     if note.starts_with("GitHub query failed:") {
-        return "github?".to_string();
+        return "github-unavailable".to_string();
     }
     text_render::truncate_end(note, 24)
 }
@@ -545,13 +761,13 @@ fn compact_record_note(note: &str) -> String {
         return "no-signals".to_string();
     }
     if note.starts_with("GitHub signals unavailable") {
-        return "github?".to_string();
+        return "github-unavailable".to_string();
     }
     if note.starts_with("crates.io query failed:") {
         return "crates.io?".to_string();
     }
     if note.starts_with("GitHub query failed:") {
-        return "github?".to_string();
+        return "github-unavailable".to_string();
     }
     if let Some(days) = extract_days(note, "latest crate release is stale (") {
         return format!("release-stale:{days}d");
@@ -646,16 +862,20 @@ fn style_action_latest_cell(value: &str, width: usize, has_latest: bool) -> Stri
     }
 }
 
-fn style_report_verdict(
-    value: &str,
-    summary: &AuditSummary,
-    actions: &[ActionAuditRecord],
-) -> String {
+fn style_dependency_report_verdict(value: &str, summary: &AuditSummary) -> String {
     if summary.high > 0 {
         tty_style::error(value)
     } else if summary.medium > 0 {
         tty_style::warning(value)
-    } else if summary.unknown > 0 || action_attention_counts(actions).1 > 0 {
+    } else if summary.unknown > 0 {
+        tty_style::active(value)
+    } else {
+        tty_style::success(value)
+    }
+}
+
+fn style_action_report_verdict(value: &str, actions: &[ActionAuditRecord]) -> String {
+    if action_attention_counts(actions).1 > 0 {
         tty_style::active(value)
     } else {
         tty_style::success(value)

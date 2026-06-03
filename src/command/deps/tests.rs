@@ -222,12 +222,12 @@ fn render_report_lines_default_focuses_on_attention() {
 
     let lines = render_report_lines(manifest, &summary, &records, &[], false);
     let output = lines.join("\n");
-    assert!(output.contains("HIGH   Cargo.toml  3 deps  1 high · 1 unknown · 1 low"));
+    assert!(output.contains("HIGH   deps     Cargo.toml  3 deps  1 high · 1 unknown · 1 baseline"));
     assert!(output.contains("\nattention\n"));
     assert!(output.contains("openssl-probe"));
     assert!(output.contains("mystery-crate"));
-    assert!(!output.contains("\nbaseline\n"));
-    assert!(output.contains("1 baseline entry hidden; use `--verbose` to show all"));
+    assert!(!output.contains("\ndeps baseline\n"));
+    assert!(output.contains("hidden  1 baseline dep; use `--verbose` to show all"));
     assert!(!output.contains("plan"));
     assert!(!output.contains("\nLOW"));
 }
@@ -258,14 +258,15 @@ fn render_report_lines_default_surfaces_low_risk_version_updates() {
 
     let lines = render_report_lines(manifest, &summary, &records, &[], false);
     let output = lines.join("\n");
-    assert!(output.contains("OK     Cargo.toml  2 deps  2 low · 1 update"));
-    assert!(output.contains("\nattention\n"));
+    assert!(output.contains("OK     deps     Cargo.toml  2 deps  1 update · 1 baseline"));
+    assert!(output.contains("\nupdates\n"));
     assert!(output.contains("reqx"));
-    assert!(output.contains("bump"));
+    assert!(output.contains("0.1.31"));
     assert!(output.contains("same-line"));
     assert!(!output.contains("same release line; refresh manifest requirement"));
     assert!(!output.contains("bytes"));
-    assert!(output.contains("1 baseline entry hidden; use `--verbose` to show all"));
+    assert!(!output.contains("\nattention\n"));
+    assert!(output.contains("hidden  1 baseline dep; use `--verbose` to show all"));
 }
 
 #[test]
@@ -293,9 +294,9 @@ fn render_report_lines_verbose_includes_baseline_and_manifest() {
 
     let lines = render_report_lines(manifest, &summary, &records, &[], true);
     let output = lines.join("\n");
-    assert!(output.contains("MED    Cargo.toml  2 deps  1 medium · 1 low"));
+    assert!(output.contains("MED    deps     Cargo.toml  2 deps  1 medium · 1 baseline"));
     assert!(output.contains("\nattention\n"));
-    assert!(output.contains("\nbaseline\n"));
+    assert!(output.contains("\ndeps baseline\n"));
     assert!(output.contains("manifest  /tmp/work/Cargo.toml"));
     assert!(output.contains("reqwest"));
     assert!(output.contains("bytes"));
@@ -316,7 +317,7 @@ fn render_report_lines_summarizes_skipped_internal_dependencies() {
     let lines = render_report_lines(manifest, &summary, &records, &[], false);
     let output = lines.join("\n");
 
-    assert!(output.contains("OK     Cargo.toml  1 deps  1 low · 2 internal skipped"));
+    assert!(output.contains("OK     deps     Cargo.toml  1 deps  1 baseline · 2 internal skipped"));
 }
 
 #[test]
@@ -350,12 +351,43 @@ fn render_report_lines_surfaces_workflow_action_updates() {
     let lines = render_report_lines(manifest, &summary, &records, &actions, false);
     let output = lines.join("\n");
 
-    assert!(output.contains("1 action update"));
-    assert!(output.contains("\nactions\n"));
+    assert!(output.contains("OK     actions  workflows  2 actions  1 update · 1 baseline"));
+    assert!(output.contains("\nupdates\n"));
     assert!(output.contains("actions/checkout"));
     assert!(output.contains("newer-tag"));
-    assert!(output.contains("1 action entry hidden; use `--verbose` to show all"));
+    assert!(
+        output.contains("hidden  1 baseline dep, 1 baseline action; use `--verbose` to show all")
+    );
     assert!(!output.contains("Swatinem/rust-cache"));
+}
+
+#[test]
+fn render_report_lines_reviews_floating_action_refs_without_fake_latest() {
+    let manifest = Path::new("/tmp/work/Cargo.toml");
+    let summary = AuditSummary {
+        high: 0,
+        medium: 0,
+        low: 0,
+        unknown: 0,
+        skipped_local: 0,
+    };
+    let actions = vec![sample_action_record(
+        "dtolnay/rust-toolchain",
+        "stable",
+        Some("v1"),
+        ActionUpdatePlan::Review,
+        "floating or non-semver ref; review manually",
+    )];
+
+    let lines = render_report_lines(manifest, &summary, &[], &actions, false);
+    let output = lines.join("\n");
+
+    assert!(output.contains("WARN   actions  workflows  1 actions  1 review"));
+    assert!(output.contains("\naction review\n"));
+    assert!(output.contains("dtolnay/rust-toolchain"));
+    assert!(output.contains("stable"));
+    assert!(output.contains("floating-ref"));
+    assert!(!output.contains("v1"));
 }
 
 #[test]

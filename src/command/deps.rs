@@ -43,7 +43,7 @@ const AUTO_DEPS_JOBS_MIN: usize = 4;
 const AUTO_DEPS_JOBS_MAX: usize = 16;
 const DEPS_CACHE_SCHEMA_VERSION: u32 = 2;
 const DEPS_CACHE_FILE_NAME: &str = "deps-cache-v2.json";
-const CRATES_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
+const CRATES_CACHE_TTL_SECS: u64 = 10 * 60;
 const GITHUB_CACHE_TTL_SECS: u64 = 60 * 60;
 const WORKFLOW_ACTION_REF_MAX_TAGS: usize = 100;
 
