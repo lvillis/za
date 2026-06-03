@@ -1,8 +1,18 @@
+## [0.1.82] - 2026-06-03
+
+### 🐛 Bug Fixes
+
+- *(deps)* Read manifests without invoking cargo
+- *(deps)* Shorten crates cache TTL
 ## [0.1.81] - 2026-05-24
 
 ### 🚀 Features
 
 - *(deps)* Audit GitHub Action version drift
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.81
 ## [0.1.80] - 2026-05-24
 
 ### 🚀 Features
