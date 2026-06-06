@@ -434,10 +434,10 @@ fn scan_compact_session(path: &Path) -> Result<Option<CompactSessionScan>> {
     let mut marker_count = 0;
 
     read_lossy_jsonl_lines(path, |line| {
-        if is_compaction_marker_line(&line) {
+        if is_compaction_marker_line(line) {
             marker_count += 1;
         }
-        let Ok(envelope) = serde_json::from_str::<CompactLogEnvelope>(&line) else {
+        let Ok(envelope) = serde_json::from_str::<CompactLogEnvelope>(line) else {
             return;
         };
         if envelope.kind != "session_meta" {
@@ -463,7 +463,7 @@ fn scan_compact_session(path: &Path) -> Result<Option<CompactSessionScan>> {
 fn count_compaction_markers(path: &Path) -> Result<usize> {
     let mut count = 0;
     read_lossy_jsonl_lines(path, |line| {
-        if is_compaction_marker_line(&line) {
+        if is_compaction_marker_line(line) {
             count += 1;
         }
     })?;
