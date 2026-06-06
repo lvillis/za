@@ -855,7 +855,7 @@ pub enum CodexCommands {
     /// Compact the current workspace Codex conversation, then resume it
     Compact {
         /// Temporary model used only for the compaction turn.
-        #[arg(long, default_value = "gpt-5.3-codex")]
+        #[arg(long, default_value = "gpt-5.4-mini")]
         model: String,
         /// Temporary reasoning effort used only for the compaction turn.
         #[arg(long, default_value = "low")]
@@ -2264,7 +2264,7 @@ mod tests {
                         timeout: 180,
                         no_resume: false,
                         verbose: false,
-                    }) if model == "gpt-5.3-codex" && effort == "low"
+                    }) if model == "gpt-5.4-mini" && effort == "low"
                 ));
             }
             _ => panic!("unexpected command"),
