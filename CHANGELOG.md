@@ -1,8 +1,18 @@
+## [0.1.85] - 2026-06-06
+
+### 🐛 Bug Fixes
+
+- *(ci)* Surface colored Rust errors in logs
+- *(codex)* Switch compact model to gpt-5.4-mini
 ## [0.1.84] - 2026-06-06
 
 ### 🐛 Bug Fixes
 
 - *(codex)* Remove needless compact log borrows
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.84
 ## [0.1.83] - 2026-06-06
 
 ### 🐛 Bug Fixes
