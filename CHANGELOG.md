@@ -1,9 +1,18 @@
+## [0.1.83] - 2026-06-06
+
+### 🐛 Bug Fixes
+
+- *(codex)* Tolerate non-UTF8 rollout logs during compact
 ## [0.1.82] - 2026-06-03
 
 ### 🐛 Bug Fixes
 
 - *(deps)* Read manifests without invoking cargo
 - *(deps)* Shorten crates cache TTL
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.82
 ## [0.1.81] - 2026-05-24
 
 ### 🚀 Features
