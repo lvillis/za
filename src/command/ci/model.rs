@@ -745,7 +745,7 @@ pub(crate) fn select_log_lines(log: &str, line_limit: usize) -> (Vec<String>, us
     for (index, line) in lines.iter().enumerate() {
         if is_primary_error_log_line(line) {
             has_primary_error = true;
-            let end = (index + 4).min(lines.len());
+            let end = (index + 6).min(lines.len());
             for selected in index..end {
                 selected_indexes.insert(selected);
             }
@@ -781,30 +781,56 @@ pub(crate) fn select_log_lines(log: &str, line_limit: usize) -> (Vec<String>, us
 }
 
 fn is_primary_error_log_line(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
+    let normalized = normalize_log_line_for_matching(line);
+    let lower = normalized.to_ascii_lowercase();
     lower.contains("::error")
         || lower.contains(" error:")
         || lower.contains("error:")
         || lower.contains("error[")
-        || lower.contains("failed")
         || lower.contains("fatal:")
         || lower.contains("panicked at")
-        || lower.contains("could not compile")
+        || lower.contains("thread '")
 }
 
 fn is_exit_status_log_line(line: &str) -> bool {
-    line.to_ascii_lowercase()
+    normalize_log_line_for_matching(line)
+        .to_ascii_lowercase()
         .contains("process completed with exit code")
 }
 
 fn is_selected_log_noise(line: &str) -> bool {
-    let line = strip_github_log_timestamp(line).trim();
+    let normalized = normalize_log_line_for_matching(line);
+    let line = normalized.trim();
     line.is_empty()
         || line.starts_with("##[group]")
         || line.starts_with("##[endgroup]")
         || line.eq_ignore_ascii_case("Post job cleanup.")
         || line.eq_ignore_ascii_case("Cleaning up orphan processes")
         || line.starts_with("[command]")
+}
+
+fn normalize_log_line_for_matching(line: &str) -> String {
+    strip_ansi_escape_codes(strip_github_log_timestamp(line))
+}
+
+fn strip_ansi_escape_codes(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        if chars.next_if_eq(&'[').is_none() {
+            continue;
+        }
+        for next in chars.by_ref() {
+            if ('@'..='~').contains(&next) {
+                break;
+            }
+        }
+    }
+    out
 }
 
 pub(crate) fn strip_github_log_timestamp(line: &str) -> &str {

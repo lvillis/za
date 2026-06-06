@@ -1565,6 +1565,29 @@ Cleaning up orphan processes
     }
 
     #[test]
+    fn select_log_lines_matches_ansi_colored_rust_errors_before_summary() {
+        let raw = "\
+2026-06-06T03:11:54.8289615Z Checking za v0.1.83
+2026-06-06T03:11:54.8289615Z \u{1b}[1m\u{1b}[91merror\u{1b}[0m: this expression creates a reference which is immediately dereferenced by the compiler
+2026-06-06T03:11:54.8289615Z    --> src/command/codex/compact.rs:437:38
+2026-06-06T03:11:54.8289615Z     |
+2026-06-06T03:11:54.8289615Z 437 |         if is_compaction_marker_line(&line) {
+2026-06-06T03:11:54.8289615Z     |                                      ^^^^^ help: change this to: `line`
+2026-06-06T03:11:54.8289615Z     = note: `-D clippy::needless-borrow` implied by `-D warnings`
+2026-06-06T03:11:54.8289615Z \u{1b}[1m\u{1b}[91merror\u{1b}[0m: could not compile `za` (bin \"za\") due to 3 previous errors
+2026-06-06T03:11:56.3027516Z ##[error]Process completed with exit code 101.
+";
+        let (lines, _omitted, matched_error_lines) = select_log_lines(raw, 6);
+        let output = lines.join("\n");
+
+        assert!(matched_error_lines);
+        assert!(output.contains("immediately dereferenced"));
+        assert!(output.contains("src/command/codex/compact.rs:437:38"));
+        assert!(output.contains("change this to: `line`"));
+        assert!(!output.contains("could not compile"));
+    }
+
+    #[test]
     fn strip_github_log_timestamp_removes_actions_prefix_for_text_rendering() {
         assert_eq!(
             strip_github_log_timestamp("2026-05-15T08:29:02.6669970Z error: failed"),
