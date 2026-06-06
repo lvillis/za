@@ -429,27 +429,25 @@ struct CompactSessionScan {
 }
 
 fn scan_compact_session(path: &Path) -> Result<Option<CompactSessionScan>> {
-    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut thread_id = None;
     let mut workspace_root = None;
     let mut marker_count = 0;
 
-    for line in BufReader::new(file).lines() {
-        let line = line.with_context(|| format!("read {}", path.display()))?;
+    read_lossy_jsonl_lines(path, |line| {
         if is_compaction_marker_line(&line) {
             marker_count += 1;
         }
         let Ok(envelope) = serde_json::from_str::<CompactLogEnvelope>(&line) else {
-            continue;
+            return;
         };
         if envelope.kind != "session_meta" {
-            continue;
+            return;
         }
         if let Ok(payload) = serde_json::from_value::<CompactSessionMeta>(envelope.payload) {
             thread_id = Some(payload.id);
             workspace_root = Some(payload.cwd);
         }
-    }
+    })?;
 
     Ok(match (thread_id, workspace_root) {
         (Some(thread_id), Some(workspace_root)) => Some(CompactSessionScan {
@@ -463,15 +461,36 @@ fn scan_compact_session(path: &Path) -> Result<Option<CompactSessionScan>> {
 }
 
 fn count_compaction_markers(path: &Path) -> Result<usize> {
-    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut count = 0;
-    for line in BufReader::new(file).lines() {
-        let line = line.with_context(|| format!("read {}", path.display()))?;
+    read_lossy_jsonl_lines(path, |line| {
         if is_compaction_marker_line(&line) {
             count += 1;
         }
-    }
+    })?;
     Ok(count)
+}
+
+fn read_lossy_jsonl_lines(path: &Path, mut visit: impl FnMut(&str)) -> Result<()> {
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut buffer = Vec::new();
+
+    loop {
+        buffer.clear();
+        let bytes = reader
+            .read_until(b'\n', &mut buffer)
+            .with_context(|| format!("read {}", path.display()))?;
+        if bytes == 0 {
+            break;
+        }
+        while matches!(buffer.last(), Some(b'\n' | b'\r')) {
+            buffer.pop();
+        }
+        let line = String::from_utf8_lossy(&buffer);
+        visit(&line);
+    }
+
+    Ok(())
 }
 
 fn is_compaction_marker_line(line: &str) -> bool {
@@ -539,5 +558,44 @@ mod tests {
         assert_eq!(params["clientInfo"]["name"], "za-codex-compact");
         assert_eq!(params["capabilities"]["experimentalApi"], true);
         assert_eq!(params["capabilities"]["requestAttestation"], false);
+    }
+
+    #[test]
+    fn compact_session_scan_tolerates_non_utf8_rollout_lines() {
+        let path = temp_rollout_path();
+        let mut content = Vec::new();
+        content.extend_from_slice(
+            br#"{"type":"response_item","payload":{"type":"contextCompaction"}}"#,
+        );
+        content.push(b'\n');
+        content.extend_from_slice(b"\xff\xfe invalid utf8\n");
+        content.extend_from_slice(
+            br#"{"type":"session_meta","payload":{"id":"019e052b-a72f-7ef3-af56-2ce01bc9230f","cwd":"/tmp/work"}}"#,
+        );
+        content.push(b'\n');
+        content.extend_from_slice(br#"{"method":"thread/compacted","params":{"threadId":"t"}}"#);
+        content.push(b'\n');
+        fs::write(&path, content).expect("write rollout");
+
+        let scan = scan_compact_session(&path)
+            .expect("scan rollout")
+            .expect("session metadata");
+        assert_eq!(scan.thread_id, "019e052b-a72f-7ef3-af56-2ce01bc9230f");
+        assert_eq!(scan.workspace_root, "/tmp/work");
+        assert_eq!(scan.marker_count, 2);
+        assert_eq!(count_compaction_markers(&path).expect("count markers"), 2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn temp_rollout_path() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "za-compact-rollout-{}-{nanos}.jsonl",
+            std::process::id()
+        ))
     }
 }
