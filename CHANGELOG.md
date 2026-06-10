@@ -1,9 +1,18 @@
+## [0.1.86] - 2026-06-10
+
+### 🚀 Features
+
+- *(tool)* Show per-tool download progress in batch updates
 ## [0.1.85] - 2026-06-06
 
 ### 🐛 Bug Fixes
 
 - *(ci)* Surface colored Rust errors in logs
 - *(codex)* Switch compact model to gpt-5.4-mini
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.85
 ## [0.1.84] - 2026-06-06
 
 ### 🐛 Bug Fixes
