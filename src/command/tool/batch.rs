@@ -334,11 +334,35 @@ fn materialize_tool_batch_parallel(
     let worker_count = materialize_worker_count(tasks.len());
     let queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
     let out: Arc<Mutex<Vec<BatchInstallResult>>> = Arc::new(Mutex::new(Vec::new()));
+    let download_states: Arc<Mutex<HashMap<String, BatchDownloadState>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let progress = new_tool_progress_bar(
         batch_kind_stage(kind),
         queue.lock().map(|guard| guard.len()).unwrap_or(0),
         "preparing tool payloads",
     );
+    let progress_sink = progress.as_ref().map(|progress| {
+        let progress = progress.clone();
+        let download_states = Arc::clone(&download_states);
+        Arc::new(move |event: source::DownloadProgress| {
+            if let Ok(mut states) = download_states.lock() {
+                if event.finished {
+                    states.remove(&event.tool);
+                } else {
+                    states.insert(
+                        event.tool.clone(),
+                        BatchDownloadState {
+                            downloaded: event.downloaded,
+                            total_bytes: event.total_bytes,
+                            elapsed: event.elapsed,
+                            updated_at: Instant::now(),
+                        },
+                    );
+                }
+                progress.set_message(render_batch_download_states(&states));
+            }
+        }) as source::DownloadProgressSink
+    });
 
     thread::scope(|scope| {
         for _ in 0..worker_count {
@@ -346,6 +370,8 @@ fn materialize_tool_batch_parallel(
             let queue = Arc::clone(&queue);
             let out = Arc::clone(&out);
             let progress = progress.clone();
+            let progress_sink = progress_sink.clone();
+            let download_states = Arc::clone(&download_states);
             scope.spawn(move || {
                 loop {
                     let task = match queue.lock() {
@@ -358,24 +384,35 @@ fn materialize_tool_batch_parallel(
                     if let Some(progress) = progress.as_ref() {
                         progress.set_message(task.plan.tool.name.clone());
                     }
-                    let result =
-                        match materialize_install_plan(&home, &task.plan, task.materialize_options)
-                        {
-                            Ok(()) => BatchInstallResult {
-                                index: task.index,
-                                requested_name: task.requested_name,
-                                plan: Some(task.plan),
-                                activate_options: task.activate_options,
-                                error: None,
-                            },
-                            Err(err) => BatchInstallResult {
-                                index: task.index,
-                                requested_name: task.requested_name,
-                                plan: None,
-                                activate_options: task.activate_options,
-                                error: Some(err),
-                            },
-                        };
+                    let tool_name = task.plan.tool.name.clone();
+                    let materialized = if let Some(sink) = progress_sink.clone() {
+                        source::with_download_progress_context(tool_name.clone(), sink, || {
+                            materialize_install_plan(&home, &task.plan, task.materialize_options)
+                        })
+                    } else {
+                        materialize_install_plan(&home, &task.plan, task.materialize_options)
+                    };
+                    clear_batch_download_state(
+                        &download_states,
+                        progress.as_ref(),
+                        tool_name.as_str(),
+                    );
+                    let result = match materialized {
+                        Ok(()) => BatchInstallResult {
+                            index: task.index,
+                            requested_name: task.requested_name,
+                            plan: Some(task.plan),
+                            activate_options: task.activate_options,
+                            error: None,
+                        },
+                        Err(err) => BatchInstallResult {
+                            index: task.index,
+                            requested_name: task.requested_name,
+                            plan: None,
+                            activate_options: task.activate_options,
+                            error: Some(err),
+                        },
+                    };
                     if let Some(progress) = progress.as_ref() {
                         progress.inc(1);
                     }
@@ -399,6 +436,70 @@ fn materialize_tool_batch_parallel(
         .unwrap_or_default();
     results.sort_by_key(|result| result.index);
     results
+}
+
+#[derive(Clone)]
+pub(super) struct BatchDownloadState {
+    pub(super) downloaded: u64,
+    pub(super) total_bytes: Option<u64>,
+    pub(super) elapsed: Duration,
+    pub(super) updated_at: Instant,
+}
+
+fn clear_batch_download_state(
+    states: &Arc<Mutex<HashMap<String, BatchDownloadState>>>,
+    progress: Option<&ProgressBar>,
+    tool_name: &str,
+) {
+    let Ok(mut states) = states.lock() else {
+        return;
+    };
+    states.remove(tool_name);
+    if let Some(progress) = progress {
+        let message = render_batch_download_states(&states);
+        if message.is_empty() {
+            progress.set_message("finalizing");
+        } else {
+            progress.set_message(message);
+        }
+    }
+}
+
+pub(super) fn render_batch_download_states(states: &HashMap<String, BatchDownloadState>) -> String {
+    const MAX_VISIBLE_DOWNLOADS: usize = 2;
+    if states.is_empty() {
+        return String::new();
+    }
+
+    let mut entries = states.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left_name, left), (right_name, right)| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left_name.cmp(right_name))
+    });
+
+    let mut parts = entries
+        .iter()
+        .take(MAX_VISIBLE_DOWNLOADS)
+        .map(|(name, state)| {
+            format!(
+                "{} {}",
+                name,
+                source::render_download_progress_brief(
+                    state.downloaded,
+                    state.total_bytes,
+                    state.elapsed,
+                )
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let hidden = entries.len().saturating_sub(MAX_VISIBLE_DOWNLOADS);
+    if hidden > 0 {
+        parts.push(format!("+{hidden} more"));
+    }
+    parts.join(" · ")
 }
 
 fn materialize_worker_count(task_count: usize) -> usize {

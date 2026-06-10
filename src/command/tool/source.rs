@@ -4,6 +4,7 @@ use flate2::read::GzDecoder;
 use semver::Version;
 use serde::de::DeserializeOwned;
 use std::{
+    cell::RefCell,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -28,6 +29,27 @@ const GITHUB_RELEASE_SCAN_MAX_PAGES: usize = 10;
 static ACTIVE_TEMP_DIRS: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static TEMP_DIR_NONCE: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static DOWNLOAD_PROGRESS_CONTEXT: RefCell<Option<DownloadProgressContext>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone)]
+pub(super) struct DownloadProgressContext {
+    tool: String,
+    sink: DownloadProgressSink,
+}
+
+pub(super) type DownloadProgressSink = Arc<dyn Fn(DownloadProgress) + Send + Sync + 'static>;
+
+#[derive(Debug, Clone)]
+pub(super) struct DownloadProgress {
+    pub(super) tool: String,
+    pub(super) downloaded: u64,
+    pub(super) total_bytes: Option<u64>,
+    pub(super) elapsed: Duration,
+    pub(super) finished: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DownloadRange {
@@ -129,6 +151,42 @@ pub(super) fn cleanup_stale_temp_dirs() -> usize {
         }
     }
     removed
+}
+
+pub(super) fn with_download_progress_context<T>(
+    tool: String,
+    sink: DownloadProgressSink,
+    run: impl FnOnce() -> T,
+) -> T {
+    let context = DownloadProgressContext { tool, sink };
+    DOWNLOAD_PROGRESS_CONTEXT.with(|slot| {
+        let previous = slot.replace(Some(context));
+        let result = run();
+        slot.replace(previous);
+        result
+    })
+}
+
+fn current_download_progress_context() -> Option<DownloadProgressContext> {
+    DOWNLOAD_PROGRESS_CONTEXT.with(|slot| slot.borrow().clone())
+}
+
+fn emit_download_progress(
+    context: Option<&DownloadProgressContext>,
+    downloaded: u64,
+    total_bytes: Option<u64>,
+    elapsed: Duration,
+    finished: bool,
+) {
+    if let Some(context) = context {
+        (context.sink)(DownloadProgress {
+            tool: context.tool.clone(),
+            downloaded,
+            total_bytes,
+            elapsed,
+            finished,
+        });
+    }
 }
 
 fn matched_temp_prefix(name: &str) -> Option<&'static str> {
@@ -1468,9 +1526,20 @@ fn download_to_path_single_once(
     let mut downloaded = 0_u64;
     let start = Instant::now();
     let mut last_report = Instant::now();
-    let use_progress = display.shows_progress();
-    let use_tty_line = use_progress && io::stderr().is_terminal();
-    if use_progress && use_tty_line {
+    let progress_context = current_download_progress_context();
+    let print_progress = display.shows_progress();
+    let track_progress = print_progress || progress_context.is_some();
+    let use_tty_line = print_progress && io::stderr().is_terminal();
+    if track_progress {
+        emit_download_progress(
+            progress_context.as_ref(),
+            downloaded,
+            total_bytes,
+            start.elapsed(),
+            false,
+        );
+    }
+    if print_progress && use_tty_line {
         eprint!(
             "\r\x1b[2K{}",
             render_download_progress_line(downloaded, total_bytes, start.elapsed(), true)
@@ -1488,25 +1557,33 @@ fn download_to_path_single_once(
         out.write_all(&chunk[..read])
             .with_context(|| format!("write downloaded file {}", asset_path.display()))?;
         downloaded = downloaded.saturating_add(read as u64);
-        if use_progress {
+        if track_progress {
             report_download_progress(
-                downloaded,
-                total_bytes,
-                start.elapsed(),
                 &mut last_report,
-                false,
-                use_tty_line,
+                DownloadProgressReport {
+                    downloaded,
+                    total_bytes,
+                    elapsed: start.elapsed(),
+                    finished: false,
+                    tty_line: use_tty_line,
+                    print_line: print_progress,
+                    progress_context: progress_context.as_ref(),
+                },
             );
         }
     }
-    if use_progress {
+    if track_progress {
         report_download_progress(
-            downloaded,
-            total_bytes,
-            start.elapsed(),
             &mut last_report,
-            true,
-            use_tty_line,
+            DownloadProgressReport {
+                downloaded,
+                total_bytes,
+                elapsed: start.elapsed(),
+                finished: true,
+                tty_line: use_tty_line,
+                print_line: print_progress,
+                progress_context: progress_context.as_ref(),
+            },
         );
     }
     if let Some(total_bytes) = total_bytes
@@ -1546,16 +1623,20 @@ fn download_to_path_parallel(
     let progress = Arc::new(AtomicU64::new(0));
     let reporter_stop = Arc::new(AtomicBool::new(false));
     let total_bytes = Some(plan.total_bytes);
-    let use_progress = display.shows_progress();
-    let use_tty_line = use_progress && io::stderr().is_terminal();
+    let progress_context = current_download_progress_context();
+    let print_progress = display.shows_progress();
+    let track_progress = print_progress || progress_context.is_some();
+    let use_tty_line = print_progress && io::stderr().is_terminal();
 
-    let mut reporter = use_progress.then(|| {
+    let mut reporter = track_progress.then(|| {
         spawn_parallel_download_reporter(
             Arc::clone(&progress),
             Arc::clone(&reporter_stop),
             total_bytes,
             start,
             use_tty_line,
+            print_progress,
+            progress_context.clone(),
         )
     });
 
@@ -1613,15 +1694,19 @@ fn download_to_path_parallel(
     if let Some(reporter) = reporter.take() {
         let _ = reporter.join();
     }
-    if use_progress {
+    if track_progress {
         let mut last_report = Instant::now();
         report_download_progress(
-            progress.load(Ordering::SeqCst),
-            total_bytes,
-            start.elapsed(),
             &mut last_report,
-            true,
-            use_tty_line,
+            DownloadProgressReport {
+                downloaded: progress.load(Ordering::SeqCst),
+                total_bytes,
+                elapsed: start.elapsed(),
+                finished: true,
+                tty_line: use_tty_line,
+                print_line: print_progress,
+                progress_context: progress_context.as_ref(),
+            },
         );
     }
 
@@ -1636,6 +1721,8 @@ fn spawn_parallel_download_reporter(
     total_bytes: Option<u64>,
     start: Instant,
     tty_line: bool,
+    print_line: bool,
+    progress_context: Option<DownloadProgressContext>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut last_report = Instant::now();
@@ -1651,14 +1738,25 @@ fn spawn_parallel_download_reporter(
             );
             let _ = io::stderr().flush();
         }
+        emit_download_progress(
+            progress_context.as_ref(),
+            progress.load(Ordering::SeqCst),
+            total_bytes,
+            start.elapsed(),
+            false,
+        );
         while !stop.load(Ordering::SeqCst) {
             report_download_progress(
-                progress.load(Ordering::SeqCst),
-                total_bytes,
-                start.elapsed(),
                 &mut last_report,
-                false,
-                tty_line,
+                DownloadProgressReport {
+                    downloaded: progress.load(Ordering::SeqCst),
+                    total_bytes,
+                    elapsed: start.elapsed(),
+                    finished: false,
+                    tty_line,
+                    print_line,
+                    progress_context: progress_context.as_ref(),
+                },
             );
             thread::sleep(Duration::from_millis(150));
         }
@@ -1855,6 +1953,17 @@ pub(super) fn render_download_progress(
     total_bytes: Option<u64>,
     elapsed: Duration,
 ) -> String {
+    format!(
+        "download: {}",
+        render_download_progress_brief(downloaded, total_bytes, elapsed)
+    )
+}
+
+pub(super) fn render_download_progress_brief(
+    downloaded: u64,
+    total_bytes: Option<u64>,
+    elapsed: Duration,
+) -> String {
     let rate = if elapsed.is_zero() {
         0.0
     } else {
@@ -1865,14 +1974,14 @@ pub(super) fn render_download_progress(
         Some(total) if total > 0 => {
             let pct = (downloaded as f64 / total as f64 * 100.0).clamp(0.0, 100.0);
             format!(
-                "download: {} / {} ({pct:.1}%, {}/s)",
+                "{} / {} ({pct:.1}%, {}/s)",
                 format_bytes_u64(downloaded),
                 format_bytes_u64(total),
                 format_bytes_f64(rate)
             )
         }
         _ => format!(
-            "download: {} ({}/s)",
+            "{} ({}/s)",
             format_bytes_u64(downloaded),
             format_bytes_f64(rate)
         ),
@@ -1893,21 +2002,40 @@ fn render_download_progress_line(
     }
 }
 
-fn report_download_progress(
+struct DownloadProgressReport<'a> {
     downloaded: u64,
     total_bytes: Option<u64>,
     elapsed: Duration,
-    last_report: &mut Instant,
-    force: bool,
+    finished: bool,
     tty_line: bool,
-) {
+    print_line: bool,
+    progress_context: Option<&'a DownloadProgressContext>,
+}
+
+fn report_download_progress(last_report: &mut Instant, report: DownloadProgressReport<'_>) {
     let now = Instant::now();
-    if !force && now.duration_since(*last_report) < Duration::from_secs(1) {
+    if !report.finished && now.duration_since(*last_report) < Duration::from_secs(1) {
         return;
     }
-    let line = render_download_progress_line(downloaded, total_bytes, elapsed, tty_line);
-    if tty_line {
-        if force {
+    emit_download_progress(
+        report.progress_context,
+        report.downloaded,
+        report.total_bytes,
+        report.elapsed,
+        report.finished,
+    );
+    if !report.print_line {
+        *last_report = now;
+        return;
+    }
+    let line = render_download_progress_line(
+        report.downloaded,
+        report.total_bytes,
+        report.elapsed,
+        report.tty_line,
+    );
+    if report.tty_line {
+        if report.finished {
             eprint!("\r\x1b[2K{line}\n");
         } else {
             eprint!("\r\x1b[2K{line}");
