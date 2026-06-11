@@ -1,6 +1,8 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+const DEFAULT_CODEX_COMPACT_TIMEOUT_SECS: u64 = 600;
+
 /// Top-level CLI parser
 #[derive(Parser)]
 #[command(name = "za", version)]
@@ -861,7 +863,7 @@ pub enum CodexCommands {
         #[arg(long, default_value = "low")]
         effort: String,
         /// Stop waiting after this many seconds.
-        #[arg(long, value_name = "SECS", default_value_t = 180)]
+        #[arg(long, value_name = "SECS", default_value_t = DEFAULT_CODEX_COMPACT_TIMEOUT_SECS)]
         timeout: u64,
         /// Do not start `za codex resume` after a successful compaction.
         #[arg(long)]
@@ -2261,10 +2263,12 @@ mod tests {
                     Some(CodexCommands::Compact {
                         model,
                         effort,
-                        timeout: 180,
+                        timeout,
                         no_resume: false,
                         verbose: false,
-                    }) if model == "gpt-5.4-mini" && effort == "low"
+                    }) if model == "gpt-5.4-mini"
+                        && effort == "low"
+                        && timeout == super::DEFAULT_CODEX_COMPACT_TIMEOUT_SECS
                 ));
             }
             _ => panic!("unexpected command"),
