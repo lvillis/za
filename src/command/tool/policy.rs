@@ -115,7 +115,6 @@ pub(super) struct ToolPolicy {
     pub(super) layout: ToolLayout,
     pub(super) package: Option<PackagePolicy>,
     pub(super) github_release: Option<GithubReleasePolicy>,
-    pub(super) cargo_fallback_package: Option<&'static str>,
 }
 
 impl ToolPolicy {
@@ -146,12 +145,11 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "codex",
         aliases: &["codex-cli"],
-        source_label: "GitHub Release (SHA-256 verified), cargo install fallback",
+        source_label: "GitHub Release (SHA-256 verified)",
         layout: ToolLayout::Binary,
         package: None,
         github_release: Some(GithubReleasePolicy {
@@ -163,7 +161,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: Some("codex-cli"),
     },
     ToolPolicy {
         canonical_name: "docker-compose",
@@ -180,7 +177,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "rg",
@@ -197,7 +193,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "fd",
@@ -214,7 +209,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "tcping",
@@ -231,7 +225,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "motdyn",
@@ -248,7 +241,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "btm",
@@ -265,7 +257,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "bpftop",
@@ -282,7 +273,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "hyperfine",
@@ -299,7 +289,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "dust",
@@ -316,7 +305,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "just",
@@ -333,7 +321,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "oha",
@@ -350,7 +337,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "actionlint",
@@ -367,7 +353,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "sccache",
@@ -384,7 +369,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "starship",
@@ -401,7 +385,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "git-cliff",
@@ -418,7 +401,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "cargo-release",
@@ -435,7 +417,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "cargo-nextest",
@@ -452,7 +433,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "cargo-fuzz",
@@ -469,7 +449,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "cross",
@@ -486,7 +465,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
             verification: GithubReleaseVerification::NoSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
-        cargo_fallback_package: None,
     },
     ToolPolicy {
         canonical_name: "ble.sh",
@@ -510,7 +488,6 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
                 version_prefix: "nightly-",
             },
         }),
-        cargo_fallback_package: None,
     },
 ];
 

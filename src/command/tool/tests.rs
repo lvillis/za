@@ -561,6 +561,7 @@ fn tool_policy_matches_alias_and_canonical() {
     let codex = find_tool_policy("codex").expect("canonical policy");
     assert_eq!(codex_alias.canonical_name, "codex");
     assert_eq!(codex.canonical_name, "codex");
+    assert_eq!(codex.source_label, "GitHub Release (SHA-256 verified)");
     let rg_alias = find_tool_policy("ripgrep").expect("alias policy");
     let rg = find_tool_policy("rg").expect("canonical policy");
     assert_eq!(rg_alias.canonical_name, "rg");
@@ -575,7 +576,6 @@ fn tool_policy_matches_alias_and_canonical() {
     assert_eq!(tcping.canonical_name, "tcping");
     let motdyn = find_tool_policy("motdyn").expect("canonical policy");
     assert_eq!(motdyn.canonical_name, "motdyn");
-    assert_eq!(motdyn.cargo_fallback_package, None);
     assert_eq!(motdyn.source_label, "GitHub Release (SHA-256 verified)");
     assert_eq!(
         motdyn.github_release.expect("github policy").verification,
@@ -585,7 +585,6 @@ fn tool_policy_matches_alias_and_canonical() {
     let bottom = find_tool_policy("btm").expect("canonical policy");
     assert_eq!(bottom_alias.canonical_name, "btm");
     assert_eq!(bottom.canonical_name, "btm");
-    assert_eq!(bottom.cargo_fallback_package, None);
     assert_eq!(bottom.source_label, "GitHub Release (SHA-256 verified)");
     assert_eq!(
         bottom.github_release.expect("github policy").verification,
@@ -593,7 +592,6 @@ fn tool_policy_matches_alias_and_canonical() {
     );
     let bpftop = find_tool_policy("bpftop").expect("canonical policy");
     assert_eq!(bpftop.canonical_name, "bpftop");
-    assert_eq!(bpftop.cargo_fallback_package, None);
     assert_eq!(bpftop.source_label, "GitHub Release (SHA-256 verified)");
     assert_eq!(
         bpftop.github_release.expect("github policy").verification,
@@ -601,7 +599,6 @@ fn tool_policy_matches_alias_and_canonical() {
     );
     let hyperfine = find_tool_policy("hyperfine").expect("canonical policy");
     assert_eq!(hyperfine.canonical_name, "hyperfine");
-    assert_eq!(hyperfine.cargo_fallback_package, None);
     assert_eq!(hyperfine.source_label, "GitHub Release (SHA-256 verified)");
     assert_eq!(
         hyperfine
@@ -616,7 +613,6 @@ fn tool_policy_matches_alias_and_canonical() {
     assert_eq!(oha.canonical_name, "oha");
     let actionlint = find_tool_policy("actionlint").expect("canonical policy");
     assert_eq!(actionlint.canonical_name, "actionlint");
-    assert_eq!(actionlint.cargo_fallback_package, None);
     assert_eq!(actionlint.source_label, "GitHub Release (SHA-256 verified)");
     assert_eq!(
         actionlint
@@ -627,7 +623,6 @@ fn tool_policy_matches_alias_and_canonical() {
     );
     let sccache = find_tool_policy("sccache").expect("canonical policy");
     assert_eq!(sccache.canonical_name, "sccache");
-    assert_eq!(sccache.cargo_fallback_package, None);
     assert_eq!(sccache.source_label, "GitHub Release (SHA-256 verified)");
     assert_eq!(
         sccache.github_release.expect("github policy").verification,
@@ -635,7 +630,6 @@ fn tool_policy_matches_alias_and_canonical() {
     );
     let starship = find_tool_policy("starship").expect("canonical policy");
     assert_eq!(starship.canonical_name, "starship");
-    assert_eq!(starship.cargo_fallback_package, None);
     assert_eq!(starship.source_label, "GitHub Release (SHA-256 verified)");
     assert_eq!(
         starship.github_release.expect("github policy").verification,
@@ -643,7 +637,6 @@ fn tool_policy_matches_alias_and_canonical() {
     );
     let git_cliff = find_tool_policy("git-cliff").expect("canonical policy");
     assert_eq!(git_cliff.canonical_name, "git-cliff");
-    assert_eq!(git_cliff.cargo_fallback_package, None);
     assert_eq!(git_cliff.source_label, "GitHub Release (SHA-256 verified)");
     assert_eq!(
         git_cliff
@@ -654,7 +647,6 @@ fn tool_policy_matches_alias_and_canonical() {
     );
     let cargo_release = find_tool_policy("cargo-release").expect("canonical policy");
     assert_eq!(cargo_release.canonical_name, "cargo-release");
-    assert_eq!(cargo_release.cargo_fallback_package, None);
     assert_eq!(
         cargo_release.source_label,
         "GitHub Release (SHA-256 verified)"
@@ -668,7 +660,6 @@ fn tool_policy_matches_alias_and_canonical() {
     );
     let nextest = find_tool_policy("cargo-nextest").expect("canonical policy");
     assert_eq!(nextest.canonical_name, "cargo-nextest");
-    assert_eq!(nextest.cargo_fallback_package, None);
     assert_eq!(nextest.source_label, "GitHub Release (SHA-256 verified)");
     assert_eq!(
         nextest.github_release.expect("github policy").verification,
@@ -676,7 +667,6 @@ fn tool_policy_matches_alias_and_canonical() {
     );
     let cargo_fuzz = find_tool_policy("cargo-fuzz").expect("canonical policy");
     assert_eq!(cargo_fuzz.canonical_name, "cargo-fuzz");
-    assert_eq!(cargo_fuzz.cargo_fallback_package, None);
     assert_eq!(cargo_fuzz.source_label, "GitHub Release (SHA-256 verified)");
     assert_eq!(
         cargo_fuzz
@@ -687,7 +677,6 @@ fn tool_policy_matches_alias_and_canonical() {
     );
     let cross = find_tool_policy("cross").expect("canonical policy");
     assert_eq!(cross.canonical_name, "cross");
-    assert_eq!(cross.cargo_fallback_package, None);
     assert_eq!(
         cross.source_label,
         "GitHub Release (SHA-256 unavailable; unverified)"
@@ -700,7 +689,6 @@ fn tool_policy_matches_alias_and_canonical() {
     let blesh = find_tool_policy("ble.sh").expect("canonical policy");
     assert_eq!(blesh_alias.canonical_name, "ble.sh");
     assert_eq!(blesh.canonical_name, "ble.sh");
-    assert_eq!(blesh.cargo_fallback_package, None);
     assert_eq!(
         blesh.source_label,
         "GitHub nightly rolling release (commit-tracked; SHA-256 unavailable)"

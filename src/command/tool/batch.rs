@@ -385,13 +385,12 @@ fn materialize_tool_batch_parallel(
                         progress.set_message(task.plan.tool.name.clone());
                     }
                     let tool_name = task.plan.tool.name.clone();
-                    let materialized = if let Some(sink) = progress_sink.clone() {
-                        source::with_download_progress_context(tool_name.clone(), sink, || {
-                            materialize_install_plan(&home, &task.plan, task.materialize_options)
-                        })
-                    } else {
-                        materialize_install_plan(&home, &task.plan, task.materialize_options)
-                    };
+                    let materialized = materialize_install_plan(
+                        &home,
+                        &task.plan,
+                        task.materialize_options,
+                        progress_sink.clone(),
+                    );
                     clear_batch_download_state(
                         &download_states,
                         progress.as_ref(),

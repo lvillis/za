@@ -4,7 +4,6 @@ use flate2::read::GzDecoder;
 use semver::Version;
 use serde::de::DeserializeOwned;
 use std::{
-    cell::RefCell,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -15,8 +14,7 @@ use tar::Archive;
 use xz2::read::XzDecoder;
 
 const TEMP_DIR_PREFIX_DOWNLOAD: &str = "za-tool-download";
-const TEMP_DIR_PREFIX_CARGO_INSTALL: &str = "za-tool-cargo-install";
-const TEMP_DIR_PREFIXES: [&str; 2] = [TEMP_DIR_PREFIX_DOWNLOAD, TEMP_DIR_PREFIX_CARGO_INSTALL];
+const TEMP_DIR_PREFIXES: [&str; 1] = [TEMP_DIR_PREFIX_DOWNLOAD];
 const DOWNLOAD_READ_CHUNK_SIZE: usize = 64 * 1024;
 const PARALLEL_DOWNLOAD_MIN_BYTES: u64 = 2 * 1024 * 1024;
 const PARALLEL_DOWNLOAD_MIN_PART_BYTES: u64 = 1024 * 1024;
@@ -30,14 +28,19 @@ static ACTIVE_TEMP_DIRS: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static TEMP_DIR_NONCE: AtomicU64 = AtomicU64::new(0);
 
-thread_local! {
-    static DOWNLOAD_PROGRESS_CONTEXT: RefCell<Option<DownloadProgressContext>> = const { RefCell::new(None) };
-}
-
 #[derive(Clone)]
-pub(super) struct DownloadProgressContext {
+pub(super) struct DownloadProgressReporter {
     tool: String,
     sink: DownloadProgressSink,
+}
+
+impl DownloadProgressReporter {
+    pub(super) fn new(tool: impl Into<String>, sink: DownloadProgressSink) -> Self {
+        Self {
+            tool: tool.into(),
+            sink,
+        }
+    }
 }
 
 pub(super) type DownloadProgressSink = Arc<dyn Fn(DownloadProgress) + Send + Sync + 'static>;
@@ -49,6 +52,42 @@ pub(super) struct DownloadProgress {
     pub(super) total_bytes: Option<u64>,
     pub(super) elapsed: Duration,
     pub(super) finished: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DownloadFeedback<'a> {
+    display: DownloadDisplay,
+    reporter: Option<&'a DownloadProgressReporter>,
+}
+
+impl<'a> DownloadFeedback<'a> {
+    fn new(display: DownloadDisplay, reporter: Option<&'a DownloadProgressReporter>) -> Self {
+        Self { display, reporter }
+    }
+
+    fn is_detailed(self) -> bool {
+        self.display.is_detailed()
+    }
+
+    fn shows_progress(self) -> bool {
+        self.display.shows_progress()
+    }
+
+    fn tracks_progress(self) -> bool {
+        self.shows_progress() || self.reporter.is_some()
+    }
+
+    fn tty_line(self) -> bool {
+        self.shows_progress() && io::stderr().is_terminal()
+    }
+
+    fn interactive(self) -> bool {
+        self.tty_line()
+    }
+
+    fn reporter(self) -> Option<&'a DownloadProgressReporter> {
+        self.reporter
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,34 +192,16 @@ pub(super) fn cleanup_stale_temp_dirs() -> usize {
     removed
 }
 
-pub(super) fn with_download_progress_context<T>(
-    tool: String,
-    sink: DownloadProgressSink,
-    run: impl FnOnce() -> T,
-) -> T {
-    let context = DownloadProgressContext { tool, sink };
-    DOWNLOAD_PROGRESS_CONTEXT.with(|slot| {
-        let previous = slot.replace(Some(context));
-        let result = run();
-        slot.replace(previous);
-        result
-    })
-}
-
-fn current_download_progress_context() -> Option<DownloadProgressContext> {
-    DOWNLOAD_PROGRESS_CONTEXT.with(|slot| slot.borrow().clone())
-}
-
 fn emit_download_progress(
-    context: Option<&DownloadProgressContext>,
+    reporter: Option<&DownloadProgressReporter>,
     downloaded: u64,
     total_bytes: Option<u64>,
     elapsed: Duration,
     finished: bool,
 ) {
-    if let Some(context) = context {
-        (context.sink)(DownloadProgress {
-            tool: context.tool.clone(),
+    if let Some(reporter) = reporter {
+        (reporter.sink)(DownloadProgress {
+            tool: reporter.tool.clone(),
             downloaded,
             total_bytes,
             elapsed,
@@ -254,6 +275,7 @@ pub(super) fn resolve_install_source(
     tool: &ToolRef,
     proxy_scope: za_config::ProxyScope,
     display: DownloadDisplay,
+    progress_sink: Option<DownloadProgressSink>,
 ) -> Result<PullSource> {
     ensure_not_interrupted()?;
 
@@ -261,26 +283,25 @@ pub(super) fn resolve_install_source(
         bail!("{}", unsupported_tool_message(&tool.name));
     };
 
-    let mut errors = Vec::new();
+    let progress_reporter =
+        progress_sink.map(|sink| DownloadProgressReporter::new(tool.name.clone(), sink));
 
-    if let Some(release) = policy.github_release {
-        match download_from_github_release(tool, policy.layout, release, proxy_scope, display) {
-            Ok(src) => return Ok(src),
-            Err(err) => errors.push(format!("github release: {err:#}")),
-        }
-    }
-    if let Some(package) = policy.cargo_fallback_package {
-        match install_from_cargo_package(tool, package) {
-            Ok(src) => return Ok(src),
-            Err(err) => errors.push(format!("cargo install: {err:#}")),
-        }
-    }
+    let Some(release) = policy.github_release else {
+        bail!(
+            "GitHub Release source is not configured for `{}`",
+            tool.name
+        );
+    };
 
-    bail!(
-        "failed to resolve source for `{}` via automatic policies:\n- {}",
-        tool.name,
-        errors.join("\n- ")
+    download_from_github_release(
+        tool,
+        policy.layout,
+        release,
+        proxy_scope,
+        display,
+        progress_reporter.as_ref(),
     )
+    .with_context(|| format!("resolve GitHub Release source for `{}`", tool.name))
 }
 
 pub(super) fn preview_install_source(
@@ -293,26 +314,15 @@ pub(super) fn preview_install_source(
         bail!("{}", unsupported_tool_message(&tool.name));
     };
 
-    let mut errors = Vec::new();
+    let Some(release) = policy.github_release else {
+        bail!(
+            "GitHub Release source is not configured for `{}`",
+            tool.name
+        );
+    };
 
-    if let Some(release) = policy.github_release {
-        match preview_github_release_source(tool, release, proxy_scope) {
-            Ok(source) => return Ok(source),
-            Err(err) => errors.push(format!("github release: {err:#}")),
-        }
-    }
-    if let Some(package) = policy.cargo_fallback_package {
-        return Ok(InstallSource {
-            kind: SOURCE_KIND_CARGO_INSTALL,
-            detail: format!("cargo install {package}"),
-        });
-    }
-
-    bail!(
-        "failed to resolve source for `{}` via automatic policies:\n- {}",
-        tool.name,
-        errors.join("\n- ")
-    )
+    preview_github_release_source(tool, release, proxy_scope)
+        .with_context(|| format!("preview GitHub Release source for `{}`", tool.name))
 }
 
 #[derive(Debug, Deserialize)]
@@ -625,6 +635,7 @@ fn download_from_github_release(
     release_policy: GithubReleasePolicy,
     proxy_scope: za_config::ProxyScope,
     display: DownloadDisplay,
+    progress_reporter: Option<&DownloadProgressReporter>,
 ) -> Result<PullSource> {
     let (asset, expected_sha256) = resolve_github_release_asset(tool, release_policy, proxy_scope)?;
 
@@ -632,12 +643,13 @@ fn download_from_github_release(
         ToolLayout::Binary => DownloadExtractionMode::PrimaryEntry(tool),
         ToolLayout::Package => DownloadExtractionMode::KeepArchive,
     };
+    let feedback = DownloadFeedback::new(display, progress_reporter);
     download_from_url(
         &asset.browser_download_url,
         expected_sha256.as_deref(),
         proxy_scope,
         extraction,
-        display,
+        feedback,
     )
 }
 
@@ -787,74 +799,6 @@ pub(super) fn parse_rolling_asset_version(
         return None;
     }
     Some(format!("{version_prefix}{middle}"))
-}
-
-fn install_from_cargo_package(tool: &ToolRef, package: &str) -> Result<PullSource> {
-    ensure_not_interrupted()?;
-    let install_root = unique_temp_dir(TEMP_DIR_PREFIX_CARGO_INSTALL)?;
-    let run = (|| -> Result<PullSource> {
-        let root_arg = install_root.to_string_lossy().to_string();
-        let version = normalize_version(&tool.version);
-
-        let output = Command::new("cargo")
-            .arg("install")
-            .arg("--locked")
-            .arg("--version")
-            .arg(&version)
-            .arg(package)
-            .arg("--root")
-            .arg(&root_arg)
-            .output()
-            .context("run `cargo install`")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("`cargo install` failed: {}", stderr.trim());
-        }
-        ensure_not_interrupted()?;
-
-        let bin_dir = install_root.join("bin");
-        let mut candidates = command_candidates(&tool.name);
-        if !candidates.iter().any(|c| c == "codex") {
-            candidates.push("codex".to_string());
-        }
-
-        for candidate in candidates {
-            let p = bin_dir.join(&candidate);
-            if is_executable_file(&p) {
-                return Ok(PullSource::temp(
-                    SOURCE_KIND_CARGO_INSTALL,
-                    PullArtifactKind::File,
-                    p,
-                    format!("cargo install {package}"),
-                    install_root.clone(),
-                ));
-            }
-        }
-
-        let mut files = Vec::new();
-        collect_files_recursive(&bin_dir, &mut files)?;
-        if files.len() == 1 {
-            return Ok(PullSource::temp(
-                SOURCE_KIND_CARGO_INSTALL,
-                PullArtifactKind::File,
-                files.remove(0),
-                format!("cargo install {package}"),
-                install_root.clone(),
-            ));
-        }
-
-        bail!(
-            "could not determine installed executable in {}",
-            bin_dir.display()
-        )
-    })();
-
-    if run.is_err() {
-        unregister_temp_dir(&install_root);
-        let _ = fs::remove_dir_all(&install_root);
-    }
-    run
 }
 
 const HTTPS_PROXY_ENV_KEYS: [&str; 6] = [
@@ -1216,7 +1160,7 @@ fn download_from_url(
     expected_sha256: Option<&str>,
     proxy_scope: za_config::ProxyScope,
     extraction: DownloadExtractionMode<'_>,
-    display: DownloadDisplay,
+    feedback: DownloadFeedback<'_>,
 ) -> Result<PullSource> {
     ensure_not_interrupted()?;
     let download_root = unique_temp_dir(TEMP_DIR_PREFIX_DOWNLOAD)?;
@@ -1224,11 +1168,11 @@ fn download_from_url(
         let url_parts = parse_url_parts(url)?;
         let asset_name = url_parts.file_name.clone();
         let asset_path = download_root.join(&asset_name);
-        let interactive = display.shows_progress() && io::stderr().is_terminal();
+        let interactive = feedback.interactive();
 
         let client = build_http_client(&url_parts.base_url, "za-tool-manager", true, proxy_scope)
             .context("build HTTP client")?;
-        if display.is_detailed() {
+        if feedback.is_detailed() {
             print_download_stage(
                 interactive,
                 "download",
@@ -1244,7 +1188,7 @@ fn download_from_url(
         let total_bytes = (probe.total_bytes > 0).then_some(probe.total_bytes);
 
         if let Some(plan) = build_parallel_download_plan(probe.total_bytes, probe.range_supported) {
-            if display.is_detailed() {
+            if feedback.is_detailed() {
                 print_download_stage(
                     interactive,
                     "download",
@@ -1261,7 +1205,7 @@ fn download_from_url(
                 &asset_path,
                 proxy_scope,
                 plan,
-                display,
+                feedback,
             ) {
                 Ok(()) => {}
                 Err(ParallelDownloadError::Unsupported) => {
@@ -1277,7 +1221,7 @@ fn download_from_url(
                             asset_path: &asset_path,
                             total_bytes,
                         },
-                        display,
+                        feedback,
                     )?;
                 }
                 Err(ParallelDownloadError::Failed(err)) => {
@@ -1294,12 +1238,12 @@ fn download_from_url(
                             asset_path: &asset_path,
                             total_bytes,
                         },
-                        display,
+                        feedback,
                     )?;
                 }
             }
         } else {
-            if display.is_detailed() {
+            if feedback.is_detailed() {
                 print_download_stage(interactive, "download", "single-stream transfer");
             }
             download_to_path_single(
@@ -1308,14 +1252,14 @@ fn download_from_url(
                 url,
                 &asset_path,
                 total_bytes,
-                display,
+                feedback,
             )?;
         }
         ensure_not_interrupted()?;
 
         if let Some(expected_sha256) = expected_sha256 {
             verify_sha256_file(&asset_path, expected_sha256)?;
-            if display.is_detailed() {
+            if feedback.is_detailed() {
                 print_download_stage(interactive, "verify", "sha256 ok");
             }
         }
@@ -1329,7 +1273,7 @@ fn download_from_url(
             }
             DownloadExtractionMode::PrimaryEntry(tool) => {
                 let resolved_path = if detect_archive_kind(&asset_name).is_some() {
-                    if display.is_detailed() {
+                    if feedback.is_detailed() {
                         print_download_stage(interactive, "extract", &asset_name);
                     }
                     extract_archive_primary_entry(tool, &asset_path, &download_root)?
@@ -1353,6 +1297,7 @@ fn download_from_url(
     })();
 
     if run.is_err() {
+        emit_download_progress(feedback.reporter(), 0, None, Duration::ZERO, true);
         unregister_temp_dir(&download_root);
         let _ = fs::remove_dir_all(&download_root);
     }
@@ -1363,15 +1308,15 @@ fn retry_single_stream_after_parallel_failure(
     interactive: bool,
     reason: String,
     request: SingleStreamDownload<'_>,
-    display: DownloadDisplay,
+    feedback: DownloadFeedback<'_>,
 ) -> Result<()> {
     if interactive {
         finish_download_tty_line();
     }
-    if display.shows_progress() {
+    if feedback.shows_progress() {
         print_download_stage(interactive, "download", reason);
     }
-    if display.is_detailed() {
+    if feedback.is_detailed() {
         print_download_stage(interactive, "download", "single-stream transfer");
     }
     download_to_path_single(
@@ -1380,7 +1325,7 @@ fn retry_single_stream_after_parallel_failure(
         request.url,
         request.asset_path,
         request.total_bytes,
-        display,
+        feedback,
     )
 }
 
@@ -1469,9 +1414,9 @@ fn download_to_path_single(
     url: &str,
     asset_path: &Path,
     known_total_bytes: Option<u64>,
-    display: DownloadDisplay,
+    feedback: DownloadFeedback<'_>,
 ) -> Result<()> {
-    let interactive = display.shows_progress() && io::stderr().is_terminal();
+    let interactive = feedback.interactive();
     let asset_label = asset_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -1485,7 +1430,7 @@ fn download_to_path_single(
             url,
             asset_path,
             known_total_bytes,
-            display,
+            feedback,
         )
     })
 }
@@ -1496,7 +1441,7 @@ fn download_to_path_single_once(
     url: &str,
     asset_path: &Path,
     known_total_bytes: Option<u64>,
-    display: DownloadDisplay,
+    feedback: DownloadFeedback<'_>,
 ) -> Result<()> {
     let req = build_download_request(client, path_and_query, None)?;
     let mut resp = req
@@ -1526,13 +1471,12 @@ fn download_to_path_single_once(
     let mut downloaded = 0_u64;
     let start = Instant::now();
     let mut last_report = Instant::now();
-    let progress_context = current_download_progress_context();
-    let print_progress = display.shows_progress();
-    let track_progress = print_progress || progress_context.is_some();
-    let use_tty_line = print_progress && io::stderr().is_terminal();
+    let print_progress = feedback.shows_progress();
+    let track_progress = feedback.tracks_progress();
+    let use_tty_line = feedback.tty_line();
     if track_progress {
         emit_download_progress(
-            progress_context.as_ref(),
+            feedback.reporter(),
             downloaded,
             total_bytes,
             start.elapsed(),
@@ -1567,7 +1511,7 @@ fn download_to_path_single_once(
                     finished: false,
                     tty_line: use_tty_line,
                     print_line: print_progress,
-                    progress_context: progress_context.as_ref(),
+                    progress_reporter: feedback.reporter(),
                 },
             );
         }
@@ -1582,7 +1526,7 @@ fn download_to_path_single_once(
                 finished: true,
                 tty_line: use_tty_line,
                 print_line: print_progress,
-                progress_context: progress_context.as_ref(),
+                progress_reporter: feedback.reporter(),
             },
         );
     }
@@ -1606,7 +1550,7 @@ fn download_to_path_parallel(
     asset_path: &Path,
     proxy_scope: za_config::ProxyScope,
     plan: ParallelDownloadPlan,
-    display: DownloadDisplay,
+    feedback: DownloadFeedback<'_>,
 ) -> Result<(), ParallelDownloadError> {
     let part_paths = split_download_ranges(plan)
         .into_iter()
@@ -1623,10 +1567,9 @@ fn download_to_path_parallel(
     let progress = Arc::new(AtomicU64::new(0));
     let reporter_stop = Arc::new(AtomicBool::new(false));
     let total_bytes = Some(plan.total_bytes);
-    let progress_context = current_download_progress_context();
-    let print_progress = display.shows_progress();
-    let track_progress = print_progress || progress_context.is_some();
-    let use_tty_line = print_progress && io::stderr().is_terminal();
+    let print_progress = feedback.shows_progress();
+    let track_progress = feedback.tracks_progress();
+    let use_tty_line = feedback.tty_line();
 
     let mut reporter = track_progress.then(|| {
         spawn_parallel_download_reporter(
@@ -1636,7 +1579,7 @@ fn download_to_path_parallel(
             start,
             use_tty_line,
             print_progress,
-            progress_context.clone(),
+            feedback.reporter().cloned(),
         )
     });
 
@@ -1705,7 +1648,7 @@ fn download_to_path_parallel(
                 finished: true,
                 tty_line: use_tty_line,
                 print_line: print_progress,
-                progress_context: progress_context.as_ref(),
+                progress_reporter: feedback.reporter(),
             },
         );
     }
@@ -1722,7 +1665,7 @@ fn spawn_parallel_download_reporter(
     start: Instant,
     tty_line: bool,
     print_line: bool,
-    progress_context: Option<DownloadProgressContext>,
+    progress_reporter: Option<DownloadProgressReporter>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut last_report = Instant::now();
@@ -1739,7 +1682,7 @@ fn spawn_parallel_download_reporter(
             let _ = io::stderr().flush();
         }
         emit_download_progress(
-            progress_context.as_ref(),
+            progress_reporter.as_ref(),
             progress.load(Ordering::SeqCst),
             total_bytes,
             start.elapsed(),
@@ -1755,7 +1698,7 @@ fn spawn_parallel_download_reporter(
                     finished: false,
                     tty_line,
                     print_line,
-                    progress_context: progress_context.as_ref(),
+                    progress_reporter: progress_reporter.as_ref(),
                 },
             );
             thread::sleep(Duration::from_millis(150));
@@ -2009,7 +1952,7 @@ struct DownloadProgressReport<'a> {
     finished: bool,
     tty_line: bool,
     print_line: bool,
-    progress_context: Option<&'a DownloadProgressContext>,
+    progress_reporter: Option<&'a DownloadProgressReporter>,
 }
 
 fn report_download_progress(last_report: &mut Instant, report: DownloadProgressReport<'_>) {
@@ -2018,7 +1961,7 @@ fn report_download_progress(last_report: &mut Instant, report: DownloadProgressR
         return;
     }
     emit_download_progress(
-        report.progress_context,
+        report.progress_reporter,
         report.downloaded,
         report.total_bytes,
         report.elapsed,
@@ -2231,7 +2174,7 @@ fn unique_temp_dir(prefix: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DownloadDisplay, DownloadExtractionMode, DownloadRange, GithubRelease,
+        DownloadDisplay, DownloadExtractionMode, DownloadFeedback, DownloadRange, GithubRelease,
         ParallelDownloadPlan, TEMP_DIR_PREFIX_DOWNLOAD, build_parallel_download_plan,
         download_from_url, latest_prerelease_version_for_channel,
         latest_stable_version_for_latest_release, latest_stable_version_for_tags,
@@ -2391,10 +2334,6 @@ mod tests {
             matched_temp_prefix("za-tool-download-1-2"),
             Some("za-tool-download")
         );
-        assert_eq!(
-            matched_temp_prefix("za-tool-cargo-install-1-2"),
-            Some("za-tool-cargo-install")
-        );
         assert_eq!(matched_temp_prefix("za-other-1-2"), None);
     }
 
@@ -2492,7 +2431,7 @@ mod tests {
             None,
             za_config::ProxyScope::Tool,
             DownloadExtractionMode::KeepArchive,
-            DownloadDisplay::Detailed,
+            DownloadFeedback::new(DownloadDisplay::Detailed, None),
         )
         .expect("single-stream retry should succeed");
         let downloaded = std::fs::read(&pull.path).expect("read downloaded asset");
@@ -2539,7 +2478,7 @@ mod tests {
             None,
             za_config::ProxyScope::Tool,
             DownloadExtractionMode::KeepArchive,
-            DownloadDisplay::Detailed,
+            DownloadFeedback::new(DownloadDisplay::Detailed, None),
         )
         .expect("download succeeds after single-stream fallback");
         let downloaded = std::fs::read(&pull.path).expect("read downloaded asset");

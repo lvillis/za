@@ -67,7 +67,6 @@ const SELF_UPDATE_BACKUP_DIR: &str = ".self-update";
 const SELF_UPDATE_BACKUP_PREFIX: &str = "za-self-backup-";
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 const SOURCE_KIND_DOWNLOAD: &str = "download";
-const SOURCE_KIND_CARGO_INSTALL: &str = "cargo-install";
 const SOURCE_KIND_ADOPTED: &str = "adopted";
 const SOURCE_KIND_SYNTHESIZED: &str = "synthesized";
 const IDE_TERMINAL_BASH_HELPER_START_MARKER: &str = "# >>> za ide-terminal (bash) >>>";
@@ -1328,7 +1327,7 @@ fn install(home: &ToolHome, requested: ToolSpec, options: InstallOptions) -> Res
         });
     }
 
-    materialize_install_plan(home, &plan, options)?;
+    materialize_install_plan(home, &plan, options, None)?;
     activate_install_plan(home, &plan, options)?;
 
     Ok(InstallResult {
@@ -1427,6 +1426,7 @@ fn materialize_install_plan(
     home: &ToolHome,
     plan: &InstallPlan,
     options: InstallOptions,
+    download_progress_sink: Option<source::DownloadProgressSink>,
 ) -> Result<()> {
     let tool = &plan.tool;
     if !plan.already_installed {
@@ -1435,28 +1435,31 @@ fn materialize_install_plan(
             fs::create_dir_all(parent)?;
         }
 
-        let source = if let Some(adopted) =
-            plan.adoption.as_ref().filter(|a| a.version == tool.version)
-        {
-            print_tool_stage_if(
-                options.emit_stages,
-                "source",
-                format!("adopting existing binary {}", adopted.path.display()),
-            );
-            copy_executable(&adopted.path, &dst)?;
-            InstallSource {
-                kind: SOURCE_KIND_ADOPTED,
-                detail: format!("existing binary {}", adopted.path.display()),
-            }
-        } else {
-            ensure_not_interrupted()?;
-            print_tool_stage_if(
-                options.emit_stages,
-                "source",
-                format!("fetching `{}` {}", tool.name, tool.version),
-            );
-            let src =
-                match resolve_install_source(tool, options.proxy_scope, options.download_display) {
+        let source =
+            if let Some(adopted) = plan.adoption.as_ref().filter(|a| a.version == tool.version) {
+                print_tool_stage_if(
+                    options.emit_stages,
+                    "source",
+                    format!("adopting existing binary {}", adopted.path.display()),
+                );
+                copy_executable(&adopted.path, &dst)?;
+                InstallSource {
+                    kind: SOURCE_KIND_ADOPTED,
+                    detail: format!("existing binary {}", adopted.path.display()),
+                }
+            } else {
+                ensure_not_interrupted()?;
+                print_tool_stage_if(
+                    options.emit_stages,
+                    "source",
+                    format!("fetching `{}` {}", tool.name, tool.version),
+                );
+                let src = match resolve_install_source(
+                    tool,
+                    options.proxy_scope,
+                    options.download_display,
+                    download_progress_sink,
+                ) {
                     Ok(src) => src,
                     Err(err) => {
                         return Err(match install_source_failure_guidance(&err) {
@@ -1465,13 +1468,13 @@ fn materialize_install_plan(
                         });
                     }
                 };
-            ensure_not_interrupted()?;
-            materialize_pulled_tool(home, tool, &src)?;
-            InstallSource {
-                kind: src.kind,
-                detail: src.resolved_by.clone(),
-            }
-        };
+                ensure_not_interrupted()?;
+                materialize_pulled_tool(home, tool, &src)?;
+                InstallSource {
+                    kind: src.kind,
+                    detail: src.resolved_by.clone(),
+                }
+            };
         write_manifest(home, tool, &source)?;
         print_tool_stage_if(
             options.emit_stages,
