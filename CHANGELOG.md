@@ -1,8 +1,18 @@
+## [0.1.87] - 2026-06-11
+
+### 🐛 Bug Fixes
+
+- *(tool)* Use GitHub releases as the only tool source
+- *(codex)* Extend compact default timeout
 ## [0.1.86] - 2026-06-10
 
 ### 🚀 Features
 
 - *(tool)* Show per-tool download progress in batch updates
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.86
 ## [0.1.85] - 2026-06-06
 
 ### 🐛 Bug Fixes
