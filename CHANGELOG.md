@@ -1,8 +1,17 @@
+## [0.1.89] - 2026-06-12
+
+### 🐛 Bug Fixes
+
+- *(tool)* Align system installs with user-scoped tools
 ## [0.1.88] - 2026-06-12
 
 ### 🐛 Bug Fixes
 
 - *(ci)* Use actions cache and show failed steps
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.88
 ## [0.1.87] - 2026-06-11
 
 ### 🐛 Bug Fixes
