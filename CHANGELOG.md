@@ -1,9 +1,18 @@
+## [0.1.88] - 2026-06-12
+
+### 🐛 Bug Fixes
+
+- *(ci)* Use actions cache and show failed steps
 ## [0.1.87] - 2026-06-11
 
 ### 🐛 Bug Fixes
 
 - *(tool)* Use GitHub releases as the only tool source
 - *(codex)* Extend compact default timeout
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.87
 ## [0.1.86] - 2026-06-10
 
 ### 🚀 Features
