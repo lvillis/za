@@ -11,8 +11,6 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-const GLOBAL_STORE_DIR: &str = "/var/lib/za/tools/store";
-const GLOBAL_CURRENT_DIR: &str = "/var/lib/za/tools/current";
 const IDE_AGENT_SHIM_MANAGED_MARKER_PREFIX: &str = "# za-managed: ide-agent-shim";
 
 pub fn run(tool: &str, args: &[String]) -> Result<i32> {
@@ -70,28 +68,20 @@ fn has_path_component(name: &str) -> bool {
 }
 
 fn resolve_user_managed_active(name: &str) -> Result<Option<PathBuf>> {
-    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+    let Ok(store_dir) = crate::command::paths::user_tool_store_dir() else {
         return Ok(None);
     };
-    let data_home = env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/share"));
-    let state_home = env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/state"));
-
-    resolve_managed_active(
-        name,
-        &data_home.join("za/tools/store"),
-        &state_home.join("za/tools/current"),
-    )
+    let Ok(current_dir) = crate::command::paths::user_tool_current_dir() else {
+        return Ok(None);
+    };
+    resolve_managed_active(name, &store_dir, &current_dir)
 }
 
 fn resolve_global_managed_active(name: &str) -> Result<Option<PathBuf>> {
     resolve_managed_active(
         name,
-        Path::new(GLOBAL_STORE_DIR),
-        Path::new(GLOBAL_CURRENT_DIR),
+        Path::new(crate::command::paths::GLOBAL_TOOL_STORE_DIR),
+        Path::new(crate::command::paths::GLOBAL_TOOL_CURRENT_DIR),
     )
 }
 

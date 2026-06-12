@@ -54,7 +54,7 @@ use self::source::{resolve_install_source, resolve_requested_version};
 use self::{batch::*, integrations::*, state::*};
 use crate::{
     cli::ToolCommands,
-    command::{render as text_render, style as tty_style, write_file_atomically, za_config},
+    command::{paths, render as text_render, style as tty_style, write_file_atomically, za_config},
 };
 
 const HTTP_TIMEOUT_SECS: u64 = 300;
@@ -584,7 +584,7 @@ pub fn update_self(
     if let Err(err) = home.ensure_layout() {
         if home.scope == ToolScope::Global {
             return Err(err).with_context(|| {
-                "cannot initialize global tool directories. retry with `za update --user` or run with elevated privileges"
+                "cannot initialize global update directories. retry with `sudo /usr/local/bin/za update --global`"
                     .to_string()
             });
         }
@@ -594,7 +594,7 @@ pub fn update_self(
         Ok(lock) => lock,
         Err(err) if home.scope == ToolScope::Global => {
             return Err(err).with_context(|| {
-                "cannot acquire global tool lock. retry with `za update --user` or run with elevated privileges"
+                "cannot acquire global update lock. retry with `sudo /usr/local/bin/za update --global`"
                     .to_string()
             });
         }
@@ -1093,32 +1093,16 @@ impl ToolHome {
         match scope {
             ToolScope::Global => Ok(Self {
                 scope,
-                store_dir: PathBuf::from("/var/lib/za/tools/store"),
-                current_dir: PathBuf::from("/var/lib/za/tools/current"),
-                bin_dir: PathBuf::from("/usr/local/bin"),
+                store_dir: PathBuf::from(paths::GLOBAL_TOOL_STORE_DIR),
+                current_dir: PathBuf::from(paths::GLOBAL_TOOL_CURRENT_DIR),
+                bin_dir: PathBuf::from(paths::GLOBAL_BIN_DIR),
             }),
-            ToolScope::User => {
-                let home = env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .ok_or_else(|| anyhow!("cannot resolve user paths: set `HOME`"))?;
-
-                let data_home = env::var_os("XDG_DATA_HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join(".local/share"));
-                let state_home = env::var_os("XDG_STATE_HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join(".local/state"));
-                let bin_home = env::var_os("XDG_BIN_HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join(".local/bin"));
-
-                Ok(Self {
-                    scope,
-                    store_dir: data_home.join("za/tools/store"),
-                    current_dir: state_home.join("za/tools/current"),
-                    bin_dir: bin_home,
-                })
-            }
+            ToolScope::User => Ok(Self {
+                scope,
+                store_dir: paths::user_tool_store_dir()?,
+                current_dir: paths::user_tool_current_dir()?,
+                bin_dir: paths::user_bin_dir()?,
+            }),
         }
     }
 
