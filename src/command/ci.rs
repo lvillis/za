@@ -1649,6 +1649,7 @@ Cleaning up orphan processes
         assert!(output.contains("1 job log"));
         assert!(output.contains("release"));
         assert!(output.contains("preflight"));
+        assert!(output.contains("step build"));
         assert!(output.contains("4 other lines omitted"));
         assert!(output.contains("failed to run git"));
         assert!(output.contains("fatal: not a git repository"));

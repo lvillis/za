@@ -400,6 +400,13 @@ pub(crate) fn render_log_report_lines(report: &CommitCiLogReport) -> Vec<String>
                     tty_style::dim(url)
                 ));
             }
+            for step in &job.job.attention_steps {
+                lines.push(format!(
+                    "      {} {}",
+                    tty_style::dim("step"),
+                    text_render::truncate_end(step, 96)
+                ));
+            }
             if let Some(err) = &job.log_query_error {
                 lines.push(format!(
                     "      {} {}",

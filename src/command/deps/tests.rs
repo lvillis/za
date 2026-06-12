@@ -340,9 +340,9 @@ fn render_report_lines_surfaces_workflow_action_updates() {
             "newer action tag available",
         ),
         sample_action_record(
-            "Swatinem/rust-cache",
-            "v2",
-            Some("v2"),
+            "actions/cache",
+            "v5.0.5",
+            Some("v5.0.5"),
             ActionUpdatePlan::Keep,
             "current ref is up to date",
         ),
@@ -358,7 +358,7 @@ fn render_report_lines_surfaces_workflow_action_updates() {
     assert!(
         output.contains("hidden  1 baseline dep, 1 baseline action; use `--verbose` to show all")
     );
-    assert!(!output.contains("Swatinem/rust-cache"));
+    assert!(!output.contains("actions/cache"));
 }
 
 #[test]
