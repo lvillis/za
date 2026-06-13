@@ -6,7 +6,7 @@ pub(super) fn ensure_post_activation_integrations(
     emit_stages: bool,
 ) -> Result<()> {
     match tool.name.as_str() {
-        "starship" => ensure_starship_bash_init(emit_stages),
+        "starship" => ensure_starship_bash_init(home, tool, emit_stages),
         "ble.sh" => ensure_blesh_bash_init(home, tool, emit_stages),
         _ => Ok(()),
     }
@@ -18,21 +18,22 @@ pub(super) fn preview_post_activation_integrations(
     emit_stages: bool,
 ) -> Result<()> {
     match tool.name.as_str() {
-        "starship" => preview_starship_bash_init(emit_stages),
+        "starship" => preview_starship_bash_init(home, tool, emit_stages),
         "ble.sh" => preview_blesh_bash_init(home, tool, emit_stages),
         _ => Ok(()),
     }
 }
 
-fn ensure_starship_bash_init(emit_stages: bool) -> Result<()> {
+fn ensure_starship_bash_init(home: &ToolHome, tool: &ToolRef, emit_stages: bool) -> Result<()> {
     let rc_path = resolve_home_dir()?.join(".bashrc");
+    let active_path = home.active_path(&tool.name);
     let helper_change = ensure_ide_terminal_bash_helper(&rc_path)?;
     let change = upsert_managed_block(
         &rc_path,
         STARSHIP_BASH_INIT_START_MARKER,
         STARSHIP_BASH_INIT_END_MARKER,
         ManagedBlockPosition::BeforeMarker(BLESH_BASH_INIT_BOTTOM_START_MARKER),
-        starship_bash_init_block(),
+        &starship_bash_init_block(&active_path),
     )
     .with_context(|| format!("configure starship bash init in `{}`", rc_path.display()))?;
     print_tool_stage_if(
@@ -49,15 +50,16 @@ fn ensure_starship_bash_init(emit_stages: bool) -> Result<()> {
     Ok(())
 }
 
-fn preview_starship_bash_init(emit_stages: bool) -> Result<()> {
+fn preview_starship_bash_init(home: &ToolHome, tool: &ToolRef, emit_stages: bool) -> Result<()> {
     let rc_path = resolve_home_dir()?.join(".bashrc");
+    let active_path = home.active_path(&tool.name);
     let helper_change = preview_ide_terminal_bash_helper(&rc_path)?;
     let change = preview_managed_block(
         &rc_path,
         STARSHIP_BASH_INIT_START_MARKER,
         STARSHIP_BASH_INIT_END_MARKER,
         ManagedBlockPosition::BeforeMarker(BLESH_BASH_INIT_BOTTOM_START_MARKER),
-        starship_bash_init_block(),
+        &starship_bash_init_block(&active_path),
     )?;
     print_tool_stage_if(
         emit_stages,
@@ -151,25 +153,38 @@ fn preview_blesh_bash_init(home: &ToolHome, tool: &ToolRef, emit_stages: bool) -
 }
 
 pub(super) fn cleanup_post_uninstall_integrations(_home: &ToolHome, name: &str) -> Result<()> {
-    if name != "ble.sh" {
-        return Ok(());
+    match name {
+        "starship" => {
+            let rc_path = resolve_home_dir()?.join(".bashrc");
+            remove_managed_block(
+                &rc_path,
+                STARSHIP_BASH_INIT_START_MARKER,
+                STARSHIP_BASH_INIT_END_MARKER,
+            )?;
+            print_tool_stage(
+                "next",
+                format!("removed starship bash init from {}", rc_path.display()),
+            );
+        }
+        "ble.sh" => {
+            let rc_path = resolve_home_dir()?.join(".bashrc");
+            remove_managed_block(
+                &rc_path,
+                BLESH_BASH_INIT_TOP_START_MARKER,
+                BLESH_BASH_INIT_TOP_END_MARKER,
+            )?;
+            remove_managed_block(
+                &rc_path,
+                BLESH_BASH_INIT_BOTTOM_START_MARKER,
+                BLESH_BASH_INIT_BOTTOM_END_MARKER,
+            )?;
+            print_tool_stage(
+                "next",
+                format!("removed ble.sh bash init from {}", rc_path.display()),
+            );
+        }
+        _ => {}
     }
-
-    let rc_path = resolve_home_dir()?.join(".bashrc");
-    remove_managed_block(
-        &rc_path,
-        BLESH_BASH_INIT_TOP_START_MARKER,
-        BLESH_BASH_INIT_TOP_END_MARKER,
-    )?;
-    remove_managed_block(
-        &rc_path,
-        BLESH_BASH_INIT_BOTTOM_START_MARKER,
-        BLESH_BASH_INIT_BOTTOM_END_MARKER,
-    )?;
-    print_tool_stage(
-        "next",
-        format!("removed ble.sh bash init from {}", rc_path.display()),
-    );
     Ok(())
 }
 
@@ -207,10 +222,14 @@ pub(crate) fn ide_terminal_bash_helper_block() -> &'static str {
 }"#
 }
 
-pub(crate) fn starship_bash_init_block() -> &'static str {
-    r#"if _za_is_supported_ide_terminal; then
-  command -v starship >/dev/null 2>&1 && eval "$(starship init bash)"
-fi"#
+pub(crate) fn starship_bash_init_block(active_path: &Path) -> String {
+    format!(
+        r#"if _za_is_supported_ide_terminal && [[ $- == *i* ]] && [ -x {} ]; then
+  eval "$({} init bash)"
+fi"#,
+        shell_single_quote(&active_path.display().to_string()),
+        shell_single_quote(&active_path.display().to_string())
+    )
 }
 
 pub(crate) fn blesh_bash_init_top_block(active_path: &Path) -> String {

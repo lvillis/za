@@ -787,9 +787,18 @@ fn ide_terminal_bash_helper_supports_jetbrains_and_zed() {
 
 #[test]
 fn starship_bash_init_block_uses_supported_ide_terminal_helper() {
-    let block = starship_bash_init_block();
-    assert!(block.contains(r#"if _za_is_supported_ide_terminal; then"#));
-    assert!(block.contains(r#"eval "$(starship init bash)""#));
+    let block = starship_bash_init_block(std::path::Path::new("/home/alice/.local/bin/starship"));
+    assert!(block.contains(r#"if _za_is_supported_ide_terminal && [[ $- == *i* ]]"#));
+    assert!(block.contains(r#"[ -x '/home/alice/.local/bin/starship' ]"#));
+    assert!(block.contains(r#"eval "$('/home/alice/.local/bin/starship' init bash)""#));
+    assert!(!block.contains("command -v starship"));
+}
+
+#[test]
+fn starship_bash_init_block_shell_quotes_active_path() {
+    let block = starship_bash_init_block(std::path::Path::new("/tmp/a'b/starship"));
+    assert!(block.contains(r#"[ -x '/tmp/a'"'"'b/starship' ]"#));
+    assert!(block.contains(r#"eval "$('/tmp/a'"'"'b/starship' init bash)""#));
 }
 
 #[test]
@@ -833,7 +842,7 @@ fn starship_bash_init_managed_block_is_idempotent() {
         STARSHIP_BASH_INIT_START_MARKER,
         STARSHIP_BASH_INIT_END_MARKER,
         ManagedBlockPosition::BeforeMarker(BLESH_BASH_INIT_BOTTOM_START_MARKER),
-        starship_bash_init_block(),
+        &starship_bash_init_block(std::path::Path::new("/tmp/starship")),
     )
     .expect("insert block");
     let second = upsert_managed_block(
@@ -841,7 +850,7 @@ fn starship_bash_init_managed_block_is_idempotent() {
         STARSHIP_BASH_INIT_START_MARKER,
         STARSHIP_BASH_INIT_END_MARKER,
         ManagedBlockPosition::BeforeMarker(BLESH_BASH_INIT_BOTTOM_START_MARKER),
-        starship_bash_init_block(),
+        &starship_bash_init_block(std::path::Path::new("/tmp/starship")),
     )
     .expect("update block");
 
@@ -882,7 +891,7 @@ fn ide_terminal_helper_is_inserted_before_tool_blocks() {
         STARSHIP_BASH_INIT_START_MARKER,
         STARSHIP_BASH_INIT_END_MARKER,
         ManagedBlockPosition::BeforeMarker(BLESH_BASH_INIT_BOTTOM_START_MARKER),
-        starship_bash_init_block(),
+        &starship_bash_init_block(std::path::Path::new("/tmp/starship")),
     )
     .expect("insert starship");
 
@@ -1052,7 +1061,7 @@ ble-attach
         STARSHIP_BASH_INIT_START_MARKER,
         STARSHIP_BASH_INIT_END_MARKER,
         ManagedBlockPosition::BeforeMarker(BLESH_BASH_INIT_BOTTOM_START_MARKER),
-        starship_bash_init_block(),
+        &starship_bash_init_block(std::path::Path::new("/tmp/starship")),
     )
     .expect("insert block");
 
@@ -1118,7 +1127,7 @@ legacy starship block
         STARSHIP_BASH_INIT_START_MARKER,
         STARSHIP_BASH_INIT_END_MARKER,
         ManagedBlockPosition::BeforeMarker(BLESH_BASH_INIT_BOTTOM_START_MARKER),
-        starship_bash_init_block(),
+        &starship_bash_init_block(std::path::Path::new("/tmp/starship")),
     )
     .expect("update block");
 
@@ -1133,7 +1142,7 @@ legacy starship block
     assert_eq!(change, ManagedFileChange::Updated);
     assert!(starship_index < bottom_index);
     assert_eq!(content.matches(STARSHIP_BASH_INIT_START_MARKER).count(), 1);
-    assert!(content.contains(r#"eval "$(starship init bash)""#));
+    assert!(content.contains(r#"eval "$('/tmp/starship' init bash)""#));
 
     let _ = fs::remove_dir_all(&root);
 }
