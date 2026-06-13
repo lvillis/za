@@ -1,8 +1,17 @@
+## [0.1.90] - 2026-06-13
+
+### 🐛 Bug Fixes
+
+- *(tool)* Use managed starship path in shell init
 ## [0.1.89] - 2026-06-12
 
 ### 🐛 Bug Fixes
 
 - *(tool)* Align system installs with user-scoped tools
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.89
 ## [0.1.88] - 2026-06-12
 
 ### 🐛 Bug Fixes
