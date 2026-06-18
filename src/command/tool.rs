@@ -9,7 +9,7 @@ mod source;
 mod state;
 
 use anyhow::{Context, Result, anyhow, bail};
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use regex::Regex;
 use reqx::{
     advanced::{ClientProfile, RedirectPolicy},

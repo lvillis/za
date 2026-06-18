@@ -4,7 +4,7 @@ use super::integrations::{
 use super::policy::GithubReleaseVerification;
 use super::{
     BLESH_BASH_INIT_BOTTOM_END_MARKER, BLESH_BASH_INIT_BOTTOM_START_MARKER,
-    BLESH_BASH_INIT_TOP_END_MARKER, BLESH_BASH_INIT_TOP_START_MARKER, BatchDownloadState,
+    BLESH_BASH_INIT_TOP_END_MARKER, BLESH_BASH_INIT_TOP_START_MARKER, BatchProgressStatus,
     IDE_TERMINAL_BASH_HELPER_END_MARKER, IDE_TERMINAL_BASH_HELPER_START_MARKER, InstallOutcome,
     LatestCheck, LatestResolutionMode, ManagedBlockPosition, ManagedFileChange,
     STARSHIP_BASH_INIT_END_MARKER, STARSHIP_BASH_INIT_START_MARKER, TOOL_UPDATE_CACHE_TTL_SECS,
@@ -14,16 +14,12 @@ use super::{
     compact_install_plan, extract_version_from_text, find_tool_policy,
     latest_check_progress_message, latest_resolution_mode_for_batch, list_update_status,
     load_sync_specs_from_manifest, normalize_requested_tool_names, normalize_version,
-    prune_non_active_versions, render_batch_download_states, render_batch_summary,
-    resolve_update_channel_request, should_parallel_materialize_batch, source,
-    starship_bash_init_block, supported_tool_names_csv, tool_update_cache_entry_is_fresh,
+    prune_non_active_versions, render_batch_progress_header, render_batch_progress_line,
+    render_batch_summary, resolve_update_channel_request, should_parallel_materialize_batch,
+    source, starship_bash_init_block, supported_tool_names_csv, tool_update_cache_entry_is_fresh,
     unsupported_tool_message, upsert_managed_block,
 };
-use std::{
-    collections::HashMap,
-    fs,
-    time::{Duration, Instant},
-};
+use std::{fs, time::Duration};
 
 #[test]
 fn parse_tool_ref_ok() {
@@ -448,44 +444,40 @@ fn render_batch_summary_uses_dry_run_wording() {
 }
 
 #[test]
-fn render_batch_download_states_shows_recent_downloads_compactly() {
-    let now = Instant::now();
-    let states = HashMap::from([
-        (
-            "codex".to_string(),
-            BatchDownloadState {
-                downloaded: 42 * 1024 * 1024,
-                total_bytes: Some(84 * 1024 * 1024),
-                elapsed: Duration::from_secs(10),
-                updated_at: now,
-            },
-        ),
-        (
-            "sccache".to_string(),
-            BatchDownloadState {
-                downloaded: 8 * 1024 * 1024,
-                total_bytes: Some(16 * 1024 * 1024),
-                elapsed: Duration::from_secs(4),
-                updated_at: now - Duration::from_secs(1),
-            },
-        ),
-        (
-            "actionlint".to_string(),
-            BatchDownloadState {
-                downloaded: 512 * 1024,
-                total_bytes: None,
-                elapsed: Duration::from_secs(1),
-                updated_at: now - Duration::from_secs(2),
-            },
-        ),
-    ]);
+fn render_batch_progress_header_matches_compose_style() {
+    assert_eq!(
+        render_batch_progress_header(ToolBatchKind::Update, 2, 5),
+        "[+] Updating 2/5"
+    );
+    assert_eq!(
+        render_batch_progress_header(ToolBatchKind::Install, 9, 5),
+        "[+] Installing 5/5"
+    );
+}
 
-    let line = render_batch_download_states(&states);
+#[test]
+fn render_batch_progress_line_shows_per_tool_download_state() {
+    assert_eq!(
+        render_batch_progress_line("codex", BatchProgressStatus::Queued),
+        "codex        queued"
+    );
+    assert_eq!(
+        render_batch_progress_line("codex", BatchProgressStatus::Preparing),
+        "codex        preparing"
+    );
 
-    assert!(line.contains("codex 42.0 MiB / 84.0 MiB"));
-    assert!(line.contains("sccache 8.0 MiB / 16.0 MiB"));
-    assert!(line.contains("+1 more"));
-    assert!(!line.contains("actionlint"));
+    let line = render_batch_progress_line(
+        "codex",
+        BatchProgressStatus::Downloading {
+            downloaded: 42 * 1024 * 1024,
+            total_bytes: Some(84 * 1024 * 1024),
+            elapsed: Duration::from_secs(10),
+        },
+    );
+
+    assert!(line.contains("codex"));
+    assert!(line.contains("42.0 MiB / 84.0 MiB"));
+    assert!(line.contains("4.2 MiB/s"));
 }
 
 #[test]

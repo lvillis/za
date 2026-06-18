@@ -332,35 +332,13 @@ fn materialize_tool_batch_parallel(
     tasks: Vec<BatchInstallTask>,
 ) -> Vec<BatchInstallResult> {
     let worker_count = materialize_worker_count(tasks.len());
+    let progress_ui = BatchProgressUi::new(kind, &tasks);
     let queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
     let out: Arc<Mutex<Vec<BatchInstallResult>>> = Arc::new(Mutex::new(Vec::new()));
-    let download_states: Arc<Mutex<HashMap<String, BatchDownloadState>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let progress = new_tool_progress_bar(
-        batch_kind_stage(kind),
-        queue.lock().map(|guard| guard.len()).unwrap_or(0),
-        "preparing tool payloads",
-    );
-    let progress_sink = progress.as_ref().map(|progress| {
-        let progress = progress.clone();
-        let download_states = Arc::clone(&download_states);
+    let progress_sink = progress_ui.as_ref().map(|progress| {
+        let progress = Arc::clone(progress);
         Arc::new(move |event: source::DownloadProgress| {
-            if let Ok(mut states) = download_states.lock() {
-                if event.finished {
-                    states.remove(&event.tool);
-                } else {
-                    states.insert(
-                        event.tool.clone(),
-                        BatchDownloadState {
-                            downloaded: event.downloaded,
-                            total_bytes: event.total_bytes,
-                            elapsed: event.elapsed,
-                            updated_at: Instant::now(),
-                        },
-                    );
-                }
-                progress.set_message(render_batch_download_states(&states));
-            }
+            progress.record_download(event);
         }) as source::DownloadProgressSink
     });
 
@@ -369,9 +347,8 @@ fn materialize_tool_batch_parallel(
             let home = home.clone();
             let queue = Arc::clone(&queue);
             let out = Arc::clone(&out);
-            let progress = progress.clone();
+            let progress_ui = progress_ui.clone();
             let progress_sink = progress_sink.clone();
-            let download_states = Arc::clone(&download_states);
             scope.spawn(move || {
                 loop {
                     let task = match queue.lock() {
@@ -381,8 +358,9 @@ fn materialize_tool_batch_parallel(
                     let Some(task) = task else {
                         break;
                     };
-                    if let Some(progress) = progress.as_ref() {
-                        progress.set_message(task.plan.tool.name.clone());
+                    if let Some(progress) = progress_ui.as_ref() {
+                        progress
+                            .set_tool_status(&task.plan.tool.name, BatchProgressStatus::Preparing);
                     }
                     let tool_name = task.plan.tool.name.clone();
                     let materialized = materialize_install_plan(
@@ -391,30 +369,38 @@ fn materialize_tool_batch_parallel(
                         task.materialize_options,
                         progress_sink.clone(),
                     );
-                    clear_batch_download_state(
-                        &download_states,
-                        progress.as_ref(),
-                        tool_name.as_str(),
-                    );
                     let result = match materialized {
-                        Ok(()) => BatchInstallResult {
-                            index: task.index,
-                            requested_name: task.requested_name,
-                            plan: Some(task.plan),
-                            activate_options: task.activate_options,
-                            error: None,
-                        },
-                        Err(err) => BatchInstallResult {
-                            index: task.index,
-                            requested_name: task.requested_name,
-                            plan: None,
-                            activate_options: task.activate_options,
-                            error: Some(err),
-                        },
+                        Ok(()) => {
+                            if let Some(progress) = progress_ui.as_ref() {
+                                progress.finish_tool(
+                                    tool_name.as_str(),
+                                    BatchProgressTerminalStatus::Ready,
+                                );
+                            }
+                            BatchInstallResult {
+                                index: task.index,
+                                requested_name: task.requested_name,
+                                plan: Some(task.plan),
+                                activate_options: task.activate_options,
+                                error: None,
+                            }
+                        }
+                        Err(err) => {
+                            if let Some(progress) = progress_ui.as_ref() {
+                                progress.finish_tool(
+                                    tool_name.as_str(),
+                                    BatchProgressTerminalStatus::Failed,
+                                );
+                            }
+                            BatchInstallResult {
+                                index: task.index,
+                                requested_name: task.requested_name,
+                                plan: None,
+                                activate_options: task.activate_options,
+                                error: Some(err),
+                            }
+                        }
                     };
-                    if let Some(progress) = progress.as_ref() {
-                        progress.inc(1);
-                    }
                     if let Ok(mut guard) = out.lock() {
                         guard.push(result);
                     } else {
@@ -425,8 +411,8 @@ fn materialize_tool_batch_parallel(
         }
     });
 
-    if let Some(progress) = progress {
-        progress.finish_and_clear();
+    if let Some(progress) = progress_ui {
+        progress.clear();
     }
 
     let mut results = out
@@ -437,68 +423,188 @@ fn materialize_tool_batch_parallel(
     results
 }
 
-#[derive(Clone)]
-pub(super) struct BatchDownloadState {
-    pub(super) downloaded: u64,
-    pub(super) total_bytes: Option<u64>,
-    pub(super) elapsed: Duration,
-    pub(super) updated_at: Instant,
+struct BatchProgressUi {
+    kind: ToolBatchKind,
+    total: usize,
+    completed: Mutex<usize>,
+    multi: MultiProgress,
+    header: ProgressBar,
+    lines: Mutex<HashMap<String, ProgressBar>>,
 }
 
-fn clear_batch_download_state(
-    states: &Arc<Mutex<HashMap<String, BatchDownloadState>>>,
-    progress: Option<&ProgressBar>,
-    tool_name: &str,
-) {
-    let Ok(mut states) = states.lock() else {
-        return;
-    };
-    states.remove(tool_name);
-    if let Some(progress) = progress {
-        let message = render_batch_download_states(&states);
-        if message.is_empty() {
-            progress.set_message("finalizing");
-        } else {
-            progress.set_message(message);
+impl BatchProgressUi {
+    fn new(kind: ToolBatchKind, tasks: &[BatchInstallTask]) -> Option<Arc<Self>> {
+        if tasks.is_empty() || !io::stderr().is_terminal() {
+            return None;
+        }
+
+        let total = tasks.len();
+        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+        let header = multi.add(new_batch_header_progress_bar(kind, 0, total));
+        let mut lines = HashMap::new();
+        for task in tasks {
+            let name = task.plan.tool.name.clone();
+            let progress = multi.add(new_batch_tool_progress_bar(
+                &name,
+                BatchProgressStatus::Queued,
+            ));
+            lines.insert(name, progress);
+        }
+
+        Some(Arc::new(Self {
+            kind,
+            total,
+            completed: Mutex::new(0),
+            multi,
+            header,
+            lines: Mutex::new(lines),
+        }))
+    }
+
+    fn set_tool_status(&self, tool_name: &str, status: BatchProgressStatus) {
+        let Ok(lines) = self.lines.lock() else {
+            return;
+        };
+        if let Some(progress) = lines.get(tool_name) {
+            progress.set_message(render_batch_progress_line(tool_name, status));
         }
     }
+
+    fn record_download(&self, event: source::DownloadProgress) {
+        if event.finished {
+            return;
+        }
+        self.set_tool_status(
+            &event.tool,
+            BatchProgressStatus::Downloading {
+                downloaded: event.downloaded,
+                total_bytes: event.total_bytes,
+                elapsed: event.elapsed,
+            },
+        );
+    }
+
+    fn finish_tool(&self, tool_name: &str, status: BatchProgressTerminalStatus) {
+        let completed = self.mark_completed();
+        self.header.set_message(render_batch_progress_header(
+            self.kind, completed, self.total,
+        ));
+
+        let Ok(lines) = self.lines.lock() else {
+            return;
+        };
+        let Some(progress) = lines.get(tool_name) else {
+            return;
+        };
+        let line = render_batch_terminal_progress_line(tool_name, status);
+        match status {
+            BatchProgressTerminalStatus::Ready => progress.finish_with_message(line),
+            BatchProgressTerminalStatus::Failed => progress.abandon_with_message(line),
+        }
+    }
+
+    fn mark_completed(&self) -> usize {
+        let Ok(mut completed) = self.completed.lock() else {
+            return 0;
+        };
+        *completed += 1;
+        *completed
+    }
+
+    fn clear(&self) {
+        if let Ok(lines) = self.lines.lock() {
+            for progress in lines.values() {
+                progress.finish_and_clear();
+            }
+        }
+        self.header.finish_and_clear();
+        let _ = self.multi.clear();
+    }
 }
 
-pub(super) fn render_batch_download_states(states: &HashMap<String, BatchDownloadState>) -> String {
-    const MAX_VISIBLE_DOWNLOADS: usize = 2;
-    if states.is_empty() {
-        return String::new();
+#[derive(Clone, Copy)]
+pub(super) enum BatchProgressStatus {
+    Queued,
+    Preparing,
+    Downloading {
+        downloaded: u64,
+        total_bytes: Option<u64>,
+        elapsed: Duration,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum BatchProgressTerminalStatus {
+    Ready,
+    Failed,
+}
+
+fn new_batch_header_progress_bar(
+    kind: ToolBatchKind,
+    completed: usize,
+    total: usize,
+) -> ProgressBar {
+    let progress = ProgressBar::new_spinner();
+    progress.set_style(
+        ProgressStyle::with_template("{wide_msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    progress.set_message(render_batch_progress_header(kind, completed, total));
+    progress
+}
+
+fn new_batch_tool_progress_bar(tool_name: &str, status: BatchProgressStatus) -> ProgressBar {
+    let progress = ProgressBar::new_spinner();
+    progress.set_style(
+        ProgressStyle::with_template("{spinner} {wide_msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner())
+            .tick_strings(&["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]),
+    );
+    progress.enable_steady_tick(Duration::from_millis(80));
+    progress.set_message(render_batch_progress_line(tool_name, status));
+    progress
+}
+
+pub(super) fn render_batch_progress_header(
+    kind: ToolBatchKind,
+    completed: usize,
+    total: usize,
+) -> String {
+    format!(
+        "[+] {} {}/{}",
+        match kind {
+            ToolBatchKind::Install => "Installing",
+            ToolBatchKind::Update => "Updating",
+            ToolBatchKind::Sync => "Syncing",
+        },
+        completed.min(total),
+        total
+    )
+}
+
+pub(super) fn render_batch_progress_line(tool_name: &str, status: BatchProgressStatus) -> String {
+    match status {
+        BatchProgressStatus::Queued => format!("{tool_name:<12} queued"),
+        BatchProgressStatus::Preparing => format!("{tool_name:<12} preparing"),
+        BatchProgressStatus::Downloading {
+            downloaded,
+            total_bytes,
+            elapsed,
+        } => format!(
+            "{tool_name:<12} {}",
+            source::render_download_progress_brief(downloaded, total_bytes, elapsed)
+        ),
     }
+}
 
-    let mut entries = states.iter().collect::<Vec<_>>();
-    entries.sort_by(|(left_name, left), (right_name, right)| {
-        right
-            .updated_at
-            .cmp(&left.updated_at)
-            .then_with(|| left_name.cmp(right_name))
-    });
-
-    let mut parts = entries
-        .iter()
-        .take(MAX_VISIBLE_DOWNLOADS)
-        .map(|(name, state)| {
-            format!(
-                "{} {}",
-                name,
-                source::render_download_progress_brief(
-                    state.downloaded,
-                    state.total_bytes,
-                    state.elapsed,
-                )
-            )
-        })
-        .collect::<Vec<_>>();
-
-    let hidden = entries.len().saturating_sub(MAX_VISIBLE_DOWNLOADS);
-    if hidden > 0 {
-        parts.push(format!("+{hidden} more"));
+fn render_batch_terminal_progress_line(
+    tool_name: &str,
+    status: BatchProgressTerminalStatus,
+) -> String {
+    match status {
+        BatchProgressTerminalStatus::Ready => format!("✔ {tool_name:<12} downloaded"),
+        BatchProgressTerminalStatus::Failed => format!("✘ {tool_name:<12} failed"),
     }
-    parts.join(" · ")
 }
 
 fn materialize_worker_count(task_count: usize) -> usize {
