@@ -1,8 +1,17 @@
+## [0.1.92] - 2026-06-18
+
+### 🐛 Bug Fixes
+
+- *(tool)* Create update progress rows on demand
 ## [0.1.91] - 2026-06-18
 
 ### 🚀 Features
 
 - *(tool)* Show per-tool update progress
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.91
 ## [0.1.90] - 2026-06-13
 
 ### 🐛 Bug Fixes
