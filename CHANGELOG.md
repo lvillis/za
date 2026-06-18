@@ -1,8 +1,17 @@
+## [0.1.91] - 2026-06-18
+
+### 🚀 Features
+
+- *(tool)* Show per-tool update progress
 ## [0.1.90] - 2026-06-13
 
 ### 🐛 Bug Fixes
 
 - *(tool)* Use managed starship path in shell init
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.90
 ## [0.1.89] - 2026-06-12
 
 ### 🐛 Bug Fixes
