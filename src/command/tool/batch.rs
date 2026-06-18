@@ -441,15 +441,6 @@ impl BatchProgressUi {
         let total = tasks.len();
         let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(10));
         let header = multi.add(new_batch_header_progress_bar(kind, 0, total));
-        let mut lines = HashMap::new();
-        for task in tasks {
-            let name = task.plan.tool.name.clone();
-            let progress = multi.add(new_batch_tool_progress_bar(
-                &name,
-                BatchProgressStatus::Queued,
-            ));
-            lines.insert(name, progress);
-        }
 
         Some(Arc::new(Self {
             kind,
@@ -457,17 +448,19 @@ impl BatchProgressUi {
             completed: Mutex::new(0),
             multi,
             header,
-            lines: Mutex::new(lines),
+            lines: Mutex::new(HashMap::new()),
         }))
     }
 
     fn set_tool_status(&self, tool_name: &str, status: BatchProgressStatus) {
-        let Ok(lines) = self.lines.lock() else {
+        let Ok(mut lines) = self.lines.lock() else {
             return;
         };
-        if let Some(progress) = lines.get(tool_name) {
-            progress.set_message(render_batch_progress_line(tool_name, status));
-        }
+        let progress = lines.entry(tool_name.to_string()).or_insert_with(|| {
+            self.multi
+                .add(new_batch_tool_progress_bar(tool_name, status))
+        });
+        progress.set_message(render_batch_progress_line(tool_name, status));
     }
 
     fn record_download(&self, event: source::DownloadProgress) {
@@ -524,7 +517,6 @@ impl BatchProgressUi {
 
 #[derive(Clone, Copy)]
 pub(super) enum BatchProgressStatus {
-    Queued,
     Preparing,
     Downloading {
         downloaded: u64,
@@ -584,7 +576,6 @@ pub(super) fn render_batch_progress_header(
 
 pub(super) fn render_batch_progress_line(tool_name: &str, status: BatchProgressStatus) -> String {
     match status {
-        BatchProgressStatus::Queued => format!("{tool_name:<12} queued"),
         BatchProgressStatus::Preparing => format!("{tool_name:<12} preparing"),
         BatchProgressStatus::Downloading {
             downloaded,

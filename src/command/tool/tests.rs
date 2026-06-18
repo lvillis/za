@@ -458,10 +458,6 @@ fn render_batch_progress_header_matches_compose_style() {
 #[test]
 fn render_batch_progress_line_shows_per_tool_download_state() {
     assert_eq!(
-        render_batch_progress_line("codex", BatchProgressStatus::Queued),
-        "codex        queued"
-    );
-    assert_eq!(
         render_batch_progress_line("codex", BatchProgressStatus::Preparing),
         "codex        preparing"
     );
