@@ -90,13 +90,14 @@ pub(super) fn update_tools(
     }
     let channel = resolve_update_channel_request(all, tools, version, alpha)?;
 
-    let requested_names = if all || tools.is_empty() {
-        collect_managed_tool_names(home)?
+    let auto_update = all || tools.is_empty();
+    let (requested_names, skipped_unknown_tools) = if auto_update {
+        split_supported_managed_tool_names(collect_managed_tool_names(home)?)
     } else {
-        normalize_requested_tool_names(tools)?
+        (normalize_requested_tool_names(tools)?, Vec::new())
     };
 
-    if requested_names.is_empty() {
+    if requested_names.is_empty() && skipped_unknown_tools.is_empty() {
         println!(
             "No za-managed tools are installed in {} scope.",
             home.scope.label()
@@ -108,15 +109,16 @@ pub(super) fn update_tools(
         .iter()
         .map(|name| ToolSpec::from_args(name, version))
         .collect::<Result<Vec<_>>>()?;
-    run_tool_batch(
+    run_tool_batch_inner(ToolBatchRun {
         home,
-        ToolBatchKind::Update,
+        kind: ToolBatchKind::Update,
         specs,
         dry_run,
         verbose,
-        None,
-        channel,
-    )
+        source_label: None,
+        update_channel: channel,
+        skipped_unknown_tools,
+    })
 }
 
 pub(super) fn run_tool_batch(
@@ -128,18 +130,61 @@ pub(super) fn run_tool_batch(
     source_label: Option<&str>,
     update_channel: ToolUpdateChannel,
 ) -> Result<()> {
+    run_tool_batch_inner(ToolBatchRun {
+        home,
+        kind,
+        specs,
+        dry_run,
+        verbose,
+        source_label,
+        update_channel,
+        skipped_unknown_tools: Vec::new(),
+    })
+}
+
+struct ToolBatchRun<'a> {
+    home: &'a ToolHome,
+    kind: ToolBatchKind,
+    specs: Vec<ToolSpec>,
+    dry_run: bool,
+    verbose: bool,
+    source_label: Option<&'a str>,
+    update_channel: ToolUpdateChannel,
+    skipped_unknown_tools: Vec<String>,
+}
+
+fn run_tool_batch_inner(input: ToolBatchRun<'_>) -> Result<()> {
+    let ToolBatchRun {
+        home,
+        kind,
+        specs,
+        dry_run,
+        verbose,
+        source_label,
+        update_channel,
+        skipped_unknown_tools,
+    } = input;
     let total = specs.len();
     let batch_mode = total > 1 || matches!(kind, ToolBatchKind::Update | ToolBatchKind::Sync);
     let compact_mode = batch_mode && !verbose;
     let parallel_materialize = should_parallel_materialize_batch(total, dry_run, verbose);
-    let mut summary = ToolBatchSummary::default();
+    let mut summary = ToolBatchSummary {
+        skipped: skipped_unknown_tools.len(),
+        ..Default::default()
+    };
     let mut failed_tools = Vec::new();
     let mut materialize_tasks = Vec::new();
 
     if compact_mode {
         print_tool_stage(
             batch_kind_stage(kind),
-            batch_start_message(kind, total, source_label),
+            batch_start_message(kind, total + skipped_unknown_tools.len(), source_label),
+        );
+    }
+    for name in &skipped_unknown_tools {
+        print_tool_stage(
+            "skip",
+            format!("`{name}` is managed by a newer za; update za first"),
         );
     }
 
@@ -299,6 +344,12 @@ pub(super) fn run_tool_batch(
         failed_tools.len(),
         failed_tools.join(", ")
     )
+}
+
+pub(super) fn split_supported_managed_tool_names(names: Vec<String>) -> (Vec<String>, Vec<String>) {
+    names
+        .into_iter()
+        .partition(|name| find_tool_policy(name).is_some())
 }
 
 #[derive(Clone)]
@@ -807,6 +858,9 @@ pub(crate) fn render_batch_summary(
 
     if summary.failed > 0 {
         parts.push(tool_summary_token(summary.failed, "failed", "error"));
+    }
+    if summary.skipped > 0 {
+        parts.push(tool_summary_token(summary.skipped, "skipped", "warning"));
     }
 
     if parts.is_empty() {

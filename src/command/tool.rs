@@ -1718,6 +1718,7 @@ struct ToolBatchSummary {
     updated: usize,
     repaired: usize,
     unchanged: usize,
+    skipped: usize,
     failed: usize,
 }
 

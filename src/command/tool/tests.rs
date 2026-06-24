@@ -16,8 +16,8 @@ use super::{
     load_sync_specs_from_manifest, normalize_requested_tool_names, normalize_version,
     prune_non_active_versions, render_batch_progress_header, render_batch_progress_line,
     render_batch_summary, resolve_update_channel_request, should_parallel_materialize_batch,
-    source, starship_bash_init_block, supported_tool_names_csv, tool_update_cache_entry_is_fresh,
-    unsupported_tool_message, upsert_managed_block,
+    source, split_supported_managed_tool_names, starship_bash_init_block, supported_tool_names_csv,
+    tool_update_cache_entry_is_fresh, unsupported_tool_message, upsert_managed_block,
 };
 use std::{fs, time::Duration};
 
@@ -429,6 +429,7 @@ fn render_batch_summary_mentions_updates_repairs_and_failures() {
         updated: 2,
         repaired: 1,
         unchanged: 3,
+        skipped: 0,
         failed: 1,
     };
     assert_eq!(
@@ -444,11 +445,28 @@ fn render_batch_summary_uses_dry_run_wording() {
         updated: 2,
         repaired: 1,
         unchanged: 3,
+        skipped: 0,
         failed: 0,
     };
     assert_eq!(
         render_batch_summary(ToolBatchKind::Update, summary, true),
         "2 would update, 1 would repair, 3 already latest"
+    );
+}
+
+#[test]
+fn render_batch_summary_mentions_skipped_unknown_tools() {
+    let summary = ToolBatchSummary {
+        installed: 0,
+        updated: 0,
+        repaired: 0,
+        unchanged: 18,
+        skipped: 1,
+        failed: 0,
+    };
+    assert_eq!(
+        render_batch_summary(ToolBatchKind::Update, summary, false),
+        "18 already latest, 1 skipped"
     );
 }
 
@@ -785,6 +803,15 @@ fn normalize_requested_tool_names_rejects_unknown_names_with_suggestion() {
     assert!(message.contains("unsupported tool `startship`"));
     assert!(message.contains("did you mean `starship`?"));
     assert!(!message.contains("supported tools:"));
+}
+
+#[test]
+fn split_supported_managed_tool_names_keeps_unknown_for_skip() {
+    let (known, unknown) =
+        split_supported_managed_tool_names(vec!["codex".to_string(), "future-tool".to_string()]);
+
+    assert_eq!(known, vec!["codex"]);
+    assert_eq!(unknown, vec!["future-tool"]);
 }
 
 #[test]
