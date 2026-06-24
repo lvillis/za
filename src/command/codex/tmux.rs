@@ -689,6 +689,10 @@ pub(super) fn attach_session(
 ) -> Result<i32> {
     tmux_apply_codex_terminal_fixes(session_name)?;
     tmux_apply_codex_session_style(session_name, workspace_label, workspace_root)?;
+    tmux_attach_session(session_name)
+}
+
+pub(super) fn tmux_attach_session(session_name: &str) -> Result<i32> {
     if tmux_current_session_is(session_name)? {
         return Ok(0);
     }

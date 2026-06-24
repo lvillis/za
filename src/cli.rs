@@ -90,7 +90,7 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: Option<CodexCommands>,
         /// Arguments passed through to `codex` when prefixed by `--`
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Update the za binary
@@ -2214,6 +2214,11 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn codex_dash_is_not_a_supported_subcommand() {
+        assert!(Cli::try_parse_from(["za", "codex", "dash"]).is_err());
     }
 
     #[test]

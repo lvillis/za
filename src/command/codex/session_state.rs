@@ -702,16 +702,21 @@ impl SessionFileTracker {
             .with_context(|| format!("seek session file {}", self.path.display()))?;
         let mut reader = BufReader::new(file);
         let mut next_offset = self.offset;
+        let mut buffer = Vec::new();
         loop {
-            let mut line = String::new();
+            buffer.clear();
             let bytes = reader
-                .read_line(&mut line)
+                .read_until(b'\n', &mut buffer)
                 .with_context(|| format!("read session file {}", self.path.display()))?;
             if bytes == 0 {
                 break;
             }
             next_offset += bytes as u64;
-            apply_session_log_line(&mut self.state, modified_unix, line.trim_end())?;
+            while matches!(buffer.last(), Some(b'\n' | b'\r')) {
+                buffer.pop();
+            }
+            let line = String::from_utf8_lossy(&buffer);
+            apply_session_log_line(&mut self.state, modified_unix, &line)?;
         }
         self.offset = next_offset;
         self.modified_unix = modified_unix;
@@ -901,7 +906,7 @@ pub(super) fn summarize_codex_session_lines<R: BufRead>(
 }
 
 fn scan_codex_session_lines<R: BufRead>(
-    reader: R,
+    mut reader: R,
     modified_unix: u64,
 ) -> Result<Option<CodexSessionSummary>> {
     let mut session_id = None;
@@ -910,8 +915,19 @@ fn scan_codex_session_lines<R: BufRead>(
     let mut effort = None;
     let mut context_left_percent = None;
 
-    for line in reader.lines() {
-        let line = line.context("read Codex session line")?;
+    let mut buffer = Vec::new();
+    loop {
+        buffer.clear();
+        let bytes = reader
+            .read_until(b'\n', &mut buffer)
+            .context("read Codex session line")?;
+        if bytes == 0 {
+            break;
+        }
+        while matches!(buffer.last(), Some(b'\n' | b'\r')) {
+            buffer.pop();
+        }
+        let line = String::from_utf8_lossy(&buffer);
         match parse_codex_session_event(&line) {
             Some(ParsedCodexSessionEvent::SessionMeta(payload)) => {
                 session_id = Some(payload.id);

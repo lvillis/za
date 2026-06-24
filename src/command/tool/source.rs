@@ -12,6 +12,7 @@ use std::{
 };
 use tar::Archive;
 use xz2::read::XzDecoder;
+use zip::ZipArchive;
 
 const TEMP_DIR_PREFIX_DOWNLOAD: &str = "za-tool-download";
 const TEMP_DIR_PREFIXES: [&str; 1] = [TEMP_DIR_PREFIX_DOWNLOAD];
@@ -534,7 +535,7 @@ fn latest_stable_version_for_tags(releases: &[GithubRelease], tag_prefix: &str) 
         .filter(|release| release_matches_stable_versioned_tag(release, tag_prefix))
         .filter_map(|release| {
             let version = parse_release_version(&release.tag_name, tag_prefix).ok()?;
-            let parsed = Version::parse(&version).ok()?;
+            let parsed = parse_release_semver(&version).ok()?;
             Some((parsed, version))
         })
         .max_by(|(left, _), (right, _)| left.cmp(right))
@@ -557,7 +558,7 @@ fn latest_stable_version_for_latest_release(
     }
 
     let version = parse_release_version(&release.tag_name, tag_prefix)?;
-    let parsed = Version::parse(&version).with_context(|| {
+    let parsed = parse_release_semver(&version).with_context(|| {
         format!(
             "latest GitHub release tag `{}` is not semver",
             release.tag_name
@@ -582,7 +583,7 @@ fn latest_prerelease_version_for_channel(
         .filter(|release| release.prerelease && !release.draft)
         .filter_map(|release| {
             let version = parse_release_version(&release.tag_name, tag_prefix).ok()?;
-            let parsed = Version::parse(&version).ok()?;
+            let parsed = parse_release_semver(&version).ok()?;
             prerelease_channel_matches(&parsed, channel).then_some((parsed, version))
         })
         .max_by(|(left, _), (right, _)| left.cmp(right))
@@ -601,7 +602,7 @@ fn release_matches_prerelease_channel(
     let Ok(version) = parse_release_version(&release.tag_name, tag_prefix) else {
         return false;
     };
-    let Ok(parsed) = Version::parse(&version) else {
+    let Ok(parsed) = parse_release_semver(&version) else {
         return false;
     };
     prerelease_channel_matches(&parsed, channel)
@@ -614,7 +615,7 @@ fn release_matches_stable_versioned_tag(release: &GithubRelease, tag_prefix: &st
     let Ok(version) = parse_release_version(&release.tag_name, tag_prefix) else {
         return false;
     };
-    let Ok(parsed) = Version::parse(&version) else {
+    let Ok(parsed) = parse_release_semver(&version) else {
         return false;
     };
     parsed.pre.is_empty()
@@ -1124,6 +1125,42 @@ pub(super) fn parse_release_version(tag_name: &str, tag_prefix: &str) -> Result<
         bail!("latest release tag had no version");
     }
     Ok(version)
+}
+
+fn parse_release_semver(version: &str) -> Result<Version> {
+    if let Ok(parsed) = Version::parse(version) {
+        return Ok(parsed);
+    }
+
+    let (core, suffix) = split_semver_core_suffix(version);
+    if !is_two_segment_numeric_version(core) {
+        return Version::parse(version).with_context(|| format!("parse semver `{version}`"));
+    }
+
+    Version::parse(&format!("{core}.0{suffix}"))
+        .with_context(|| format!("parse semver `{version}`"))
+}
+
+fn split_semver_core_suffix(version: &str) -> (&str, &str) {
+    match version.find(['-', '+']) {
+        Some(index) => version.split_at(index),
+        None => (version, ""),
+    }
+}
+
+fn is_two_segment_numeric_version(core: &str) -> bool {
+    let mut parts = core.split('.');
+    let Some(major) = parts.next() else {
+        return false;
+    };
+    let Some(minor) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && !major.is_empty()
+        && !minor.is_empty()
+        && major.bytes().all(|byte| byte.is_ascii_digit())
+        && minor.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn resolve_github_token() -> Result<Option<String>> {
@@ -2024,6 +2061,7 @@ pub(super) fn truncate_for_log(input: &str, max_chars: usize) -> String {
 enum ArchiveKind {
     TarGz,
     TarXz,
+    Zip,
 }
 
 fn detect_archive_kind(name: &str) -> Option<ArchiveKind> {
@@ -2032,6 +2070,8 @@ fn detect_archive_kind(name: &str) -> Option<ArchiveKind> {
         Some(ArchiveKind::TarGz)
     } else if lower.ends_with(".tar.xz") || lower.ends_with(".txz") {
         Some(ArchiveKind::TarXz)
+    } else if lower.ends_with(".zip") {
+        Some(ArchiveKind::Zip)
     } else {
         None
     }
@@ -2045,6 +2085,11 @@ pub(super) fn is_tar_gz_asset(name: &str) -> bool {
 #[cfg(test)]
 pub(super) fn is_tar_xz_asset(name: &str) -> bool {
     detect_archive_kind(name) == Some(ArchiveKind::TarXz)
+}
+
+#[cfg(test)]
+pub(super) fn is_zip_asset(name: &str) -> bool {
+    detect_archive_kind(name) == Some(ArchiveKind::Zip)
 }
 
 pub(super) fn extract_archive_into_dir(archive_path: &Path, dst: &Path) -> Result<()> {
@@ -2074,6 +2119,13 @@ pub(super) fn extract_archive_into_dir(archive_path: &Path, dst: &Path) -> Resul
             let mut archive = Archive::new(xz);
             archive
                 .unpack(dst)
+                .with_context(|| format!("extract archive {}", archive_path.display()))?;
+        }
+        ArchiveKind::Zip => {
+            let mut archive = ZipArchive::new(file)
+                .with_context(|| format!("read zip archive {}", archive_path.display()))?;
+            archive
+                .extract(dst)
                 .with_context(|| format!("extract archive {}", archive_path.display()))?;
         }
     }
@@ -2245,6 +2297,24 @@ mod tests {
         assert_eq!(
             latest_stable_version_for_tags(&releases, "rust-v").expect("latest stable"),
             "0.132.0"
+        );
+    }
+
+    #[test]
+    fn latest_stable_version_accepts_two_segment_release_tags() {
+        let releases = vec![
+            github_release("v34.1", false, false),
+            github_release("v35.1", false, false),
+        ];
+
+        assert_eq!(
+            latest_stable_version_for_tags(&releases, "v").expect("latest stable"),
+            "35.1"
+        );
+        assert_eq!(
+            latest_stable_version_for_latest_release(&github_release("v35.1", false, false), "v")
+                .expect("latest release"),
+            "35.1"
         );
     }
 

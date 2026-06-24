@@ -202,15 +202,27 @@ pub(super) fn stale_versions_to_prune(home: &ToolHome, active: &ToolRef) -> Resu
 
 pub(crate) fn command_candidates(name: &str) -> Vec<String> {
     let mut out = vec![name.to_string()];
+    #[cfg(windows)]
+    {
+        out.push(format!("{name}.exe"));
+    }
     if let Some(stripped) = name.strip_suffix("-cli")
         && !stripped.is_empty()
     {
         out.push(stripped.to_string());
+        #[cfg(windows)]
+        {
+            out.push(format!("{stripped}.exe"));
+        }
     }
     if let Some(stripped) = name.strip_suffix("_cli")
         && !stripped.is_empty()
     {
         out.push(stripped.to_string());
+        #[cfg(windows)]
+        {
+            out.push(format!("{stripped}.exe"));
+        }
     }
     out.sort();
     out.dedup();

@@ -1320,6 +1320,67 @@ mod tests {
     }
 
     #[test]
+    fn summarize_codex_session_lines_tolerates_non_utf8_lines() {
+        let workspaces = BTreeMap::from([("/workspace/sample-repo".to_string(), 1_700_000_000)]);
+        let mut raw = Vec::new();
+        raw.extend_from_slice(
+            br#"{"type":"session_meta","payload":{"id":"019cc38e-4d75-7052-b96a-b3a1e36b1868","cwd":"/workspace/sample-repo"}}
+"#,
+        );
+        raw.extend_from_slice(b"{\"type\":\"event_msg\",\"payload\":\"bad ");
+        raw.push(0xe9);
+        raw.extend_from_slice(b" bytes\"}\n");
+        raw.extend_from_slice(
+            br#"{"type":"turn_context","payload":{"model":"gpt-5.4","effort":"low"}}
+"#,
+        );
+
+        let summary = summarize_codex_session_lines(Cursor::new(raw), 1_700_000_100, &workspaces)
+            .expect("non-UTF-8 rollout lines must not fail ps")
+            .expect("must match workspace");
+
+        assert_eq!(summary.session_id, "019cc38e-4d75-7052-b96a-b3a1e36b1868");
+        assert_eq!(summary.workspace_root, "/workspace/sample-repo");
+        assert_eq!(summary.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(summary.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn session_file_tracker_tolerates_non_utf8_lines() {
+        let dir = TempDir::new("session-tracker-non-utf8").expect("temp dir");
+        let path = dir.path.join("rollout.jsonl");
+        let mut raw = Vec::new();
+        raw.extend_from_slice(
+            br#"{"type":"session_meta","payload":{"id":"019cc38e-4d75-7052-b96a-b3a1e36b1868","cwd":"/workspace/sample-repo"}}
+"#,
+        );
+        raw.extend_from_slice(b"{\"type\":\"event_msg\",\"payload\":\"bad ");
+        raw.push(0xe9);
+        raw.extend_from_slice(b" bytes\"}\n");
+        raw.extend_from_slice(
+            br#"{"type":"turn_context","payload":{"model":"gpt-5.4","effort":"low"}}
+"#,
+        );
+        fs::write(&path, raw).expect("write rollout");
+
+        let mut tracker = SessionFileTracker::new(path);
+        tracker
+            .sync()
+            .expect("non-UTF-8 rollout lines must not fail top");
+
+        assert_eq!(
+            tracker.state.session_id.as_deref(),
+            Some("019cc38e-4d75-7052-b96a-b3a1e36b1868")
+        );
+        assert_eq!(
+            tracker.state.workspace_root.as_deref(),
+            Some("/workspace/sample-repo")
+        );
+        assert_eq!(tracker.state.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(tracker.state.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
     fn parse_otlp_session_events_extracts_core_attributes() {
         let raw = br#"{
           "resourceLogs":[

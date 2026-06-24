@@ -126,6 +126,11 @@ fn command_candidates_include_cli_stripped_name() {
     let cands = command_candidates("codex-cli");
     assert!(cands.iter().any(|c| c == "codex-cli"));
     assert!(cands.iter().any(|c| c == "codex"));
+    #[cfg(windows)]
+    {
+        assert!(cands.iter().any(|c| c == "codex-cli.exe"));
+        assert!(cands.iter().any(|c| c == "codex.exe"));
+    }
 }
 
 #[test]
@@ -141,10 +146,14 @@ fn tar_asset_detection_works() {
     assert!(source::is_tar_gz_asset("A.TGZ"));
     assert!(source::is_tar_xz_asset("a.tar.xz"));
     assert!(source::is_tar_xz_asset("A.TXZ"));
+    assert!(source::is_zip_asset("a.zip"));
+    assert!(source::is_zip_asset("A.ZIP"));
     assert!(!source::is_tar_gz_asset("a.zip"));
     assert!(!source::is_tar_gz_asset("codex"));
     assert!(!source::is_tar_xz_asset("a.zip"));
     assert!(!source::is_tar_xz_asset("codex"));
+    assert!(!source::is_zip_asset("a.tar.gz"));
+    assert!(!source::is_zip_asset("codex"));
 }
 
 #[test]
@@ -616,6 +625,15 @@ fn tool_policy_matches_alias_and_canonical() {
         sccache.github_release.expect("github policy").verification,
         GithubReleaseVerification::RequiredSha256Digest
     );
+    let protobuf_alias = find_tool_policy("protobuf").expect("alias policy");
+    let protoc = find_tool_policy("protoc").expect("canonical policy");
+    assert_eq!(protobuf_alias.canonical_name, "protoc");
+    assert_eq!(protoc.canonical_name, "protoc");
+    assert_eq!(protoc.source_label, "GitHub Release (SHA-256 verified)");
+    assert_eq!(
+        protoc.github_release.expect("github policy").verification,
+        GithubReleaseVerification::RequiredSha256Digest
+    );
     let starship = find_tool_policy("starship").expect("canonical policy");
     assert_eq!(starship.canonical_name, "starship");
     assert_eq!(starship.source_label, "GitHub Release (SHA-256 verified)");
@@ -703,6 +721,8 @@ fn canonical_tool_name_resolves_aliases() {
     assert_eq!(canonical_tool_name("oha"), "oha");
     assert_eq!(canonical_tool_name("actionlint"), "actionlint");
     assert_eq!(canonical_tool_name("sccache"), "sccache");
+    assert_eq!(canonical_tool_name("protobuf"), "protoc");
+    assert_eq!(canonical_tool_name("protoc"), "protoc");
     assert_eq!(canonical_tool_name("starship"), "starship");
     assert_eq!(canonical_tool_name("git-cliff"), "git-cliff");
     assert_eq!(canonical_tool_name("cargo-release"), "cargo-release");
@@ -735,6 +755,8 @@ fn supported_tool_names_csv_contains_all_aliases() {
     assert!(csv.contains("oha"));
     assert!(csv.contains("actionlint"));
     assert!(csv.contains("sccache"));
+    assert!(csv.contains("protoc"));
+    assert!(csv.contains("protobuf"));
     assert!(csv.contains("starship"));
     assert!(csv.contains("git-cliff"));
     assert!(csv.contains("cargo-release"));
@@ -1172,6 +1194,26 @@ fn sccache_policy_expected_asset_name_matches_supported_tarball() {
         asset_name,
         format!("sccache-v0.15.0-{expected_target}.tar.gz")
     );
+}
+
+#[test]
+fn protoc_policy_expected_asset_name_matches_supported_zip() {
+    let policy = find_tool_policy("protoc")
+        .expect("policy")
+        .github_release
+        .expect("github policy");
+    let asset_name =
+        (policy.expected_asset_name.expect("asset resolver"))("35.1").expect("asset name");
+    let expected_target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "linux-x86_64",
+        ("linux", "aarch64") => "linux-aarch_64",
+        ("macos", "x86_64") => "osx-x86_64",
+        ("macos", "aarch64") => "osx-aarch_64",
+        ("windows", "x86_64") => "win64",
+        ("windows", "x86") => "win32",
+        other => panic!("unsupported local test platform: {other:?}"),
+    };
+    assert_eq!(asset_name, format!("protoc-35.1-{expected_target}.zip"));
 }
 
 #[test]

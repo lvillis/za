@@ -46,6 +46,9 @@ const ACTIONLINT_GITHUB_TAG_PREFIX: &str = "v";
 const SCCACHE_GITHUB_OWNER: &str = "mozilla";
 const SCCACHE_GITHUB_REPO: &str = "sccache";
 const SCCACHE_GITHUB_TAG_PREFIX: &str = "v";
+const PROTOBUF_GITHUB_OWNER: &str = "protocolbuffers";
+const PROTOBUF_GITHUB_REPO: &str = "protobuf";
+const PROTOBUF_GITHUB_TAG_PREFIX: &str = "v";
 const STARSHIP_GITHUB_OWNER: &str = "starship";
 const STARSHIP_GITHUB_REPO: &str = "starship";
 const STARSHIP_GITHUB_TAG_PREFIX: &str = "v";
@@ -129,7 +132,7 @@ impl ToolPolicy {
     }
 }
 
-const TOOL_POLICIES: [ToolPolicy; 22] = [
+const TOOL_POLICIES: [ToolPolicy; 23] = [
     ToolPolicy {
         canonical_name: "za",
         aliases: &[],
@@ -371,6 +374,22 @@ const TOOL_POLICIES: [ToolPolicy; 22] = [
         }),
     },
     ToolPolicy {
+        canonical_name: "protoc",
+        aliases: &["protobuf"],
+        source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
+        github_release: Some(GithubReleasePolicy {
+            project_label: "protobuf",
+            owner: PROTOBUF_GITHUB_OWNER,
+            repo: PROTOBUF_GITHUB_REPO,
+            tag_prefix: PROTOBUF_GITHUB_TAG_PREFIX,
+            expected_asset_name: Some(protoc_expected_asset_name),
+            verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
+        }),
+    },
+    ToolPolicy {
         canonical_name: "starship",
         aliases: &[],
         source_label: "GitHub Release (SHA-256 verified)",
@@ -592,6 +611,10 @@ fn sccache_expected_asset_name(version: &str) -> Result<String> {
         "sccache-v{version}-{}.tar.gz",
         sccache_target_triple()?
     ))
+}
+
+fn protoc_expected_asset_name(version: &str) -> Result<String> {
+    Ok(format!("protoc-{version}-{}.zip", protoc_target()?))
 }
 
 fn starship_expected_asset_name(_version: &str) -> Result<String> {
@@ -829,6 +852,22 @@ fn sccache_target_triple() -> Result<&'static str> {
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
         _ => bail!(
             "unsupported platform for sccache release asset: {}-{}",
+            env::consts::ARCH,
+            env::consts::OS
+        ),
+    }
+}
+
+fn protoc_target() -> Result<&'static str> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("linux-x86_64"),
+        ("linux", "aarch64") => Ok("linux-aarch_64"),
+        ("macos", "x86_64") => Ok("osx-x86_64"),
+        ("macos", "aarch64") => Ok("osx-aarch_64"),
+        ("windows", "x86_64") => Ok("win64"),
+        ("windows", "x86") => Ok("win32"),
+        _ => bail!(
+            "unsupported platform for protobuf protoc release asset: {}-{}",
             env::consts::ARCH,
             env::consts::OS
         ),
