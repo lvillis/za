@@ -1,8 +1,17 @@
+## [0.1.94] - 2026-06-24
+
+### 🐛 Bug Fixes
+
+- *(tool)* Skip unsupported managed tools during update
 ## [0.1.93] - 2026-06-24
 
 ### 🚀 Features
 
 - *(tool)* Add protoc release management
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.93
 ## [0.1.92] - 2026-06-18
 
 ### 🐛 Bug Fixes
