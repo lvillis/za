@@ -1,8 +1,17 @@
+## [0.1.93] - 2026-06-24
+
+### 🚀 Features
+
+- *(tool)* Add protoc release management
 ## [0.1.92] - 2026-06-18
 
 ### 🐛 Bug Fixes
 
 - *(tool)* Create update progress rows on demand
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.92
 ## [0.1.91] - 2026-06-18
 
 ### 🚀 Features
