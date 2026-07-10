@@ -179,13 +179,11 @@ fn inspect_tool(home: &ToolHome, name: &str) -> Result<ToolDoctorRow> {
                         payload_path.display()
                     ),
                 ));
-            } else if is_package {
-                if let Err(err) = validate_package_payload(home, &tool) {
-                    issues.push((
-                        DoctorIssueSeverity::Error,
-                        format!("installed package payload is incomplete: {err:#}"),
-                    ));
-                }
+            } else if is_package && let Err(err) = validate_package_payload(home, &tool) {
+                issues.push((
+                    DoctorIssueSeverity::Error,
+                    format!("installed package payload is incomplete: {err:#}"),
+                ));
             }
             if !active_path.exists() {
                 issues.push((
