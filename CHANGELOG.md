@@ -1,3 +1,12 @@
+## [0.1.96] - 2026-07-10
+
+### 🚀 Features
+
+- *(deps)* Harden dependency and action auditing
+
+### 🐛 Bug Fixes
+
+- *(cli)* [**breaking**] Harden process and scripting contracts
 ## [0.1.95] - 2026-07-10
 
 ### 🚀 Features
@@ -7,6 +16,10 @@
 ### 🚜 Refactor
 
 - *(tool)* Simplify package doctor validation
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.95
 ## [0.1.94] - 2026-06-24
 
 ### 🐛 Bug Fixes
