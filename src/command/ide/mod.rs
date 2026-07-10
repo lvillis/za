@@ -26,7 +26,11 @@ mod zed_rpc {
 
 use crate::{
     cli::{IdeAgentCommands, IdeCommands, IdeReconcileStrategy},
-    command::{paths, write_file_atomically, za_config},
+    command::{
+        paths, print_json,
+        process::{ProcessIdentity, process_identity_matches},
+        write_file_atomically, za_config,
+    },
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -117,12 +121,6 @@ struct ProcStat {
     stime_ticks: u64,
     start_ticks: u64,
     rss_pages: i64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ProcessIdentity {
-    pid: i32,
-    start_ticks: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -493,10 +491,7 @@ fn run_agent_install(agent: &str, force: bool) -> Result<i32> {
 fn run_agent_status(agent: Option<&str>, probe: bool, json: bool) -> Result<i32> {
     let output = collect_ide_agent_status(agent, probe)?;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&output).context("serialize ide agent status output")?
-        );
+        print_json(&output, "serialize ide agent status output")?;
         return Ok(0);
     }
 
@@ -1085,10 +1080,7 @@ fn run_ps(duplicates_only: bool, json: bool) -> Result<i32> {
             diagnostics,
             projects: project_rows,
         };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&out).context("serialize ide ps output")?
-        );
+        print_json(&out, "serialize ide ps output")?;
         return Ok(0);
     }
 
@@ -1153,10 +1145,7 @@ fn run_stop(pid: i32, timeout_secs: u64, json: bool) -> Result<i32> {
             forced,
             elapsed_ms,
         };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&out).context("serialize ide stop output")?
-        );
+        print_json(&out, "serialize ide stop output")?;
         return Ok(0);
     }
 
@@ -1267,10 +1256,7 @@ fn run_reconcile(
                 orphan_pids: Vec::new(),
                 orphan_failures: Vec::new(),
             };
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&out).context("serialize ide reconcile output")?
-            );
+            print_json(&out, "serialize ide reconcile output")?;
         } else {
             println!("No duplicate or stale JetBrains IDE sessions need cleanup.");
         }
@@ -1328,10 +1314,7 @@ fn run_reconcile(
             orphan_pids,
             orphan_failures,
         };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&out).context("serialize ide reconcile output")?
-        );
+        print_json(&out, "serialize ide reconcile output")?;
     } else {
         if apply {
             println!("Applying duplicate session reconciliation:");
@@ -1439,7 +1422,7 @@ fn run_fix(dry_run: bool, timeout_secs: u64, json: bool) -> Result<i32> {
     let active_toolbox = toolbox_processes
         .iter()
         .filter(|process| {
-            process_matches_identity(ProcessIdentity {
+            process_identity_matches(ProcessIdentity {
                 pid: process.pid,
                 start_ticks: process.start_ticks,
             })
@@ -1551,10 +1534,7 @@ fn run_fix(dry_run: bool, timeout_secs: u64, json: bool) -> Result<i32> {
     };
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&output).context("serialize ide fix output")?
-        );
+        print_json(&output, "serialize ide fix output")?;
     } else {
         for line in render_fix_lines(&output) {
             println!("{line}");
@@ -1658,7 +1638,7 @@ fn pick_keep_pids(
 }
 
 fn stop_session(identity: ProcessIdentity, timeout: Duration) -> Result<StopOutcome> {
-    if !process_matches_identity(identity) {
+    if !process_identity_matches(identity) {
         return Ok(StopOutcome::AlreadyExited);
     }
 
@@ -1694,7 +1674,7 @@ fn stop_session(identity: ProcessIdentity, timeout: Duration) -> Result<StopOutc
 }
 
 fn send_signal(identity: ProcessIdentity, signal: &str) -> Result<bool> {
-    if !process_matches_identity(identity) {
+    if !process_identity_matches(identity) {
         return Ok(false);
     }
 
@@ -1704,7 +1684,7 @@ fn send_signal(identity: ProcessIdentity, signal: &str) -> Result<bool> {
         .status()
         .with_context(|| format!("execute kill {signal} {}", identity.pid))?;
     if !status.success() {
-        if !process_matches_identity(identity) {
+        if !process_identity_matches(identity) {
             return Ok(false);
         }
         bail!("kill {signal} {} failed with status {status}", identity.pid);
@@ -1714,20 +1694,10 @@ fn send_signal(identity: ProcessIdentity, signal: &str) -> Result<bool> {
 
 fn wait_for_exit(identity: ProcessIdentity, timeout: Duration) -> bool {
     let start = Instant::now();
-    while process_matches_identity(identity) && start.elapsed() < timeout {
+    while process_identity_matches(identity) && start.elapsed() < timeout {
         thread::sleep(Duration::from_millis(STOP_POLL_MS));
     }
-    !process_matches_identity(identity)
-}
-
-fn process_matches_identity(identity: ProcessIdentity) -> bool {
-    read_process_start_ticks(identity.pid) == Some(identity.start_ticks)
-}
-
-fn read_process_start_ticks(pid: i32) -> Option<u64> {
-    let stat_path = Path::new(PROC_ROOT).join(pid.to_string()).join("stat");
-    let raw = fs::read_to_string(stat_path).ok()?;
-    proc_scan::parse_proc_stat_line(&raw).map(|stat| stat.start_ticks)
+    !process_identity_matches(identity)
 }
 
 fn truncate_end(input: &str, max_chars: usize) -> String {
@@ -2421,15 +2391,17 @@ mod tests {
     };
     use super::{
         ConfidenceLevel, IdeFixFailure, IdeFixOutput, IdeProjectRow, IdeProvider, IdePsDiagnostic,
-        IdeReconcileStrategy, IdeSession, ProcessIdentity, RemoteProjectSource,
-        expected_ide_agent_shim_content, format_memory_bytes, ide_agent_bash_path_block,
-        ide_agent_shim_is_managed, normalize_ide_agent_name, parse_ipcs_semaphore_rows,
+        IdeReconcileStrategy, IdeSession, RemoteProjectSource, expected_ide_agent_shim_content,
+        format_memory_bytes, ide_agent_bash_path_block, ide_agent_shim_is_managed,
+        normalize_ide_agent_name, parse_ipcs_semaphore_rows,
         parse_jetbrains_ide_station_socket_pid, parse_toolbox_ipc_key_line, pick_keep_pid,
-        pick_keep_pids, process_matches_identity, project_row_attention_rank,
-        read_process_start_ticks, remove_ide_agent_bash_block, render_fix_lines,
+        pick_keep_pids, project_row_attention_rank, remove_ide_agent_bash_block, render_fix_lines,
         render_ps_diagnostics, render_ps_project_rows, render_ps_summary,
         resolve_za_executable_from_path_env, shell_single_quote, sort_project_rows_for_ps,
         upsert_ide_agent_bash_block,
+    };
+    use crate::command::process::{
+        ProcessIdentity, capture_process_identity, process_identity_matches,
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -2697,15 +2669,12 @@ mod tests {
 
     #[test]
     fn process_identity_matches_current_process_start_ticks() {
-        let pid = std::process::id() as i32;
-        let start_ticks = read_process_start_ticks(pid).expect("current process start ticks");
-        assert!(process_matches_identity(ProcessIdentity {
-            pid,
-            start_ticks
-        }));
-        assert!(!process_matches_identity(ProcessIdentity {
-            pid,
-            start_ticks: start_ticks.saturating_add(1),
+        let identity =
+            capture_process_identity(std::process::id()).expect("capture current process identity");
+        assert!(process_identity_matches(identity));
+        assert!(!process_identity_matches(ProcessIdentity {
+            start_ticks: identity.start_ticks.saturating_add(1),
+            ..identity
         }));
     }
 

@@ -1,4 +1,10 @@
-use crate::cli::{PortCommands, PortSignal};
+use crate::{
+    cli::{PortCommands, PortSignal},
+    command::{
+        print_json,
+        process::{ProcessIdentity, capture_process_identity, process_identity_matches},
+    },
+};
 use anyhow::{Context, Result, anyhow, bail};
 #[cfg(target_os = "linux")]
 use rustix::process::{Pid, Signal, kill_process};
@@ -14,7 +20,6 @@ use std::{
 
 const PROC_ROOT: &str = "/proc";
 const PROC_NET_ROOT: &str = "/proc/net";
-const PORT_REPORT_SCHEMA_VERSION: u8 = 1;
 const PORT_WAIT_TIMEOUT_EXIT: i32 = 30;
 const PORT_OPEN_MISSING_EXIT: i32 = 31;
 const PORT_STOP_FAILED_EXIT: i32 = 32;
@@ -96,6 +101,8 @@ struct SocketEndpoint {
 struct PortOwner {
     pid: u32,
     process: String,
+    #[serde(skip)]
+    identity: Option<ProcessIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -116,7 +123,6 @@ struct PortRow {
 
 #[derive(Debug, Serialize)]
 struct PortReport {
-    schema_version: u8,
     platform: &'static str,
     listen_only: bool,
     filters: PortFilterSummary,
@@ -286,10 +292,7 @@ fn run_open(port: u16, options: PortLsOptions) -> Result<i32> {
 fn run_ls(options: PortLsOptions) -> Result<i32> {
     let report = collect_port_report(&options)?;
     if options.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).context("serialize port output")?
-        );
+        print_json(&report, "serialize port output")?;
     } else {
         print!("{}", render_port_report(&report));
     }
@@ -299,10 +302,7 @@ fn run_ls(options: PortLsOptions) -> Result<i32> {
 fn run_who(options: PortLsOptions) -> Result<i32> {
     let report = collect_port_report(&options)?;
     if options.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).context("serialize port who output")?
-        );
+        print_json(&report, "serialize port who output")?;
     } else if report.rows.is_empty() {
         let port = options
             .ports
@@ -355,10 +355,39 @@ fn run_stop(port: u16, signal: PortSignal, dry_run: bool, options: PortLsOptions
         return Ok(0);
     }
 
+    let refreshed = collect_port_report(&options)?;
+    let current_targets = collect_stop_targets(&refreshed)
+        .into_iter()
+        .filter_map(|owner| owner.identity.map(|identity| (identity, owner)))
+        .collect::<BTreeMap<_, _>>();
     let mut failures = Vec::new();
+    let mut stopped = 0;
     for owner in &targets {
+        let Some(identity) = owner.identity else {
+            failures.push(format!(
+                "{} {}: process identity unavailable",
+                owner.pid, owner.process
+            ));
+            continue;
+        };
+        if !current_targets.contains_key(&identity) {
+            failures.push(format!(
+                "{} {}: process no longer owns the selected port",
+                owner.pid, owner.process
+            ));
+            continue;
+        }
+        if !process_identity_matches(identity) {
+            failures.push(format!(
+                "{} {}: process identity changed before signal delivery",
+                owner.pid, owner.process
+            ));
+            continue;
+        }
         if let Err(err) = send_signal(owner.pid, signal) {
             failures.push(format!("{} {}: {err}", owner.pid, owner.process));
+        } else {
+            stopped += 1;
         }
     }
 
@@ -366,7 +395,7 @@ fn run_stop(port: u16, signal: PortSignal, dry_run: bool, options: PortLsOptions
         println!(
             "Sent {} to {} process(es) owning local port {port}.",
             port_signal_label(signal),
-            targets.len()
+            stopped
         );
         return Ok(0);
     }
@@ -531,7 +560,6 @@ fn collect_port_report_linux(options: &PortLsOptions) -> Result<PortReport> {
     });
 
     Ok(PortReport {
-        schema_version: PORT_REPORT_SCHEMA_VERSION,
         platform: "linux",
         listen_only: !options.all,
         filters: PortFilterSummary {
@@ -575,7 +603,8 @@ fn collect_socket_owners(
     proc_root: &Path,
     pid_filters: &BTreeSet<u32>,
 ) -> Result<HashMap<u64, Vec<PortOwner>>> {
-    let mut owners_by_inode: HashMap<u64, BTreeMap<u32, String>> = HashMap::new();
+    let mut owners_by_inode: HashMap<u64, BTreeMap<u32, (String, ProcessIdentity)>> =
+        HashMap::new();
     for entry in fs::read_dir(proc_root).context("read /proc")? {
         let entry = match entry {
             Ok(entry) => entry,
@@ -589,6 +618,9 @@ fn collect_socket_owners(
         }
 
         let proc_dir = entry.path();
+        let Some(identity) = capture_process_identity(pid) else {
+            continue;
+        };
         let process = read_process_name(&proc_dir).unwrap_or_else(|| pid.to_string());
         let fd_dir = proc_dir.join("fd");
         let fd_entries = match fs::read_dir(&fd_dir) {
@@ -612,7 +644,7 @@ fn collect_socket_owners(
                 .entry(inode)
                 .or_default()
                 .entry(pid)
-                .or_insert_with(|| process.clone());
+                .or_insert_with(|| (process.clone(), identity));
         }
     }
 
@@ -621,7 +653,11 @@ fn collect_socket_owners(
         .map(|(inode, owners)| {
             let owners = owners
                 .into_iter()
-                .map(|(pid, process)| PortOwner { pid, process })
+                .map(|(pid, (process, identity))| PortOwner {
+                    pid,
+                    process,
+                    identity: Some(identity),
+                })
                 .collect::<Vec<_>>();
             (inode, owners)
         })
@@ -1037,21 +1073,19 @@ impl PortRow {
 
 fn collect_stop_targets(report: &PortReport) -> Vec<PortOwner> {
     let current_pid = process::id();
-    let mut owners = BTreeMap::<u32, String>::new();
+    let mut owners = BTreeMap::<ProcessIdentity, PortOwner>::new();
     for row in &report.rows {
         for owner in &row.owners {
             if owner.pid == current_pid {
                 continue;
             }
-            owners
-                .entry(owner.pid)
-                .or_insert_with(|| owner.process.clone());
+            let Some(identity) = owner.identity else {
+                continue;
+            };
+            owners.entry(identity).or_insert_with(|| owner.clone());
         }
     }
-    owners
-        .into_iter()
-        .map(|(pid, process)| PortOwner { pid, process })
-        .collect()
+    owners.into_values().collect()
 }
 
 fn port_signal_label(signal: PortSignal) -> &'static str {
@@ -1120,7 +1154,6 @@ mod tests {
     #[test]
     fn render_port_report_shows_filters_and_owner_visibility_hint() {
         let report = PortReport {
-            schema_version: PORT_REPORT_SCHEMA_VERSION,
             platform: "linux",
             listen_only: true,
             filters: PortFilterSummary {
@@ -1141,6 +1174,7 @@ mod tests {
                 owners: vec![PortOwner {
                     pid: 123,
                     process: "python".to_string(),
+                    identity: None,
                 }],
             }],
             rows_without_visible_owner: 1,
@@ -1158,7 +1192,6 @@ mod tests {
     #[test]
     fn render_port_report_surfaces_pid_filter_visibility_limit_when_empty() {
         let report = PortReport {
-            schema_version: PORT_REPORT_SCHEMA_VERSION,
             platform: "linux",
             listen_only: true,
             filters: PortFilterSummary {
@@ -1201,7 +1234,6 @@ mod tests {
     fn collect_stop_targets_deduplicates_and_skips_current_process() {
         let current_pid = std::process::id();
         let report = PortReport {
-            schema_version: PORT_REPORT_SCHEMA_VERSION,
             platform: "linux",
             listen_only: true,
             filters: PortFilterSummary {
@@ -1224,10 +1256,18 @@ mod tests {
                         PortOwner {
                             pid: current_pid,
                             process: "za".to_string(),
+                            identity: Some(ProcessIdentity {
+                                pid: current_pid as i32,
+                                start_ticks: 1,
+                            }),
                         },
                         PortOwner {
                             pid: 2000,
                             process: "python".to_string(),
+                            identity: Some(ProcessIdentity {
+                                pid: 2000,
+                                start_ticks: 2,
+                            }),
                         },
                     ],
                 },
@@ -1244,6 +1284,10 @@ mod tests {
                     owners: vec![PortOwner {
                         pid: 2000,
                         process: "python".to_string(),
+                        identity: Some(ProcessIdentity {
+                            pid: 2000,
+                            start_ticks: 2,
+                        }),
                     }],
                 },
             ],
@@ -1257,6 +1301,10 @@ mod tests {
             vec![PortOwner {
                 pid: 2000,
                 process: "python".to_string(),
+                identity: Some(ProcessIdentity {
+                    pid: 2000,
+                    start_ticks: 2,
+                }),
             }]
         );
     }
@@ -1264,7 +1312,6 @@ mod tests {
     #[test]
     fn render_follow_snapshot_reports_empty_state() {
         let report = PortReport {
-            schema_version: PORT_REPORT_SCHEMA_VERSION,
             platform: "linux",
             listen_only: true,
             filters: PortFilterSummary {

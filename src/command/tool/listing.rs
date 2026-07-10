@@ -1,4 +1,5 @@
 use super::*;
+use crate::command::print_json;
 
 #[derive(Debug, Clone)]
 pub(super) enum LatestCheck {
@@ -308,10 +309,7 @@ pub(super) fn show_tool(home: &ToolHome, tool: &str, json: bool) -> Result<i32> 
 pub(super) fn show_catalog(json: bool) -> Result<i32> {
     let rows = supported_tools_view();
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&rows).context("serialize supported tools JSON")?
-        );
+        print_json(&rows, "serialize supported tools JSON")?;
     } else {
         print_supported_tools(&rows);
     }
@@ -725,10 +723,7 @@ fn print_installed_json(report: &InstalledToolReport) -> Result<()> {
             .collect(),
         unmanaged: report.unmanaged.clone(),
     };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json).context("serialize tool list JSON")?
-    );
+    print_json(&json, "serialize tool list JSON")?;
     Ok(())
 }
 
@@ -815,10 +810,7 @@ fn print_tool_detail_json(report: &ToolDetailReport) -> Result<()> {
             .collect(),
         unmanaged: report.unmanaged.clone(),
     };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json).context("serialize tool detail JSON")?
-    );
+    print_json(&json, "serialize tool detail JSON")?;
     Ok(())
 }
 
@@ -865,10 +857,7 @@ fn print_outdated_json(report: &OutdatedReport) -> Result<()> {
         has_updates: report.has_updates,
         has_check_failures: !report.check_failures.is_empty(),
     };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json).context("serialize tool outdated JSON")?
-    );
+    print_json(&json, "serialize tool outdated JSON")?;
     Ok(())
 }
 

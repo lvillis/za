@@ -1,5 +1,6 @@
 use super::render::{render_latest_lines, render_latest_toml};
 use super::*;
+use crate::command::print_json;
 
 #[derive(Debug, Clone)]
 pub(crate) struct LatestQuery {
@@ -161,15 +162,14 @@ fn print_latest_json(
     summary: &LatestSummary,
     records: &[LatestRecord],
 ) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&LatestReport {
+    print_json(
+        &LatestReport {
             manifest_path: manifest_path.map(|path| path.display().to_string()),
             summary: summary.clone(),
             records: records.to_vec(),
-        })
-        .context("serialize latest dependency output")?
-    );
+        },
+        "serialize latest dependency output",
+    )?;
     Ok(())
 }
 

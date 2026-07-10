@@ -2,14 +2,12 @@
 
 use crate::{
     cli::PinCommands,
-    command::{render as text_render, za_config},
+    command::{
+        http::build_client, print_json as print_json_envelope, render as text_render, za_config,
+    },
 };
 use anyhow::{Context, Result, anyhow, bail};
-use reqx::{
-    advanced::ClientProfile,
-    blocking::{Client, ClientBuilder},
-    prelude::RetryPolicy,
-};
+use reqx::{advanced::ClientProfile, blocking::Client};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, env, time::Duration};
 
@@ -41,13 +39,9 @@ pub fn run(cmd: PinCommands) -> Result<i32> {
                 print_crate_pin(&record);
             }
         }
-        PinCommands::Action {
-            spec,
-            github_token,
-            json,
-        } => {
+        PinCommands::Action { spec, json } => {
             let spec = ActionSpec::parse(&spec)?;
-            let record = resolve_action_pin(&spec, github_token)?;
+            let record = resolve_action_pin(&spec)?;
             if json {
                 print_json(&record)?;
             } else {
@@ -228,12 +222,12 @@ fn resolve_crate_pin(name: &str) -> Result<CratePinRecord> {
     Ok(build_crate_record(name, version))
 }
 
-fn resolve_action_pin(spec: &ActionSpec, github_token: Option<String>) -> Result<ActionPinRecord> {
+fn resolve_action_pin(spec: &ActionSpec) -> Result<ActionPinRecord> {
     if is_full_commit_sha(&spec.ref_name) {
         return Ok(build_action_record(spec, spec.ref_name.clone(), "input"));
     }
 
-    let token = resolve_github_token(github_token)?;
+    let token = resolve_github_token()?;
     let client = build_http_client(GITHUB_API_BASE)?;
     let ref_path = percent_encode_path_segment(&spec.ref_name);
     let path = format!(
@@ -266,7 +260,7 @@ fn resolve_action_pin(spec: &ActionSpec, github_token: Option<String>) -> Result
         let body = text_render::truncate_end(&response.text_lossy(), 200);
         if status.as_u16() == 403 && token.is_none() {
             bail!(
-                "GitHub API returned 403 for `{}`; set GITHUB_TOKEN, GH_TOKEN, or `za config set github-token <token>`. body: {body}",
+                "GitHub API returned 403 for `{}`; set GITHUB_TOKEN or GH_TOKEN, or pipe a token to `za config set github-token --stdin`. body: {body}",
                 spec.input()
             );
         }
@@ -361,8 +355,7 @@ fn print_kv(label: &str, value: &str) {
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
-    Ok(())
+    print_json_envelope(value, "serialize pin output")
 }
 
 fn parse_npm_package_query(input: &str, tag: Option<&str>) -> Result<NpmPackageQuery> {
@@ -523,113 +516,17 @@ fn is_full_commit_sha(value: &str) -> bool {
 }
 
 fn build_http_client(base_url: &str) -> Result<Client> {
-    let mut builder = Client::builder(base_url)
-        .profile(ClientProfile::StandardSdk)
-        .request_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .total_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .retry_policy(RetryPolicy::disabled())
-        .client_name("za-pin");
-    let scheme = base_url
-        .split_once("://")
-        .map(|(scheme, _)| scheme)
-        .unwrap_or("https");
-    builder = apply_proxy_with_scope(builder, scheme, za_config::ProxyScope::Deps)
-        .with_context(|| format!("configure HTTP client proxy for `{base_url}`"))?;
-    builder
-        .build()
-        .with_context(|| format!("build HTTP client for `{base_url}`"))
+    build_client(
+        base_url,
+        "za-pin",
+        ClientProfile::StandardSdk,
+        false,
+        Duration::from_secs(HTTP_TIMEOUT_SECS),
+        za_config::ProxyScope::Deps,
+    )
 }
 
-fn apply_proxy_with_scope(
-    mut builder: ClientBuilder,
-    scheme: &str,
-    proxy_scope: za_config::ProxyScope,
-) -> Result<ClientBuilder> {
-    let overrides = za_config::load_proxy_overrides(proxy_scope)?;
-    let proxy_value = if scheme.eq_ignore_ascii_case("https") {
-        overrides
-            .https_proxy
-            .clone()
-            .or_else(|| overrides.all_proxy.clone())
-            .or_else(|| overrides.http_proxy.clone())
-    } else {
-        overrides
-            .http_proxy
-            .clone()
-            .or_else(|| overrides.all_proxy.clone())
-            .or_else(|| overrides.https_proxy.clone())
-    };
-
-    let (proxy_var, proxy_value) = if let Some(value) = proxy_value {
-        ("config".to_string(), value)
-    } else if let Some((name, value)) = first_env_value(proxy_env_keys_for_scheme(scheme)) {
-        (name, value)
-    } else {
-        return Ok(builder);
-    };
-
-    let proxy_uri = proxy_value
-        .parse()
-        .with_context(|| format!("invalid proxy URI in `{proxy_var}`"))?;
-    builder = builder.http_proxy(proxy_uri);
-
-    let no_proxy_raw = overrides
-        .no_proxy
-        .clone()
-        .or_else(|| first_env_value(&["NO_PROXY", "no_proxy"]).map(|(_, value)| value));
-    if let Some(no_proxy_raw) = no_proxy_raw {
-        let rules = split_no_proxy_rules(&no_proxy_raw);
-        if !rules.is_empty() {
-            builder = builder
-                .try_no_proxy(rules)
-                .context("invalid `NO_PROXY`/`no_proxy` rules")?;
-        }
-    }
-
-    Ok(builder)
-}
-
-fn proxy_env_keys_for_scheme(scheme: &str) -> &'static [&'static str] {
-    if scheme.eq_ignore_ascii_case("https") {
-        &[
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-            "HTTP_PROXY",
-            "http_proxy",
-        ]
-    } else {
-        &["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
-    }
-}
-
-fn first_env_value(names: &[&str]) -> Option<(String, String)> {
-    for name in names {
-        let Ok(value) = env::var(name) else {
-            continue;
-        };
-        let value = value.trim();
-        if !value.is_empty() {
-            return Some(((*name).to_string(), value.to_string()));
-        }
-    }
-    None
-}
-
-fn split_no_proxy_rules(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|rule| !rule.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn resolve_github_token(override_token: Option<String>) -> Result<Option<String>> {
-    if let Some(token) = normalize_owned(override_token) {
-        return Ok(Some(token));
-    }
+fn resolve_github_token() -> Result<Option<String>> {
     for key in ["ZA_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"] {
         if let Ok(value) = env::var(key)
             && let Some(token) = normalize_owned(Some(value))

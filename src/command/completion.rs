@@ -115,63 +115,71 @@ fn status_completion(shell: CompletionShell, path_override: Option<PathBuf>) -> 
 fn doctor_completion(shell: CompletionShell, path_override: Option<PathBuf>) -> Result<i32> {
     let target_path = completion_target_path(shell, path_override.as_deref())?;
     let legacy = detect_legacy_marker(shell)?;
-    match detect_completion_activation(shell, &target_path, path_override.as_deref()) {
-        Ok(activation) => {
-            let report = build_completion_status_report(shell, target_path, activation, legacy);
-            println!(
-                "{} {} completion doctor  {}",
-                completion_badge(report.status_kind),
-                tty_style::header(shell.label()),
-                completion_status_summary(&report)
-            );
-            println!(
-                "{}  {}",
-                tty_style::dim("target"),
-                report.target_path.display()
-            );
-            println!(
-                "{}  {}",
-                tty_style::dim("file"),
-                if report.target_exists {
-                    "present"
+    let exit_code =
+        match detect_completion_activation(shell, &target_path, path_override.as_deref()) {
+            Ok(activation) => {
+                let report = build_completion_status_report(shell, target_path, activation, legacy);
+                let exit_code = if report.status_kind == CompletionStatusKind::Healthy {
+                    0
                 } else {
-                    "missing"
-                }
-            );
-            println!(
-                "{}  {}",
-                tty_style::dim("activation"),
-                activation_mode_label(shell, report.activation.mode)
-            );
-            println!(
-                "{}  {}",
-                tty_style::dim("availability"),
-                availability_label(&report.activation, shell)
-            );
-            if let Some(location) = &report.activation.location {
-                println!("{}  {}", tty_style::dim("location"), location.display());
-            }
-            if let Some(reason) = &report.activation.reason {
-                println!("{}  {}", tty_style::dim("reason"), reason);
-            }
-            if let Some(next_step) = &report.activation.next_step {
-                println!("{}  {}", tty_style::dim("next"), next_step);
-            }
-            if let LegacyMarkerPresence::Present(path) = report.legacy {
+                    1
+                };
                 println!(
-                    "{}  previous za-managed {} block still present in {}",
-                    tty_style::warning("legacy"),
-                    shell.label(),
-                    path.display()
+                    "{} {} completion doctor  {}",
+                    completion_badge(report.status_kind),
+                    tty_style::header(shell.label()),
+                    completion_status_summary(&report)
                 );
+                println!(
+                    "{}  {}",
+                    tty_style::dim("target"),
+                    report.target_path.display()
+                );
+                println!(
+                    "{}  {}",
+                    tty_style::dim("file"),
+                    if report.target_exists {
+                        "present"
+                    } else {
+                        "missing"
+                    }
+                );
+                println!(
+                    "{}  {}",
+                    tty_style::dim("activation"),
+                    activation_mode_label(shell, report.activation.mode)
+                );
+                println!(
+                    "{}  {}",
+                    tty_style::dim("availability"),
+                    availability_label(&report.activation, shell)
+                );
+                if let Some(location) = &report.activation.location {
+                    println!("{}  {}", tty_style::dim("location"), location.display());
+                }
+                if let Some(reason) = &report.activation.reason {
+                    println!("{}  {}", tty_style::dim("reason"), reason);
+                }
+                if let Some(next_step) = &report.activation.next_step {
+                    println!("{}  {}", tty_style::dim("next"), next_step);
+                }
+                if let LegacyMarkerPresence::Present(path) = report.legacy {
+                    println!(
+                        "{}  previous za-managed {} block still present in {}",
+                        tty_style::warning("legacy"),
+                        shell.label(),
+                        path.display()
+                    );
+                }
+                exit_code
             }
-        }
-        Err(ShellcompError::Failure(failure)) => {
-            print_completion_failure(shell, &target_path, legacy, &failure);
-        }
-        Err(err) => return Err(err).context("detect completion status"),
-    }
-    Ok(0)
+            Err(ShellcompError::Failure(failure)) => {
+                print_completion_failure(shell, &target_path, legacy, &failure);
+                1
+            }
+            Err(err) => return Err(err).context("detect completion status"),
+        };
+    Ok(exit_code)
 }
 
 fn uninstall_completion(shell: CompletionShell, path_override: Option<PathBuf>) -> Result<i32> {

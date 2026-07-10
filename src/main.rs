@@ -127,11 +127,7 @@ fn main() -> Result<()> {
         cli::Commands::Ide { cmd } => exit_with(command::ide::run(cmd)?),
         cli::Commands::Gh { cmd } => match cmd {
             cli::GhCommands::Auth { cmd } => exit_with(command::git::run_auth(cmd)?),
-            cli::GhCommands::Ci {
-                json,
-                github_token,
-                cmd,
-            } => exit_with(command::ci::run(cmd, json, github_token)?),
+            cli::GhCommands::Ci { json, cmd } => exit_with(command::ci::run(cmd, json)?),
             cli::GhCommands::Credential { operation } => {
                 exit_with(command::git::run_credential(operation)?)
             }

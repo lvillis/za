@@ -9,7 +9,10 @@ use self::compact::*;
 use self::session_state::*;
 use self::tmux::*;
 use self::top::*;
-use crate::{cli::CodexCommands, command::write_file_atomically};
+use crate::{
+    cli::CodexCommands,
+    command::{print_json, write_file_atomically},
+};
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -58,7 +61,7 @@ const MANAGED_TRACKER_MATCH_WINDOW_SECS: u64 = 600;
 pub fn run(cmd: Option<CodexCommands>, passthrough_args: &[String]) -> Result<i32> {
     match cmd {
         Some(CodexCommands::Up { args }) => run_up(&args),
-        Some(CodexCommands::Attach) => run_attach(),
+        Some(CodexCommands::Attach { takeover }) => run_attach(takeover),
         Some(CodexCommands::Exec { args }) => run_exec(&args),
         Some(CodexCommands::Resume { args }) => run_resume(&args),
         Some(CodexCommands::Compact {
@@ -226,7 +229,7 @@ fn start_managed_session(
     Ok(())
 }
 
-fn run_attach() -> Result<i32> {
+fn run_attach(takeover: bool) -> Result<i32> {
     ensure_tmux_available()?;
 
     let ctx = resolve_workspace_context()?;
@@ -236,7 +239,16 @@ fn run_attach() -> Result<i32> {
             ctx.workspace_root.display()
         );
     }
-    maybe_attach_or_report(&ctx.session_name, &ctx.workspace_root, &ctx.workspace_label)
+    if is_interactive_terminal() {
+        attach_session_with_mode(
+            &ctx.session_name,
+            &ctx.workspace_label,
+            &ctx.workspace_root,
+            takeover,
+        )
+    } else {
+        maybe_attach_or_report(&ctx.session_name, &ctx.workspace_root, &ctx.workspace_label)
+    }
 }
 
 fn run_exec(args: &[String]) -> Result<i32> {
@@ -298,14 +310,13 @@ fn run_ps(json: bool, all: bool) -> Result<i32> {
     )?;
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&CodexPsOutput {
+        print_json(
+            &CodexPsOutput {
                 tmux_available,
-                sessions: rows.clone()
-            })
-            .context("serialize codex ps output")?
-        );
+                sessions: rows.clone(),
+            },
+            "serialize codex ps output",
+        )?;
         return Ok(0);
     }
 
@@ -382,10 +393,7 @@ fn run_stop(json: bool, all: bool) -> Result<i32> {
     };
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&output).context("serialize codex stop output")?
-        );
+        print_json(&output, "serialize codex stop output")?;
     } else {
         println!("{}", render_stop_message(&output));
     }
@@ -413,15 +421,14 @@ fn run_stop_all(json: bool) -> Result<i32> {
             false
         };
         if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&CodexStopAllOutput {
+            print_json(
+                &CodexStopAllOutput {
                     tmux_available,
                     empty_tmux_server_stopped,
                     sessions: Vec::new(),
-                })
-                .context("serialize codex stop --all output")?
-            );
+                },
+                "serialize codex stop --all output",
+            )?;
         } else {
             println!(
                 "{}",
@@ -473,15 +480,14 @@ fn run_stop_all(json: bool) -> Result<i32> {
     };
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&CodexStopAllOutput {
+        print_json(
+            &CodexStopAllOutput {
                 tmux_available,
                 empty_tmux_server_stopped,
                 sessions: outputs,
-            })
-            .context("serialize codex stop --all output")?
-        );
+            },
+            "serialize codex stop --all output",
+        )?;
     } else {
         for output in &outputs {
             println!("{}", render_stop_message(output));
@@ -752,10 +758,10 @@ mod tests {
         parse_tmux_codex_window_ids, parse_tmux_sessions, render_stop_all_empty_message,
         render_stop_message, resolve_state_home, sanitize_session_label, session_matches_scope,
         session_status_label, shell_escape, stop_target_session_names,
-        summarize_codex_session_lines, tmux_codex_status_command, tmux_codex_status_format,
-        tmux_codex_status_helper_script, tmux_codex_status_left, tmux_codex_status_left_length,
-        tmux_panes_include_listener_endpoint, tmux_terminal_overrides_disable_alt_screen,
-        workspace_hash,
+        summarize_codex_session_lines, tmux_attach_args, tmux_codex_status_command,
+        tmux_codex_status_format, tmux_codex_status_helper_script, tmux_codex_status_left,
+        tmux_codex_status_left_length, tmux_panes_include_listener_endpoint,
+        tmux_terminal_overrides_disable_alt_screen, workspace_hash,
     };
     use anyhow::Result;
     use std::{
@@ -1130,6 +1136,22 @@ mod tests {
         assert!(is_tmux_session_absent(
             "error connecting to /tmp/tmux-0/default (No such file or directory)"
         ));
+    }
+
+    #[test]
+    fn tmux_attach_only_detaches_other_clients_for_explicit_takeover() {
+        assert_eq!(
+            tmux_attach_args("work", false, false),
+            ["attach-session", "-t", "work"]
+        );
+        assert_eq!(
+            tmux_attach_args("work", true, false),
+            ["attach-session", "-d", "-t", "work"]
+        );
+        assert_eq!(
+            tmux_attach_args("work", true, true),
+            ["switch-client", "-t", "work"]
+        );
     }
 
     #[test]

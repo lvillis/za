@@ -687,27 +687,57 @@ pub(super) fn attach_session(
     workspace_label: &str,
     workspace_root: &Path,
 ) -> Result<i32> {
-    tmux_apply_codex_terminal_fixes(session_name)?;
-    tmux_apply_codex_session_style(session_name, workspace_label, workspace_root)?;
-    tmux_attach_session(session_name)
+    attach_session_with_mode(session_name, workspace_label, workspace_root, false)
 }
 
-pub(super) fn tmux_attach_session(session_name: &str) -> Result<i32> {
+pub(super) fn attach_session_with_mode(
+    session_name: &str,
+    workspace_label: &str,
+    workspace_root: &Path,
+    takeover: bool,
+) -> Result<i32> {
+    tmux_apply_codex_terminal_fixes(session_name)?;
+    tmux_apply_codex_session_style(session_name, workspace_label, workspace_root)?;
+    tmux_attach_session(session_name, takeover)
+}
+
+pub(super) fn tmux_attach_session(session_name: &str, takeover: bool) -> Result<i32> {
     if tmux_current_session_is(session_name)? {
         return Ok(0);
     }
 
     let mut cmd = Command::new("tmux");
-    if env::var_os("TMUX").is_some() {
-        cmd.args(["switch-client", "-t", session_name]);
-    } else {
-        cmd.args(["attach-session", "-d", "-t", session_name]);
-    }
+    cmd.args(tmux_attach_args(
+        session_name,
+        takeover,
+        env::var_os("TMUX").is_some(),
+    ));
 
     let status = cmd
         .status()
         .with_context(|| format!("attach tmux session `{session_name}`"))?;
     Ok(status.code().unwrap_or(130))
+}
+
+pub(super) fn tmux_attach_args(
+    session_name: &str,
+    takeover: bool,
+    inside_tmux: bool,
+) -> Vec<String> {
+    if inside_tmux {
+        return vec![
+            "switch-client".to_string(),
+            "-t".to_string(),
+            session_name.to_string(),
+        ];
+    }
+
+    let mut args = vec!["attach-session".to_string()];
+    if takeover {
+        args.push("-d".to_string());
+    }
+    args.extend(["-t".to_string(), session_name.to_string()]);
+    args
 }
 
 pub(super) fn tmux_current_session_is(session_name: &str) -> Result<bool> {

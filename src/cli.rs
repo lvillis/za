@@ -676,9 +676,6 @@ pub enum PinCommands {
         /// Action reference, e.g. actions/checkout@v4 or owner/repo/path@main.
         #[arg(value_name = "OWNER/REPO[/PATH]@REF")]
         spec: String,
-        /// Optional GitHub token override for this request.
-        #[arg(long, value_name = "TOKEN")]
-        github_token: Option<String>,
         /// Print JSON output for scripting.
         #[arg(long)]
         json: bool,
@@ -723,7 +720,11 @@ pub enum ConfigCommands {
     Set {
         #[arg(value_enum)]
         key: ConfigKey,
-        value: String,
+        /// Value to store. Secrets must be supplied with `--stdin` instead.
+        value: Option<String>,
+        /// Read the value from standard input. Required for secret values.
+        #[arg(long, conflicts_with = "value")]
+        stdin: bool,
     },
     /// Get a config value
     Get {
@@ -844,7 +845,11 @@ pub enum CodexCommands {
         args: Vec<String>,
     },
     /// Attach to the current workspace Codex tmux session
-    Attach,
+    Attach {
+        /// Detach other clients before attaching to the session.
+        #[arg(long)]
+        takeover: bool,
+    },
     /// Open a new tmux window inside the current workspace Codex session
     Exec {
         /// Command to run inside the existing tmux session
@@ -915,9 +920,6 @@ pub enum CiCommands {
         /// Print JSON output for scripting.
         #[arg(long)]
         json: bool,
-        /// Optional GitHub token override for this run.
-        #[arg(long, value_name = "TOKEN")]
-        github_token: Option<String>,
     },
     /// List CI status across repos from args or a group manifest
     List {
@@ -936,9 +938,6 @@ pub enum CiCommands {
         /// Show all targets, including clean green repos.
         #[arg(long)]
         all: bool,
-        /// Optional GitHub token override for this run.
-        #[arg(long, value_name = "TOKEN")]
-        github_token: Option<String>,
     },
     /// Drill into failing workflows, jobs, and steps for the current commit
     Inspect {
@@ -948,9 +947,6 @@ pub enum CiCommands {
         /// Print JSON output for scripting.
         #[arg(long)]
         json: bool,
-        /// Optional GitHub token override for this run.
-        #[arg(long, value_name = "TOKEN")]
-        github_token: Option<String>,
     },
     /// Show failure-focused GitHub Actions job logs for the current commit
     Logs {
@@ -963,9 +959,6 @@ pub enum CiCommands {
         /// Print JSON output for scripting.
         #[arg(long)]
         json: bool,
-        /// Optional GitHub token override for this run.
-        #[arg(long, value_name = "TOKEN")]
-        github_token: Option<String>,
     },
 }
 
@@ -982,9 +975,6 @@ pub enum GhCommands {
         /// Print JSON output for scripting.
         #[arg(long)]
         json: bool,
-        /// Optional GitHub token override for this run.
-        #[arg(long, value_name = "TOKEN")]
-        github_token: Option<String>,
         #[command(subcommand)]
         cmd: Option<CiCommands>,
     },
@@ -1760,8 +1750,8 @@ mod tests {
     }
 
     #[test]
-    fn pin_action_parses_token_and_json() {
-        let cli = Cli::try_parse_from([
+    fn pin_action_rejects_plaintext_token_argument() {
+        let result = Cli::try_parse_from([
             "za",
             "pin",
             "action",
@@ -1769,23 +1759,11 @@ mod tests {
             "--github-token",
             "ghp_token",
             "--json",
-        ])
-        .expect("must parse");
-        match cli.cmd {
-            Commands::Pin {
-                cmd:
-                    PinCommands::Action {
-                        spec,
-                        github_token,
-                        json,
-                    },
-            } => {
-                assert_eq!(spec, "actions/checkout@v4");
-                assert_eq!(github_token.as_deref(), Some("ghp_token"));
-                assert!(json);
-            }
-            _ => panic!("unexpected command"),
-        }
+        ]);
+        let Err(error) = result else {
+            panic!("plaintext token arguments must be rejected");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
@@ -1951,13 +1929,17 @@ mod tests {
                             Some(CiCommands::Inspect {
                                 all: true,
                                 json: true,
-                                github_token: None,
                             }),
                         ..
                     },
             } => {}
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn gh_ci_rejects_plaintext_token_argument() {
+        assert!(Cli::try_parse_from(["za", "gh", "ci", "--github-token", "ghp_secret"]).is_err());
     }
 
     #[test]
@@ -1975,7 +1957,6 @@ mod tests {
                                 file,
                                 json: false,
                                 all: true,
-                                github_token: None,
                             }),
                         ..
                     },
@@ -2003,7 +1984,6 @@ mod tests {
                                 recent: true,
                                 lines: 40,
                                 json: true,
-                                github_token: None,
                             }),
                         ..
                     },
@@ -2209,10 +2189,25 @@ mod tests {
         match cli.cmd {
             Commands::Codex { cmd, args } => {
                 assert!(args.is_empty());
-                assert!(matches!(cmd, Some(CodexCommands::Attach)));
+                assert!(matches!(
+                    cmd,
+                    Some(CodexCommands::Attach { takeover: false })
+                ));
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn codex_attach_parses_explicit_takeover() {
+        let cli = Cli::try_parse_from(["za", "codex", "attach", "--takeover"]).expect("must parse");
+        assert!(matches!(
+            cli.cmd,
+            Commands::Codex {
+                cmd: Some(CodexCommands::Attach { takeover: true }),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2447,19 +2442,13 @@ mod tests {
         let cli = Cli::try_parse_from(["za", "github", "ci", "watch"]).expect("must parse");
         match cli.cmd {
             Commands::Gh { cmd } => match cmd {
-                GhCommands::Ci {
-                    json,
-                    github_token,
-                    cmd,
-                } => {
+                GhCommands::Ci { json, cmd } => {
                     assert!(!json);
-                    assert!(github_token.is_none());
                     assert!(matches!(
                         cmd,
                         Some(CiCommands::Watch {
                             timeout_secs: None,
                             json: false,
-                            github_token: None,
                         })
                     ));
                 }

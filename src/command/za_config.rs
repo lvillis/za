@@ -19,7 +19,7 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -321,6 +321,7 @@ pub struct IdeJetbrainsPolicy {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProxyScope {
+    General,
     Run,
     Tool,
     Update,
@@ -336,7 +337,7 @@ pub fn run(cmd: Option<ConfigCommands>) -> Result<()> {
             println!("{}", path.display());
             Ok(())
         }
-        Some(ConfigCommands::Set { key, value }) => set_value(key, value),
+        Some(ConfigCommands::Set { key, value, stdin }) => set_value(key, value, stdin),
         Some(ConfigCommands::Get { key, raw }) => get_value(key, raw),
         Some(ConfigCommands::Unset { key }) => unset_value(key),
     }
@@ -361,6 +362,7 @@ pub fn load_proxy_overrides(scope: ProxyScope) -> Result<ProxyOverrides> {
     let cfg = read_config(&path)?;
     let global = normalize_proxy_config(&cfg.proxy);
     let scoped = match scope {
+        ProxyScope::General => ProxyOverrides::default(),
         ProxyScope::Run => normalize_proxy_config(&cfg.run),
         ProxyScope::Tool => normalize_proxy_config(&cfg.tool),
         ProxyScope::Update => normalize_proxy_config(&cfg.update),
@@ -394,7 +396,28 @@ pub fn load_ide_jetbrains_policy() -> Result<IdeJetbrainsPolicy> {
     })
 }
 
-fn set_value(key: ConfigKey, value: String) -> Result<()> {
+fn set_value(key: ConfigKey, value: Option<String>, stdin: bool) -> Result<()> {
+    let secret = key == ConfigKey::GithubToken;
+    if secret && !stdin {
+        bail!(
+            "`github-token` must be read from standard input; use `za config set github-token --stdin`"
+        );
+    }
+    if !secret && stdin {
+        bail!("`--stdin` is only supported for secret config values");
+    }
+    let value = if stdin {
+        if io::stdin().is_terminal() {
+            bail!("standard input is a terminal; pipe the secret into this command");
+        }
+        let mut value = String::new();
+        io::stdin()
+            .read_to_string(&mut value)
+            .context("read config value from standard input")?;
+        value
+    } else {
+        value.ok_or_else(|| anyhow!("config value is required"))?
+    };
     set_value_impl(key, value, true)?;
     Ok(())
 }
@@ -1235,7 +1258,18 @@ fn mask_secret(secret: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProxyOverrides, merge_proxy_overrides};
+    use super::{ConfigKey, ProxyOverrides, merge_proxy_overrides, set_value};
+
+    #[test]
+    fn github_token_rejects_command_line_value() {
+        let error = set_value(
+            ConfigKey::GithubToken,
+            Some("ghp_secret".to_string()),
+            false,
+        )
+        .expect_err("plaintext secret must be rejected");
+        assert!(error.to_string().contains("--stdin"));
+    }
 
     #[test]
     fn scoped_proxy_overrides_global_values() {

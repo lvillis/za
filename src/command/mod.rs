@@ -8,10 +8,12 @@ pub mod deps;
 pub mod diff;
 pub mod r#gen;
 pub mod git;
+pub mod http;
 pub mod ide;
 pub mod paths;
 pub mod pin;
 pub mod port;
+pub mod process;
 pub mod render;
 pub mod run;
 pub mod style;
@@ -22,6 +24,7 @@ use anyhow::{Context, Result, anyhow};
 use humantime::format_rfc3339_seconds;
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use serde::Serialize;
 use std::{
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
@@ -32,6 +35,26 @@ use std::{
 
 /// ---------- constants ----------
 pub const DEFAULT_MAX_LINES_PER_FILE: usize = 400;
+pub const JSON_SCHEMA_VERSION: u8 = 1;
+
+#[derive(Serialize)]
+struct JsonEnvelope<'a, T> {
+    schema_version: u8,
+    data: &'a T,
+}
+
+pub fn json_string<T: Serialize>(value: &T, context: &'static str) -> Result<String> {
+    serde_json::to_string_pretty(&JsonEnvelope {
+        schema_version: JSON_SCHEMA_VERSION,
+        data: value,
+    })
+    .context(context)
+}
+
+pub fn print_json<T: Serialize>(value: &T, context: &'static str) -> Result<()> {
+    println!("{}", json_string(value, context)?);
+    Ok(())
+}
 
 /// Files to skip regardless of ignore settings.
 const SKIP_BASENAMES: &[&str] = &[".gitignore", ".aiignore", "CONTEXT.md"];
@@ -319,6 +342,16 @@ mod tests {
             .count();
         assert_eq!(leftovers, 0);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn json_output_has_stable_versioned_envelope() {
+        let rendered = json_string(&serde_json::json!({"ok": true}), "serialize test output")
+            .expect("serialize envelope");
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("parse envelope");
+        assert_eq!(parsed["schema_version"], JSON_SCHEMA_VERSION);
+        assert_eq!(parsed["data"]["ok"], true);
+        assert_eq!(parsed.as_object().map(serde_json::Map::len), Some(2));
     }
 
     #[cfg(unix)]

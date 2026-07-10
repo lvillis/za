@@ -13,6 +13,8 @@ use std::{
     process::{Command, Output},
 };
 
+use crate::command::{json_string, print_json};
+
 const DIFF_STAT_BLOCK_COUNT: usize = 5;
 const DIFF_STAT_FILLED_BLOCK: &str = "\u{25A0}";
 const DIFF_STAT_EMPTY_BLOCK: &str = "\u{25A1}";
@@ -24,8 +26,6 @@ const LARGE_DIFF_THRESHOLD_MAX: u64 = 1200;
 const LARGE_DIFF_HISTORY_COMMITS: usize = 200;
 const LARGE_DIFF_HISTORY_MIN_SAMPLES: usize = 32;
 const LARGE_DIFF_HISTORY_PERCENTILE: usize = 90;
-const DIFF_REPORT_SCHEMA_VERSION: u8 = 2;
-const DIFF_STATS_SCHEMA_VERSION: u8 = 1;
 const GENERATED_MARKERS: &[&str] = &[
     "/dist/",
     "/build/",
@@ -91,10 +91,7 @@ pub fn run(options: DiffRunOptions) -> Result<i32> {
     let report = collect_workspace_diff(&repo_root, options.files || !options.json, &filters)?;
 
     if options.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).context("serialize diff output")?
-        );
+        print_json(&report, "serialize diff output")?;
     } else {
         print!(
             "{}",
@@ -114,7 +111,12 @@ pub fn run(options: DiffRunOptions) -> Result<i32> {
     Ok(0)
 }
 
-pub fn render_workspace_output_for_ai(options: &DiffRunOptions) -> Result<String> {
+pub struct AiDiffRender {
+    pub text: String,
+    pub source_bytes: u64,
+}
+
+pub fn render_workspace_output_for_ai(options: &DiffRunOptions) -> Result<AiDiffRender> {
     if options.tui {
         bail!("TUI diff output cannot be rendered as plain text");
     }
@@ -123,10 +125,10 @@ pub fn render_workspace_output_for_ai(options: &DiffRunOptions) -> Result<String
     let filters = DiffFilterSpec::from_run_options(options, &repo_root)?;
     let report = collect_workspace_diff(&repo_root, options.files || !options.json, &filters)?;
 
-    if options.json {
-        serde_json::to_string_pretty(&report).context("serialize diff output")
+    let text = if options.json {
+        json_string(&report, "serialize diff output")?
     } else {
-        Ok(render_diff_report(
+        render_diff_report(
             &report,
             RenderOptions {
                 use_color: false,
@@ -135,8 +137,12 @@ pub fn render_workspace_output_for_ai(options: &DiffRunOptions) -> Result<String
                 terminal_width: Some(100),
                 interactive: false,
             },
-        ))
-    }
+        )
+    };
+    Ok(AiDiffRender {
+        text,
+        source_bytes: report.source_bytes,
+    })
 }
 
 pub fn run_stats(options: DiffStatsRunOptions) -> Result<i32> {
@@ -144,10 +150,7 @@ pub fn run_stats(options: DiffStatsRunOptions) -> Result<i32> {
     let report = collect_diff_stats(&repo_root, &options)?;
 
     if options.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).context("serialize diff stats output")?
-        );
+        print_json(&report, "serialize diff stats output")?;
     } else {
         print!(
             "{}",
@@ -268,7 +271,6 @@ struct DiffKindStat {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct DiffStatsOutput {
-    schema_version: u8,
     repo_root: String,
     head: Option<String>,
     since: String,
@@ -321,7 +323,6 @@ struct DiffStatsTotals {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct DiffWorkspaceOutput {
-    schema_version: u8,
     repo_root: String,
     head: Option<String>,
     clean: bool,
@@ -332,6 +333,8 @@ struct DiffWorkspaceOutput {
     unstaged: DiffSection,
     untracked: DiffSection,
     total: DiffSection,
+    #[serde(skip)]
+    source_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
@@ -457,7 +460,7 @@ fn collect_workspace_diff(
 ) -> Result<DiffWorkspaceOutput> {
     let head = git_head_short(repo_root)?;
     let risk_policy = detect_risk_policy(repo_root)?;
-    let raw_staged_entries = collect_git_diff_entries(
+    let (raw_staged_entries, staged_source_bytes) = collect_git_diff_entries(
         repo_root,
         &["diff", "--cached", "--numstat", "-z", "-M", "--root", "--"],
         &[
@@ -472,14 +475,14 @@ fn collect_workspace_diff(
         NumstatPathMode::Native,
         DiffScope::Staged,
     )?;
-    let raw_unstaged_entries = collect_git_diff_entries(
+    let (raw_unstaged_entries, unstaged_source_bytes) = collect_git_diff_entries(
         repo_root,
         &["diff", "--numstat", "-z", "-M", "--"],
         &["diff", "--name-status", "-z", "-M", "--"],
         NumstatPathMode::Native,
         DiffScope::Unstaged,
     )?;
-    let raw_untracked_entries = collect_untracked_entries(repo_root)?;
+    let (raw_untracked_entries, untracked_source_bytes) = collect_untracked_entries(repo_root)?;
     let mut raw_staged_entries = raw_staged_entries;
     let mut raw_unstaged_entries = raw_unstaged_entries;
     let mut raw_untracked_entries = raw_untracked_entries;
@@ -511,7 +514,6 @@ fn collect_workspace_diff(
     );
 
     Ok(DiffWorkspaceOutput {
-        schema_version: DIFF_REPORT_SCHEMA_VERSION,
         repo_root: repo_root.display().to_string(),
         head,
         clean,
@@ -522,6 +524,9 @@ fn collect_workspace_diff(
         unstaged,
         untracked,
         total,
+        source_bytes: staged_source_bytes
+            .saturating_add(unstaged_source_bytes)
+            .saturating_add(untracked_source_bytes),
     })
 }
 
@@ -555,7 +560,6 @@ fn collect_diff_stats(repo_root: &Path, options: &DiffStatsRunOptions) -> Result
     let total = build_diff_stats_totals(&days, worktree.as_ref());
 
     Ok(DiffStatsOutput {
-        schema_version: DIFF_STATS_SCHEMA_VERSION,
         repo_root: repo_root.display().to_string(),
         head: git_head_short(repo_root)?,
         since: options.since.clone(),
@@ -1111,7 +1115,7 @@ fn collect_git_diff_entries(
     status_args: &[&str],
     path_mode: NumstatPathMode,
     scope: DiffScope,
-) -> Result<Vec<DiffFileStat>> {
+) -> Result<(Vec<DiffFileStat>, u64)> {
     let numstat_output = git_output(repo_root, numstat_args)?;
     if !numstat_output.status.success() {
         let stderr = String::from_utf8_lossy(&numstat_output.stderr);
@@ -1126,10 +1130,11 @@ fn collect_git_diff_entries(
 
     let numstats = parse_numstat_z(&numstat_output.stdout, path_mode)?;
     let statuses = parse_name_status_z(&status_output.stdout)?;
-    merge_diff_entries(numstats, statuses, scope)
+    let source_bytes = output_size(&numstat_output).saturating_add(output_size(&status_output));
+    Ok((merge_diff_entries(numstats, statuses, scope)?, source_bytes))
 }
 
-fn collect_untracked_entries(repo_root: &Path) -> Result<Vec<DiffFileStat>> {
+fn collect_untracked_entries(repo_root: &Path) -> Result<(Vec<DiffFileStat>, u64)> {
     let output = git_output(
         repo_root,
         &["ls-files", "-z", "--others", "--exclude-standard", "--"],
@@ -1143,6 +1148,7 @@ fn collect_untracked_entries(repo_root: &Path) -> Result<Vec<DiffFileStat>> {
     }
 
     let mut entries = Vec::new();
+    let mut source_bytes = output_size(&output);
     for path in parse_nul_paths(&output.stdout)? {
         let numstat_output = git_output_allow_codes(
             repo_root,
@@ -1157,6 +1163,7 @@ fn collect_untracked_entries(repo_root: &Path) -> Result<Vec<DiffFileStat>> {
             ],
             &[1],
         )?;
+        source_bytes = source_bytes.saturating_add(output_size(&numstat_output));
         let numstats = parse_numstat_z(&numstat_output.stdout, NumstatPathMode::NoIndex)?;
         for entry in numstats {
             entries.push(DiffFileStat {
@@ -1176,7 +1183,11 @@ fn collect_untracked_entries(repo_root: &Path) -> Result<Vec<DiffFileStat>> {
         }
     }
 
-    Ok(entries)
+    Ok((entries, source_bytes))
+}
+
+fn output_size(output: &Output) -> u64 {
+    u64::try_from(output.stdout.len().saturating_add(output.stderr.len())).unwrap_or(u64::MAX)
 }
 
 fn parse_numstat_z(raw: &[u8], path_mode: NumstatPathMode) -> Result<Vec<RawNumstatEntry>> {
@@ -2947,13 +2958,13 @@ impl DiffStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        DIFF_REPORT_SCHEMA_VERSION, DIFF_STAT_FILLED_BLOCK, DiffFileKind, DiffFileStat,
-        DiffFilterSpec, DiffFilterSummary, DiffLargeThresholdSource, DiffRisk, DiffRiskKind,
-        DiffRiskLevel, DiffRiskPolicy, DiffScope, DiffSection, DiffStatus, DiffWorkspaceOutput,
-        NumstatPathMode, RenderOptions, StatsRenderOptions, collect_diff_stats,
-        collect_workspace_diff, compute_large_diff_threshold, parse_daily_diff_stats,
-        parse_diff_status, parse_historical_diff_samples, parse_name_status_z, parse_numstat_z,
-        render_diff_report, render_diff_stats_report, resolve_repo_root_from,
+        DIFF_STAT_FILLED_BLOCK, DiffFileKind, DiffFileStat, DiffFilterSpec, DiffFilterSummary,
+        DiffLargeThresholdSource, DiffRisk, DiffRiskKind, DiffRiskLevel, DiffRiskPolicy, DiffScope,
+        DiffSection, DiffStatus, DiffWorkspaceOutput, NumstatPathMode, RenderOptions,
+        StatsRenderOptions, collect_diff_stats, collect_workspace_diff,
+        compute_large_diff_threshold, parse_daily_diff_stats, parse_diff_status,
+        parse_historical_diff_samples, parse_name_status_z, parse_numstat_z, render_diff_report,
+        render_diff_stats_report, resolve_repo_root_from,
     };
     use anyhow::Result;
     use std::{
@@ -3215,7 +3226,7 @@ mod tests {
     #[test]
     fn render_diff_report_adds_ansi_colors_when_enabled() {
         let report = DiffWorkspaceOutput {
-            schema_version: DIFF_REPORT_SCHEMA_VERSION,
+            source_bytes: 0,
             repo_root: "/tmp/repo".to_string(),
             head: Some("abc1234".to_string()),
             clean: false,
@@ -3545,7 +3556,6 @@ mod tests {
     #[test]
     fn render_diff_stats_report_shows_daily_table_and_worktree() {
         let report = super::DiffStatsOutput {
-            schema_version: super::DIFF_STATS_SCHEMA_VERSION,
             repo_root: "/tmp/repo".to_string(),
             head: Some("abc1234".to_string()),
             since: "7d".to_string(),

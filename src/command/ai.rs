@@ -8,11 +8,13 @@ use std::{
     env, fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    process::Command,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crate::cli::{AiCommands, AiGitCommands, AiGitStatusArgs, AiShell};
+use crate::{
+    cli::{AiCommands, AiGitCommands, AiGitStatusArgs, AiShell},
+    command::print_json,
+};
 
 const AI_SESSION_KEY: &str = "ZA_AI_SESSION";
 const AI_AGENT_KEY: &str = "ZA_AI_AGENT";
@@ -20,7 +22,6 @@ const AI_WORKSPACE_KEY: &str = "ZA_AI_WORKSPACE";
 const AI_PREV_BASH_ENV_KEY: &str = "ZA_AI_PREV_BASH_ENV";
 const AI_BASH_ENV_KEY: &str = "BASH_ENV";
 const AI_ANALYTICS_SCHEMA_VERSION: u8 = 1;
-const AI_GAIN_SCHEMA_VERSION: u8 = 1;
 const TOKEN_ESTIMATE_BYTES_PER_TOKEN: u64 = 4;
 
 const AI_ROUTE_MAP: &[(&str, &str)] = &[
@@ -70,7 +71,6 @@ enum GainView {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 struct AiGainOutput {
-    schema_version: u8,
     view: GainView,
     days: u64,
     scope: String,
@@ -164,24 +164,20 @@ pub fn run(cmd: AiCommands) -> Result<i32> {
             };
             let output = build_gain_output(days, all, view)?;
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&output).context("serialize ai gain output")?
-                );
+                print_json(&output, "serialize ai gain output")?;
             } else {
                 print!("{}", render_gain(&output));
             }
         }
         AiCommands::Doctor { json } => {
             let report = collect_doctor_output()?;
+            let exit_code = i32::from(!report.active || !report.issues.is_empty());
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report).context("serialize ai doctor output")?
-                );
+                print_json(&report, "serialize ai doctor output")?;
             } else {
                 print!("{}", render_doctor(&report));
             }
+            return Ok(exit_code);
         }
         AiCommands::Git { cmd } => return run_git(cmd),
     }
@@ -240,45 +236,33 @@ fn render_and_record_ai_route(
     ctx: &AiSessionContext,
     route: &str,
     source_command: Vec<String>,
-    render: impl FnOnce() -> Result<String>,
+    render: impl FnOnce() -> Result<crate::command::diff::AiDiffRender>,
 ) -> Result<i32> {
     let started = Instant::now();
-    let summary = render()?;
+    let rendered = render()?;
     let duration_ms = started.elapsed().as_millis() as u64;
-    let raw_bytes = capture_command_output_bytes(&source_command).ok();
+    let summary = rendered.text;
+    let raw_bytes = rendered.source_bytes;
 
     print!("{summary}");
 
-    if let Some(raw_bytes) = raw_bytes {
-        let summary_bytes = summary.len() as u64;
-        let record = AiAnalyticsRecord {
-            schema_version: AI_ANALYTICS_SCHEMA_VERSION,
-            recorded_at_unix_ms: unix_timestamp_ms(),
-            agent: ctx.agent.clone(),
-            workspace: ctx.workspace.clone(),
-            route: route.to_string(),
-            source_command: source_command.join(" "),
-            raw_bytes,
-            summary_bytes,
-            raw_estimated_tokens: estimate_tokens_from_bytes(raw_bytes),
-            summary_estimated_tokens: estimate_tokens_from_bytes(summary_bytes),
-            duration_ms,
-        };
-        let _ = analytics::append_record(&record);
-    }
+    let summary_bytes = summary.len() as u64;
+    let record = AiAnalyticsRecord {
+        schema_version: AI_ANALYTICS_SCHEMA_VERSION,
+        recorded_at_unix_ms: unix_timestamp_ms(),
+        agent: ctx.agent.clone(),
+        workspace: ctx.workspace.clone(),
+        route: route.to_string(),
+        source_command: source_command.join(" "),
+        raw_bytes,
+        summary_bytes,
+        raw_estimated_tokens: estimate_tokens_from_bytes(raw_bytes),
+        summary_estimated_tokens: estimate_tokens_from_bytes(summary_bytes),
+        duration_ms,
+    };
+    let _ = analytics::append_record(&record);
 
     Ok(0)
-}
-
-fn capture_command_output_bytes(argv: &[String]) -> Result<u64> {
-    let (program, args) = argv
-        .split_first()
-        .ok_or_else(|| anyhow::anyhow!("cannot execute empty source command"))?;
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("capture source command `{}`", argv.join(" ")))?;
-    Ok((output.stdout.len() + output.stderr.len()) as u64)
 }
 
 fn raw_git_diff_command(args: &crate::cli::AiGitDiffArgs) -> Vec<String> {
@@ -634,7 +618,6 @@ fn aggregate_gain_records(
     history.truncate(20);
 
     AiGainOutput {
-        schema_version: AI_GAIN_SCHEMA_VERSION,
         view,
         days,
         scope: scope.to_string(),

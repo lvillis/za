@@ -1,4 +1,5 @@
 use super::*;
+use crate::command::print_json;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -87,19 +88,17 @@ pub(super) fn run_doctor(home: &ToolHome, tools: &[String], json: bool) -> Resul
         summary,
         rows,
     };
+    let exit_code = i32::from(report.summary.error > 0);
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).context("serialize tool doctor output")?
-        );
+        print_json(&report, "serialize tool doctor output")?;
     } else {
         for line in render_doctor_lines(&report) {
             println!("{line}");
         }
     }
 
-    Ok(0)
+    Ok(exit_code)
 }
 
 fn doctor_target_names(home: &ToolHome, tools: &[String]) -> Result<Vec<String>> {

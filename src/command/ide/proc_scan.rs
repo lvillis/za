@@ -110,7 +110,9 @@ fn collect_jetbrains_sessions_from_snapshot(snapshot: &ProcScanSnapshot) -> Vec<
         };
 
         let (cpu_percent, rss_bytes, uptime_secs) = process_resource_usage(process, snapshot);
-        let uid = read_uid_from_status(&process.proc_dir.join("status")).unwrap_or(0);
+        let Some(uid) = read_uid_from_status(&process.proc_dir.join("status")) else {
+            continue;
+        };
         let remote_state = remote_state_by_pid
             .get(&process.pid)
             .cloned()
@@ -213,7 +215,9 @@ fn collect_zed_sessions_from_snapshot(snapshot: &ProcScanSnapshot) -> Vec<IdeSes
         }
 
         let (cpu_percent, rss_bytes, uptime_secs) = process_resource_usage(process, snapshot);
-        let uid = read_uid_from_status(&process.proc_dir.join("status")).unwrap_or(0);
+        let Some(uid) = read_uid_from_status(&process.proc_dir.join("status")) else {
+            continue;
+        };
         let link_pid = zed
             .workspace_id
             .as_ref()

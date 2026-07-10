@@ -2,13 +2,8 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use flate2::read::GzDecoder;
-use reqx::{
-    advanced::{ClientProfile, RedirectPolicy},
-    blocking::{Client, ClientBuilder},
-    prelude::RetryPolicy,
-};
+use reqx::advanced::ClientProfile;
 use std::{
-    env,
     fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -18,7 +13,8 @@ use std::{
 use tar::Archive;
 
 use crate::command::{
-    BinaryFile, TextFile, lang_of, md_header, walk_workspace, write_file_atomically,
+    BinaryFile, TextFile, http::build_client, lang_of, md_header, walk_workspace,
+    write_file_atomically, za_config::ProxyScope,
 };
 
 const HTTP_TIMEOUT_SECS: u64 = 180;
@@ -268,7 +264,14 @@ fn extract_tar_gz_archive(archive_path: &Path, out_dir: &Path) -> Result<PathBuf
 
 fn download_to_path(url: &str, dst: &Path) -> Result<()> {
     let url_parts = parse_url_parts(url)?;
-    let client = build_http_client(&url_parts.base_url, "za-gen", true)?;
+    let client = build_client(
+        &url_parts.base_url,
+        "za-gen",
+        ClientProfile::HighThroughput,
+        true,
+        Duration::from_secs(HTTP_TIMEOUT_SECS),
+        ProxyScope::General,
+    )?;
 
     let mut req = client.get(url_parts.path_and_query);
     req = req
@@ -345,89 +348,6 @@ fn parse_url_parts(url: &str) -> Result<UrlParts> {
             path_and_query
         },
     })
-}
-
-const HTTPS_PROXY_ENV_KEYS: [&str; 6] = [
-    "HTTPS_PROXY",
-    "https_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-    "HTTP_PROXY",
-    "http_proxy",
-];
-const HTTP_PROXY_ENV_KEYS: [&str; 4] = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
-
-fn proxy_env_keys_for_scheme(scheme: &str) -> &'static [&'static str] {
-    if scheme.eq_ignore_ascii_case("https") {
-        &HTTPS_PROXY_ENV_KEYS
-    } else {
-        &HTTP_PROXY_ENV_KEYS
-    }
-}
-
-fn first_env_value(names: &[&str]) -> Option<(String, String)> {
-    for name in names {
-        let Ok(value) = env::var(name) else {
-            continue;
-        };
-        let value = value.trim();
-        if !value.is_empty() {
-            return Some(((*name).to_string(), value.to_string()));
-        }
-    }
-    None
-}
-
-fn split_no_proxy_rules(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|rule| !rule.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn apply_proxy_from_env(mut builder: ClientBuilder, scheme: &str) -> Result<ClientBuilder> {
-    let Some((proxy_var, proxy_value)) = first_env_value(proxy_env_keys_for_scheme(scheme)) else {
-        return Ok(builder);
-    };
-
-    let proxy_uri = proxy_value
-        .parse()
-        .with_context(|| format!("invalid proxy URI in `{proxy_var}`"))?;
-    builder = builder.http_proxy(proxy_uri);
-
-    if let Some((_, no_proxy_raw)) = first_env_value(&["NO_PROXY", "no_proxy"]) {
-        let rules = split_no_proxy_rules(&no_proxy_raw);
-        if !rules.is_empty() {
-            builder = builder
-                .try_no_proxy(rules)
-                .context("invalid `NO_PROXY`/`no_proxy` rules")?;
-        }
-    }
-
-    Ok(builder)
-}
-
-fn build_http_client(base_url: &str, client_name: &str, follow_redirects: bool) -> Result<Client> {
-    let mut builder = Client::builder(base_url)
-        .profile(ClientProfile::HighThroughput)
-        .request_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .total_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .retry_policy(RetryPolicy::disabled())
-        .client_name(client_name);
-    if follow_redirects {
-        builder = builder.redirect_policy(RedirectPolicy::follow());
-    }
-    let scheme = base_url
-        .split_once("://")
-        .map(|(s, _)| s)
-        .unwrap_or("https");
-    builder = apply_proxy_from_env(builder, scheme)
-        .with_context(|| format!("configure HTTP client proxy for `{base_url}`"))?;
-    builder
-        .build()
-        .with_context(|| format!("build HTTP client for `{base_url}`"))
 }
 
 /// RAII guard for temporarily changing current working directory.

@@ -1,9 +1,6 @@
 use super::*;
-use reqx::{
-    advanced::ClientProfile,
-    blocking::{Client, ClientBuilder},
-    prelude::RetryPolicy,
-};
+use crate::command::http::build_client;
+use reqx::{advanced::ClientProfile, blocking::Client};
 use std::fs::{File, OpenOptions};
 
 pub(super) struct ApiClient {
@@ -103,16 +100,6 @@ impl GitHubTagsCacheEntry {
         }
     }
 }
-
-const HTTPS_PROXY_ENV_KEYS: [&str; 6] = [
-    "HTTPS_PROXY",
-    "https_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-    "HTTP_PROXY",
-    "http_proxy",
-];
-const HTTP_PROXY_ENV_KEYS: [&str; 4] = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
 
 impl DepsCacheState {
     fn load() -> Self {
@@ -778,101 +765,15 @@ fn normalize_optional_string(input: Option<String>) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn proxy_env_keys_for_scheme(scheme: &str) -> &'static [&'static str] {
-    if scheme.eq_ignore_ascii_case("https") {
-        &HTTPS_PROXY_ENV_KEYS
-    } else {
-        &HTTP_PROXY_ENV_KEYS
-    }
-}
-
-fn first_env_value(names: &[&str]) -> Option<(String, String)> {
-    for name in names {
-        let Ok(value) = env::var(name) else {
-            continue;
-        };
-        let value = value.trim();
-        if !value.is_empty() {
-            return Some(((*name).to_string(), value.to_string()));
-        }
-    }
-    None
-}
-
-fn split_no_proxy_rules(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|rule| !rule.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn apply_proxy_with_scope(
-    mut builder: ClientBuilder,
-    scheme: &str,
-    proxy_scope: za_config::ProxyScope,
-) -> Result<ClientBuilder> {
-    let overrides = za_config::load_proxy_overrides(proxy_scope)?;
-    let proxy_value = if scheme.eq_ignore_ascii_case("https") {
-        overrides
-            .https_proxy
-            .clone()
-            .or_else(|| overrides.all_proxy.clone())
-            .or_else(|| overrides.http_proxy.clone())
-    } else {
-        overrides
-            .http_proxy
-            .clone()
-            .or_else(|| overrides.all_proxy.clone())
-            .or_else(|| overrides.https_proxy.clone())
-    };
-
-    let (proxy_var, proxy_value) = if let Some(value) = proxy_value {
-        ("config".to_string(), value)
-    } else if let Some((name, value)) = first_env_value(proxy_env_keys_for_scheme(scheme)) {
-        (name, value)
-    } else {
-        return Ok(builder);
-    };
-
-    let proxy_uri = proxy_value
-        .parse()
-        .with_context(|| format!("invalid proxy URI in `{proxy_var}`"))?;
-    builder = builder.http_proxy(proxy_uri);
-
-    let no_proxy_raw = overrides
-        .no_proxy
-        .clone()
-        .or_else(|| first_env_value(&["NO_PROXY", "no_proxy"]).map(|(_, value)| value));
-    if let Some(no_proxy_raw) = no_proxy_raw {
-        let rules = split_no_proxy_rules(&no_proxy_raw);
-        if !rules.is_empty() {
-            builder = builder
-                .try_no_proxy(rules)
-                .context("invalid `NO_PROXY`/`no_proxy` rules")?;
-        }
-    }
-
-    Ok(builder)
-}
-
 fn build_http_client(base_url: &str) -> Result<Client> {
-    let mut builder = Client::builder(base_url)
-        .profile(ClientProfile::StandardSdk)
-        .request_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .total_timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .retry_policy(RetryPolicy::disabled())
-        .client_name("za-deps-audit");
-    let scheme = base_url
-        .split_once("://")
-        .map(|(scheme, _)| scheme)
-        .unwrap_or("https");
-    builder = apply_proxy_with_scope(builder, scheme, za_config::ProxyScope::Deps)
-        .with_context(|| format!("configure HTTP client proxy for `{base_url}`"))?;
-    builder
-        .build()
-        .with_context(|| format!("build HTTP client for `{base_url}`"))
+    build_client(
+        base_url,
+        "za-deps-audit",
+        ClientProfile::StandardSdk,
+        false,
+        Duration::from_secs(HTTP_TIMEOUT_SECS),
+        za_config::ProxyScope::Deps,
+    )
 }
 
 fn resolve_github_token() -> Result<Option<String>> {

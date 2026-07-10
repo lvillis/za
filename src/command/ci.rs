@@ -6,16 +6,14 @@ mod render;
 use crate::{
     cli::CiCommands,
     command::{
-        render as text_render, style as tty_style, write_file_atomically,
+        http::build_client,
+        print_json, render as text_render, style as tty_style, write_file_atomically,
         za_config::{self, ProxyScope},
     },
 };
 use anyhow::{Context, Result, anyhow, bail};
 use humantime::parse_rfc3339_weak;
-use reqx::{
-    advanced::{ClientProfile, RedirectPolicy},
-    blocking::{Client, ClientBuilder},
-};
+use reqx::{advanced::ClientProfile, blocking::Client};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -44,34 +42,25 @@ const EXIT_NO_RUNS: i32 = 12;
 const CI_CACHE_SCHEMA_VERSION: u8 = 1;
 const CI_CACHE_FILE_NAME: &str = "gh-ci-cache-v1.json";
 const CI_CACHE_TTL_SECS: u64 = 20;
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub fn run(cmd: Option<CiCommands>, json: bool, github_token: Option<String>) -> Result<i32> {
+pub fn run(cmd: Option<CiCommands>, json: bool) -> Result<i32> {
     match cmd {
-        None => run_status(json, github_token),
-        Some(CiCommands::Watch {
-            timeout_secs,
-            json,
-            github_token,
-        }) => run_watch(timeout_secs, json, github_token),
+        None => run_status(json),
+        Some(CiCommands::Watch { timeout_secs, json }) => run_watch(timeout_secs, json),
         Some(CiCommands::List {
             group,
             repo,
             file,
             json,
             all,
-            github_token,
-        }) => run_list(group, repo, file, json, all, github_token),
-        Some(CiCommands::Inspect {
-            all,
-            json,
-            github_token,
-        }) => run_inspect(all, json, github_token),
+        }) => run_list(group, repo, file, json, all),
+        Some(CiCommands::Inspect { all, json }) => run_inspect(all, json),
         Some(CiCommands::Logs {
             recent,
             lines,
             json,
-            github_token,
-        }) => run_logs(recent, lines, json, github_token),
+        }) => run_logs(recent, lines, json),
     }
 }
 
@@ -108,10 +97,10 @@ struct GitHubClient {
 }
 
 impl GitHubClient {
-    fn new(github_token_override: Option<String>, cache_mode: CiCacheMode) -> Result<Self> {
+    fn new(cache_mode: CiCacheMode) -> Result<Self> {
         Ok(Self {
             http: build_http_client(GITHUB_API_BASE)?,
-            github_token: resolve_github_token(github_token_override)?,
+            github_token: resolve_github_token()?,
             cache: matches!(cache_mode, CiCacheMode::ReadWrite)
                 .then(|| Mutex::new(CiApiCacheState::load())),
         })
@@ -317,7 +306,7 @@ impl GitHubClient {
             if status.as_u16() == 403 {
                 if self.github_token.is_none() {
                     bail!(
-                        "GitHub API returned 403 for `{path}`; set GITHUB_TOKEN, GH_TOKEN, or `za config set github-token <token>`. body: {body}"
+                        "GitHub API returned 403 for `{path}`; set GITHUB_TOKEN or GH_TOKEN, or pipe a token to `za config set github-token --stdin`. body: {body}"
                     );
                 }
                 bail!("GitHub API returned 403 for `{path}`. body: {body}");
@@ -364,7 +353,7 @@ impl GitHubClient {
             if status.as_u16() == 403 {
                 if self.github_token.is_none() {
                     bail!(
-                        "GitHub API returned 403 for `{path}`; set GITHUB_TOKEN, GH_TOKEN, or `za config set github-token <token>`. body: {body}"
+                        "GitHub API returned 403 for `{path}`; set GITHUB_TOKEN or GH_TOKEN, or pipe a token to `za config set github-token --stdin`. body: {body}"
                     );
                 }
                 bail!("GitHub API returned 403 for `{path}`. body: {body}");
@@ -484,24 +473,21 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
-fn run_status(json: bool, github_token: Option<String>) -> Result<i32> {
-    let client = GitHubClient::new(github_token, CiCacheMode::ReadWrite)?;
+fn run_status(json: bool) -> Result<i32> {
+    let client = GitHubClient::new(CiCacheMode::ReadWrite)?;
     let report = client
         .fetch_commit_report_for_local_path(&env::current_dir()?, CiSourceKind::CurrentRepo)?;
     client.flush_cache()?;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).context("serialize ci status output")?
-        );
+        print_json(&report, "serialize ci status output")?;
         return Ok(exit_code_for_state(report.state));
     }
     print_commit_report(&report);
     Ok(exit_code_for_state(report.state))
 }
 
-fn run_watch(timeout_secs: Option<u64>, json: bool, github_token: Option<String>) -> Result<i32> {
-    let client = GitHubClient::new(github_token, CiCacheMode::Bypass)?;
+fn run_watch(timeout_secs: Option<u64>, json: bool) -> Result<i32> {
+    let client = GitHubClient::new(CiCacheMode::Bypass)?;
     let cwd = env::current_dir()?;
     let started = Instant::now();
     let mut last_digest = None::<String>;
@@ -538,10 +524,7 @@ fn run_watch(timeout_secs: Option<u64>, json: bool, github_token: Option<String>
         thread::sleep(watch_interval_for_state(report.state));
     };
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).context("serialize ci watch output")?
-        );
+        print_json(&report, "serialize ci watch output")?;
         return Ok(exit_code_for_state(report.state));
     }
 
@@ -558,9 +541,8 @@ fn run_list(
     file: Option<PathBuf>,
     json: bool,
     show_all: bool,
-    github_token: Option<String>,
 ) -> Result<i32> {
-    let client = GitHubClient::new(github_token, CiCacheMode::ReadWrite)?;
+    let client = GitHubClient::new(CiCacheMode::ReadWrite)?;
     let targets = resolve_list_targets(group, repos, file)?;
     let mut entries = Vec::with_capacity(targets.len());
     let mut summary = CiBoardSummary::default();
@@ -604,18 +586,15 @@ fn run_list(
     let out = CiBoardOutput { summary, entries };
     client.flush_cache()?;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&out).context("serialize ci list output")?
-        );
+        print_json(&out, "serialize ci list output")?;
         return Ok(exit_code_for_board(&out));
     }
     print_board_output(&out, show_all);
     Ok(exit_code_for_board(&out))
 }
 
-fn run_inspect(all: bool, json: bool, github_token: Option<String>) -> Result<i32> {
-    let client = GitHubClient::new(github_token, CiCacheMode::ReadWrite)?;
+fn run_inspect(all: bool, json: bool) -> Result<i32> {
+    let client = GitHubClient::new(CiCacheMode::ReadWrite)?;
     let cwd = env::current_dir()?;
     let ctx = resolve_local_repo_context(&cwd)?;
     let report = client.fetch_commit_report_for_sha(
@@ -629,10 +608,7 @@ fn run_inspect(all: bool, json: bool, github_token: Option<String>) -> Result<i3
     client.flush_cache()?;
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&inspect).context("serialize ci inspect output")?
-        );
+        print_json(&inspect, "serialize ci inspect output")?;
         return Ok(exit_code_for_state(report.state));
     }
 
@@ -642,17 +618,12 @@ fn run_inspect(all: bool, json: bool, github_token: Option<String>) -> Result<i3
     Ok(exit_code_for_state(report.state))
 }
 
-fn run_logs(
-    recent: bool,
-    line_limit: usize,
-    json: bool,
-    github_token: Option<String>,
-) -> Result<i32> {
+fn run_logs(recent: bool, line_limit: usize, json: bool) -> Result<i32> {
     if line_limit == 0 {
         bail!("`--lines` must be greater than 0");
     }
 
-    let client = GitHubClient::new(github_token, CiCacheMode::ReadWrite)?;
+    let client = GitHubClient::new(CiCacheMode::ReadWrite)?;
     let cwd = env::current_dir()?;
     let ctx = resolve_local_repo_context(&cwd)?;
     let report = if recent {
@@ -670,10 +641,7 @@ fn run_logs(
     client.flush_cache()?;
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&logs).context("serialize ci logs output")?
-        );
+        print_json(&logs, "serialize ci logs output")?;
         return Ok(exit_code_for_state(logs.state));
     }
 
@@ -885,25 +853,17 @@ fn default_ci_manifest_path() -> Result<PathBuf> {
 }
 
 fn build_http_client(base_url: &str) -> Result<Client> {
-    let mut builder = Client::builder(base_url)
-        .profile(ClientProfile::StandardSdk)
-        .redirect_policy(RedirectPolicy::follow())
-        .client_name("za-ci");
-    let scheme = base_url
-        .split_once("://")
-        .map(|(scheme, _)| scheme)
-        .unwrap_or("https");
-    builder = apply_proxy_with_scope(builder, scheme, ProxyScope::Ci)
-        .with_context(|| format!("configure HTTP client proxy for `{base_url}`"))?;
-    builder
-        .build()
-        .with_context(|| format!("build HTTP client for `{base_url}`"))
+    build_client(
+        base_url,
+        "za-ci",
+        ClientProfile::StandardSdk,
+        true,
+        HTTP_TIMEOUT,
+        ProxyScope::Ci,
+    )
 }
 
-fn resolve_github_token(override_token: Option<String>) -> Result<Option<String>> {
-    if let Some(token) = normalize_owned(override_token) {
-        return Ok(Some(token));
-    }
+fn resolve_github_token() -> Result<Option<String>> {
     for key in ["ZA_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"] {
         if let Ok(value) = env::var(key)
             && let Some(token) = normalize_owned(Some(value))
@@ -912,95 +872,6 @@ fn resolve_github_token(override_token: Option<String>) -> Result<Option<String>
         }
     }
     za_config::load_github_token()
-}
-
-const HTTPS_PROXY_ENV_KEYS: [&str; 6] = [
-    "HTTPS_PROXY",
-    "https_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-    "HTTP_PROXY",
-    "http_proxy",
-];
-const HTTP_PROXY_ENV_KEYS: [&str; 4] = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
-
-fn apply_proxy_with_scope(
-    mut builder: ClientBuilder,
-    scheme: &str,
-    proxy_scope: ProxyScope,
-) -> Result<ClientBuilder> {
-    let overrides = za_config::load_proxy_overrides(proxy_scope)?;
-    let proxy_value = if scheme.eq_ignore_ascii_case("https") {
-        overrides
-            .https_proxy
-            .clone()
-            .or_else(|| overrides.all_proxy.clone())
-            .or_else(|| overrides.http_proxy.clone())
-    } else {
-        overrides
-            .http_proxy
-            .clone()
-            .or_else(|| overrides.all_proxy.clone())
-            .or_else(|| overrides.https_proxy.clone())
-    };
-
-    let (proxy_var, proxy_value) = if let Some(value) = proxy_value {
-        ("config".to_string(), value)
-    } else if let Some((name, value)) = first_env_value(proxy_env_keys_for_scheme(scheme)) {
-        (name, value)
-    } else {
-        return Ok(builder);
-    };
-
-    let proxy_uri = proxy_value
-        .parse()
-        .with_context(|| format!("invalid proxy URI in `{proxy_var}`"))?;
-    builder = builder.http_proxy(proxy_uri);
-
-    let no_proxy_raw = overrides
-        .no_proxy
-        .clone()
-        .or_else(|| first_env_value(&["NO_PROXY", "no_proxy"]).map(|(_, value)| value));
-    if let Some(no_proxy_raw) = no_proxy_raw {
-        let rules = split_no_proxy_rules(&no_proxy_raw);
-        if !rules.is_empty() {
-            builder = builder
-                .try_no_proxy(rules)
-                .context("invalid `NO_PROXY`/`no_proxy` rules")?;
-        }
-    }
-
-    Ok(builder)
-}
-
-fn proxy_env_keys_for_scheme(scheme: &str) -> &'static [&'static str] {
-    if scheme.eq_ignore_ascii_case("https") {
-        &HTTPS_PROXY_ENV_KEYS
-    } else {
-        &HTTP_PROXY_ENV_KEYS
-    }
-}
-
-fn first_env_value(names: &[&str]) -> Option<(String, String)> {
-    for name in names {
-        let Ok(value) = env::var(name) else {
-            continue;
-        };
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Some(((*name).to_string(), trimmed.to_string()));
-        }
-    }
-    None
-}
-
-fn split_no_proxy_rules(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|rule| !rule.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 #[cfg(test)]

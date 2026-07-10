@@ -11,11 +11,7 @@ mod state;
 use anyhow::{Context, Result, anyhow, bail};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use regex::Regex;
-use reqx::{
-    advanced::{ClientProfile, RedirectPolicy},
-    blocking::{Client, ClientBuilder},
-    prelude::RetryPolicy,
-};
+use reqx::{advanced::ClientProfile, blocking::Client};
 use serde::{Deserialize, Serialize};
 use signal_hook::{consts::signal::SIGINT, flag as signal_flag};
 #[cfg(unix)]
@@ -52,6 +48,7 @@ use self::policy::{
 };
 use self::source::{resolve_install_source, resolve_requested_version};
 use self::{batch::*, integrations::*, state::*};
+use crate::command::process::output_with_timeout;
 use crate::{
     cli::ToolCommands,
     command::{paths, render as text_render, style as tty_style, write_file_atomically, za_config},
@@ -82,6 +79,7 @@ const PROXY_HINT: &str =
 const TOOL_UPDATE_CACHE_SCHEMA_VERSION: u32 = 3;
 const TOOL_UPDATE_CACHE_FILE_NAME: &str = "tool-latest-cache-v3.json";
 const TOOL_UPDATE_CACHE_TTL_SECS: u64 = 10 * 60;
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TOOL_UPDATE_JOBS_MULTIPLIER: usize = 2;
 const TOOL_UPDATE_JOBS_MIN: usize = 2;
 const TOOL_UPDATE_JOBS_MAX: usize = 8;
@@ -694,9 +692,7 @@ fn backup_existing_self_binary(home: &ToolHome) -> Result<Option<PathBuf>> {
 
 fn verify_self_update(home: &ToolHome, installed: &ToolRef) -> Result<()> {
     let bin = home.bin_path("za");
-    let output = Command::new(&bin)
-        .arg("--version")
-        .output()
+    let output = output_with_timeout(Command::new(&bin).arg("--version"), VERSION_PROBE_TIMEOUT)
         .with_context(|| format!("run self-update health check {}", bin.display()))?;
     if !output.status.success() {
         bail!(
@@ -1969,7 +1965,10 @@ fn collect_unmanaged_binaries(home: &ToolHome) -> Result<Vec<UnmanagedBinary>> {
 }
 
 fn probe_binary_version(binary_path: &Path) -> Result<Option<String>> {
-    let output = match Command::new(binary_path).arg("--version").output() {
+    let output = match output_with_timeout(
+        Command::new(binary_path).arg("--version"),
+        VERSION_PROBE_TIMEOUT,
+    ) {
         Ok(output) => output,
         Err(_) => return Ok(None),
     };

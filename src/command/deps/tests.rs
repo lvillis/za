@@ -439,8 +439,9 @@ fn empty_audit_writes_requested_json_report() {
 
     let output = fs::read_to_string(&report).expect("read report");
     let json: serde_json::Value = serde_json::from_str(&output).expect("parse report");
-    assert_eq!(json["dependencies"], serde_json::json!([]));
-    assert_eq!(json["actions"], serde_json::Value::Null);
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["data"]["dependencies"], serde_json::json!([]));
+    assert_eq!(json["data"]["actions"], serde_json::Value::Null);
 
     let _ = fs::remove_dir_all(root);
 }

@@ -3,6 +3,7 @@ use super::latest::{
 };
 use super::model::{ActionUpdatePlan, DependencyUpdatePlan};
 use super::*;
+use crate::command::json_string;
 
 pub(super) fn build_summary(records: &[DepAuditRecord], skipped_local: usize) -> AuditSummary {
     let mut summary = AuditSummary::default();
@@ -928,8 +929,9 @@ pub(super) fn write_json_report(
         dependencies: records.to_vec(),
         actions: actions.to_vec(),
     };
-    let json = serde_json::to_vec_pretty(&report).context("serialize dependency report JSON")?;
-    write_file_atomically(&path, json).with_context(|| format!("write {}", path.display()))?;
+    let json = json_string(&report, "serialize dependency report JSON")?;
+    write_file_atomically(&path, json.as_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
     println!("JSON report written: {}", path.display());
     Ok(())
 }

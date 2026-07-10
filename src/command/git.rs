@@ -1,6 +1,9 @@
 //! Git authentication integration utilities.
 
-use crate::{cli::GitAuthCommands, command::za_config};
+use crate::{
+    cli::GitAuthCommands,
+    command::{print_json, za_config},
+};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::{
@@ -196,10 +199,7 @@ fn run_auth_status(json: bool) -> Result<i32> {
             token_source: None,
         };
         if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&status).context("serialize git auth status")?
-            );
+            print_json(&status, "serialize git auth status")?;
             return Ok(0);
         }
         println!("Git available: no");
@@ -230,10 +230,7 @@ fn run_auth_status(json: bool) -> Result<i32> {
     };
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&status).context("serialize git auth status")?
-        );
+        print_json(&status, "serialize git auth status")?;
         return Ok(0);
     }
 
@@ -392,7 +389,7 @@ fn run_auth_doctor(json: bool) -> Result<i32> {
             None
         } else {
             Some(
-                "Set `ZA_GITHUB_TOKEN`/`GITHUB_TOKEN`/`GH_TOKEN`, or `za config set github-token <TOKEN>`."
+                "Set `ZA_GITHUB_TOKEN`/`GITHUB_TOKEN`/`GH_TOKEN`, or pipe it to `za config set github-token --stdin`."
                     .to_string(),
             )
         },
@@ -402,10 +399,7 @@ fn run_auth_doctor(json: bool) -> Result<i32> {
     let report = GitAuthDoctorReport { ok, checks };
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).context("serialize git auth doctor report")?
-        );
+        print_json(&report, "serialize git auth doctor report")?;
     } else {
         println!(
             "Git auth doctor: {}",
@@ -537,10 +531,7 @@ fn run_auth_repair(remote: String, timeout_secs: u64, json: bool) -> Result<i32>
     };
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).context("serialize git auth repair report")?
-        );
+        print_json(&report, "serialize git auth repair report")?;
     } else {
         println!(
             "Git auth repair: {}",
@@ -607,10 +598,7 @@ fn run_auth_test(
     let (git_version, report) = build_auth_test_report(repo, remote, timeout_secs)?;
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).context("serialize git auth test report")?
-        );
+        print_json(&report, "serialize git auth test report")?;
     } else if report.ok {
         println!(
             "Git auth test passed for {} ({} ms).",
