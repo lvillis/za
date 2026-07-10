@@ -145,7 +145,9 @@ fn inspect_tool(home: &ToolHome, name: &str) -> Result<ToolDoctorRow> {
                 name: name.to_string(),
                 version: version.to_string(),
             };
-            let is_package = package_policy_for_name(name).is_some();
+            let package = package_policy_for_name(name);
+            let is_package = package.is_some();
+            let package_exposes_bin = package.and_then(|package| package.bin_relpath).is_some();
             let version_dir = home.version_dir(&tool);
             let payload_path = home.install_path(&tool);
             let tool_manifest = home.manifest_path(&tool);
@@ -177,6 +179,13 @@ fn inspect_tool(home: &ToolHome, name: &str) -> Result<ToolDoctorRow> {
                         payload_path.display()
                     ),
                 ));
+            } else if is_package {
+                if let Err(err) = validate_package_payload(home, &tool) {
+                    issues.push((
+                        DoctorIssueSeverity::Error,
+                        format!("installed package payload is incomplete: {err:#}"),
+                    ));
+                }
             }
             if !active_path.exists() {
                 issues.push((
@@ -186,7 +195,7 @@ fn inspect_tool(home: &ToolHome, name: &str) -> Result<ToolDoctorRow> {
                         active_path.display()
                     ),
                 ));
-            } else if !is_package && !is_executable_file(&active_path) {
+            } else if (!is_package || package_exposes_bin) && !is_executable_file(&active_path) {
                 issues.push((
                     DoctorIssueSeverity::Error,
                     format!("active path is not executable: {}", active_path.display()),

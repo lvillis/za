@@ -1154,6 +1154,7 @@ impl ToolHome {
 
     fn active_path(&self, name: &str) -> PathBuf {
         match package_policy_for_name(name) {
+            Some(package) if package.bin_relpath.is_some() => self.bin_path(name),
             Some(package) => self.current_package_path(name).join(package.entry_relpath),
             None => self.bin_path(name),
         }
@@ -1243,14 +1244,7 @@ fn stage_package_payload(home: &ToolHome, tool: &ToolRef, source: &PullSource) -
             })?;
             remove_path_if_exists(&unpack_dir)?;
         }
-        let entry_path = home.install_path(tool);
-        if !entry_path.exists() {
-            bail!(
-                "package payload for `{}` missing expected entry {}",
-                tool.name,
-                entry_path.display()
-            );
-        }
+        validate_package_payload(home, tool)?;
         Ok(())
     })();
 
@@ -1258,6 +1252,79 @@ fn stage_package_payload(home: &ToolHome, tool: &ToolRef, source: &PullSource) -
         let _ = remove_path_if_exists(&version_dir);
     }
     run
+}
+
+fn validate_package_payload(home: &ToolHome, tool: &ToolRef) -> Result<()> {
+    let package = package_policy_for_name(&tool.name)
+        .ok_or_else(|| anyhow!("`{}` does not use a package-style install", tool.name))?;
+    let payload_dir = home.package_payload_dir(tool);
+    for relpath in package_required_relpaths(package) {
+        validate_package_relpath(
+            &tool.name,
+            &payload_dir,
+            relpath,
+            package_relpath_requires_execute(relpath),
+        )?;
+    }
+    Ok(())
+}
+
+fn package_required_relpaths(package: PackagePolicy) -> Vec<&'static str> {
+    let mut relpaths = Vec::new();
+    relpaths.push(package.entry_relpath);
+    if let Some(bin_relpath) = package.bin_relpath {
+        relpaths.push(bin_relpath);
+    }
+    relpaths.extend(package.required_relpaths.iter().copied());
+    match env::consts::OS {
+        "linux" => relpaths.extend(package.required_linux_relpaths.iter().copied()),
+        "macos" => relpaths.extend(package.required_macos_relpaths.iter().copied()),
+        "windows" => relpaths.extend(package.required_windows_relpaths.iter().copied()),
+        _ => {}
+    }
+    relpaths.sort_unstable();
+    relpaths.dedup();
+    relpaths
+}
+
+fn package_relpath_requires_execute(relpath: &str) -> bool {
+    #[cfg(not(unix))]
+    {
+        let _ = relpath;
+        false
+    }
+    #[cfg(unix)]
+    {
+        !relpath.ends_with(".json")
+    }
+}
+
+fn validate_package_relpath(
+    tool_name: &str,
+    payload_dir: &Path,
+    relpath: &str,
+    must_execute: bool,
+) -> Result<()> {
+    let path = payload_dir.join(relpath);
+    let metadata = fs::metadata(&path).with_context(|| {
+        format!(
+            "package payload for `{tool_name}` is missing required file {}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        bail!(
+            "package payload for `{tool_name}` required entry is not a file: {}",
+            path.display()
+        );
+    }
+    if must_execute && !is_executable_file(&path) {
+        bail!(
+            "package payload for `{tool_name}` required entry is not executable: {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn select_extracted_payload_root(unpack_dir: &Path) -> Result<PathBuf> {

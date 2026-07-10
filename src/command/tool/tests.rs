@@ -1,7 +1,7 @@
 use super::integrations::{
     blesh_bash_init_bottom_block, blesh_bash_init_top_block, ide_terminal_bash_helper_block,
 };
-use super::policy::GithubReleaseVerification;
+use super::policy::{GithubReleaseVerification, ToolLayout};
 use super::{
     BLESH_BASH_INIT_BOTTOM_END_MARKER, BLESH_BASH_INIT_BOTTOM_START_MARKER,
     BLESH_BASH_INIT_TOP_END_MARKER, BLESH_BASH_INIT_TOP_START_MARKER, BatchProgressStatus,
@@ -19,7 +19,62 @@ use super::{
     source, split_supported_managed_tool_names, starship_bash_init_block, supported_tool_names_csv,
     tool_update_cache_entry_is_fresh, unsupported_tool_message, upsert_managed_block,
 };
-use std::{fs, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+fn temp_tool_home(label: &str) -> (PathBuf, ToolHome) {
+    let root = std::env::temp_dir().join(format!(
+        "za-test-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    let home = ToolHome {
+        scope: ToolScope::User,
+        store_dir: root.join("store"),
+        current_dir: root.join("current"),
+        bin_dir: root.join("bin"),
+    };
+    (root, home)
+}
+
+fn write_test_file(path: &Path, executable: bool) {
+    fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+    fs::write(path, b"test\n").expect("write file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = if executable { 0o755 } else { 0o644 };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod file");
+    }
+}
+
+fn write_test_codex_package_payload(home: &ToolHome, tool: &ToolRef) {
+    let payload = home.package_payload_dir(tool);
+    write_test_file(&payload.join("codex-package.json"), false);
+    write_test_file(&payload.join("bin/codex"), true);
+    write_test_file(&payload.join("bin/codex-code-mode-host"), true);
+    write_test_file(&payload.join("codex-path/rg"), true);
+    #[cfg(target_os = "linux")]
+    write_test_file(&payload.join("codex-resources/bwrap"), true);
+    #[cfg(target_os = "windows")]
+    {
+        write_test_file(
+            &payload.join("codex-resources/codex-command-runner.exe"),
+            true,
+        );
+        write_test_file(
+            &payload.join("codex-resources/codex-windows-sandbox-setup.exe"),
+            true,
+        );
+    }
+}
 
 #[test]
 fn parse_tool_ref_ok() {
@@ -577,6 +632,7 @@ fn tool_policy_matches_alias_and_canonical() {
     assert_eq!(codex_alias.canonical_name, "codex");
     assert_eq!(codex.canonical_name, "codex");
     assert_eq!(codex.source_label, "GitHub Release (SHA-256 verified)");
+    assert_eq!(codex.layout, ToolLayout::Package);
     let rg_alias = find_tool_policy("ripgrep").expect("alias policy");
     let rg = find_tool_policy("rg").expect("canonical policy");
     assert_eq!(rg_alias.canonical_name, "rg");
@@ -722,6 +778,61 @@ fn tool_policy_matches_alias_and_canonical() {
         GithubReleaseVerification::NoSha256Digest
     );
     assert!(find_tool_policy("unknown-tool").is_none());
+}
+
+#[test]
+fn codex_policy_uses_official_package_layout() {
+    let codex = find_tool_policy("codex").expect("codex policy");
+    let package = codex.package.expect("codex package policy");
+    assert_eq!(codex.layout, ToolLayout::Package);
+    assert_eq!(package.entry_relpath, "bin/codex");
+    assert_eq!(package.bin_relpath, Some("bin/codex"));
+    assert!(
+        package
+            .required_relpaths
+            .contains(&"bin/codex-code-mode-host")
+    );
+    assert!(package.required_relpaths.contains(&"codex-path/rg"));
+    assert!(
+        package
+            .required_linux_relpaths
+            .contains(&"codex-resources/bwrap")
+    );
+
+    let resolver = codex
+        .github_release
+        .expect("github policy")
+        .expected_asset_name
+        .expect("asset resolver");
+    let asset = resolver("0.144.1");
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    assert_eq!(
+        asset.expect("linux x86_64 asset"),
+        "codex-package-x86_64-unknown-linux-musl.tar.gz"
+    );
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    assert_eq!(
+        asset.expect("linux aarch64 asset"),
+        "codex-package-aarch64-unknown-linux-musl.tar.gz"
+    );
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    assert_eq!(
+        asset.expect("macos x86_64 asset"),
+        "codex-package-x86_64-apple-darwin.tar.gz"
+    );
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    assert_eq!(
+        asset.expect("macos aarch64 asset"),
+        "codex-package-aarch64-apple-darwin.tar.gz"
+    );
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )))]
+    assert!(asset.is_err());
 }
 
 #[test]
@@ -1510,6 +1621,53 @@ fn activate_tool_rejects_non_executable_binary_payload() {
     assert!(
         home.active_path("rg").exists(),
         "previous active entry should remain available"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn activate_tool_links_package_payload_and_exposed_command() {
+    let (root, home) = temp_tool_home("activate-codex-package");
+    let tool = ToolRef {
+        name: "codex".to_string(),
+        version: "0.144.1".to_string(),
+    };
+    write_test_codex_package_payload(&home, &tool);
+
+    super::state::activate_tool(&home, &tool).expect("activate codex package");
+
+    assert_eq!(home.active_path("codex"), home.bin_path("codex"));
+    assert!(
+        home.current_package_path("codex").exists(),
+        "package payload should be linked into current"
+    );
+    assert!(
+        super::state::is_executable_file(&home.active_path("codex")),
+        "codex command should be executable"
+    );
+    assert_eq!(
+        fs::read_to_string(home.current_file("codex")).expect("read current version"),
+        "0.144.1\n"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn validate_package_payload_rejects_incomplete_codex_package() {
+    let (root, home) = temp_tool_home("validate-incomplete-codex-package");
+    let tool = ToolRef {
+        name: "codex".to_string(),
+        version: "0.144.1".to_string(),
+    };
+    write_test_file(&home.package_payload_dir(&tool).join("bin/codex"), true);
+
+    let err = super::validate_package_payload(&home, &tool).expect_err("reject incomplete package");
+
+    assert!(
+        format!("{err:#}").contains("bin/codex-code-mode-host"),
+        "unexpected error: {err:#}"
     );
 
     let _ = fs::remove_dir_all(&root);

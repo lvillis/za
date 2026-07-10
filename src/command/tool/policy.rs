@@ -80,6 +80,11 @@ pub(super) enum ToolLayout {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PackagePolicy {
     pub(super) entry_relpath: &'static str,
+    pub(super) bin_relpath: Option<&'static str>,
+    pub(super) required_relpaths: &'static [&'static str],
+    pub(super) required_linux_relpaths: &'static [&'static str],
+    pub(super) required_macos_relpaths: &'static [&'static str],
+    pub(super) required_windows_relpaths: &'static [&'static str],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,8 +158,23 @@ const TOOL_POLICIES: [ToolPolicy; 23] = [
         canonical_name: "codex",
         aliases: &["codex-cli"],
         source_label: "GitHub Release (SHA-256 verified)",
-        layout: ToolLayout::Binary,
-        package: None,
+        layout: ToolLayout::Package,
+        package: Some(PackagePolicy {
+            entry_relpath: "bin/codex",
+            bin_relpath: Some("bin/codex"),
+            required_relpaths: &[
+                "codex-package.json",
+                "bin/codex",
+                "bin/codex-code-mode-host",
+                "codex-path/rg",
+            ],
+            required_linux_relpaths: &["codex-resources/bwrap"],
+            required_macos_relpaths: &[],
+            required_windows_relpaths: &[
+                "codex-resources/codex-command-runner.exe",
+                "codex-resources/codex-windows-sandbox-setup.exe",
+            ],
+        }),
         github_release: Some(GithubReleasePolicy {
             project_label: "codex",
             owner: CODEX_GITHUB_OWNER,
@@ -492,6 +512,11 @@ const TOOL_POLICIES: [ToolPolicy; 23] = [
         layout: ToolLayout::Package,
         package: Some(PackagePolicy {
             entry_relpath: "ble.sh",
+            bin_relpath: None,
+            required_relpaths: &["ble.sh"],
+            required_linux_relpaths: &[],
+            required_macos_relpaths: &[],
+            required_windows_relpaths: &[],
         }),
         github_release: Some(GithubReleasePolicy {
             project_label: "ble.sh",
@@ -536,7 +561,7 @@ pub(super) fn canonical_tool_name(name: &str) -> String {
 }
 
 fn codex_expected_asset_name(_version: &str) -> Result<String> {
-    Ok(format!("codex-{}.tar.gz", codex_target_triple()?))
+    Ok(format!("codex-package-{}.tar.gz", codex_target_triple()?))
 }
 
 fn za_expected_asset_name(version: &str) -> Result<String> {

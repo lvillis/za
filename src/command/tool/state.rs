@@ -411,6 +411,7 @@ fn sync_active_entry(home: &ToolHome, tool: &ToolRef) -> Result<()> {
             Ok(())
         }
         ToolLayout::Package => {
+            validate_package_payload(home, tool)?;
             let src_dir = home.package_payload_dir(tool);
             let dst_dir = home.current_package_path(&tool.name);
             link_directory(&src_dir, &dst_dir).with_context(|| {
@@ -419,7 +420,23 @@ fn sync_active_entry(home: &ToolHome, tool: &ToolRef) -> Result<()> {
                     tool.image(),
                     src_dir.display()
                 )
-            })
+            })?;
+
+            if let Some(bin_relpath) =
+                package_policy_for_name(&tool.name).and_then(|package| package.bin_relpath)
+            {
+                let src = src_dir.join(bin_relpath);
+                let dst = home.bin_path(&tool.name);
+                if let Err(err) = link_executable(&src, &dst) {
+                    copy_executable(&src, &dst).with_context(|| {
+                        format!(
+                            "activate {} package command via copy fallback after link failed: {err}",
+                            tool.image()
+                        )
+                    })?;
+                }
+            }
+            Ok(())
         }
     }
 }
