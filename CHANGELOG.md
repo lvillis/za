@@ -1,8 +1,21 @@
+## [0.1.95] - 2026-07-10
+
+### 🚀 Features
+
+- *(tool)* Install complete Codex release package
+
+### 🚜 Refactor
+
+- *(tool)* Simplify package doctor validation
 ## [0.1.94] - 2026-06-24
 
 ### 🐛 Bug Fixes
 
 - *(tool)* Skip unsupported managed tools during update
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.94
 ## [0.1.93] - 2026-06-24
 
 ### 🚀 Features
