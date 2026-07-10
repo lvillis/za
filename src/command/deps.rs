@@ -1,10 +1,8 @@
 //! Dependency governance, version drift, and maintenance audit for Rust projects.
 
 mod api;
-#[path = "deps/latest.rs"]
 mod latest;
 mod model;
-#[path = "deps/render.rs"]
 mod render;
 
 use crate::command::{render as text_render, style as tty_style, write_file_atomically, za_config};
@@ -29,8 +27,9 @@ use std::{
 use self::api::ApiClient;
 use self::model::{
     ActionAuditRecord, ActionLocation, ActionUpdatePlan, AuditReport, AuditSummary, DepAuditRecord,
-    DependencySpec, DependencySpecBuilder, DependencyUpdatePlan, GitHubCacheEntry, RiskLevel,
-    age_days_from_now, classify_risk, github_repo_from_url, std_alternative,
+    DependencySource, DependencySpec, DependencySpecBuilder, DependencyUpdatePlan,
+    GitHubCacheEntry, RiskLevel, age_days_from_now, classify_risk, github_repo_from_url,
+    minimum_rust_version, std_alternative,
 };
 use self::render::{build_summary, print_report, write_json_report};
 
@@ -41,20 +40,21 @@ const HTTP_BACKOFF_BASE_MS: u64 = 200;
 const AUTO_DEPS_JOBS_MULTIPLIER: usize = 2;
 const AUTO_DEPS_JOBS_MIN: usize = 4;
 const AUTO_DEPS_JOBS_MAX: usize = 16;
-const DEPS_CACHE_SCHEMA_VERSION: u32 = 2;
-const DEPS_CACHE_FILE_NAME: &str = "deps-cache-v2.json";
+const DEPS_CACHE_SCHEMA_VERSION: u32 = 3;
+const DEPS_CACHE_FILE_NAME: &str = "deps-cache-v3.json";
 const CRATES_CACHE_TTL_SECS: u64 = 10 * 60;
 const GITHUB_CACHE_TTL_SECS: u64 = 60 * 60;
 const WORKFLOW_ACTION_REF_MAX_TAGS: usize = 100;
+const WORKFLOW_ACTION_REF_MAX_PAGES: usize = 20;
 
 pub struct DepsRunOptions {
     pub manifest_path: Option<PathBuf>,
     pub project_path: Option<PathBuf>,
-    pub github_token_override: Option<String>,
     pub jobs: Option<usize>,
     pub include_dev: bool,
     pub include_build: bool,
     pub include_optional: bool,
+    pub refresh: bool,
     pub json_out: Option<PathBuf>,
     pub fail_on_high: bool,
     pub verbose: bool,
@@ -68,6 +68,7 @@ pub struct DepsLatestOptions {
     pub include_dev: bool,
     pub include_build: bool,
     pub include_optional: bool,
+    pub refresh: bool,
     pub json: bool,
     pub toml: bool,
     pub suggest: bool,
@@ -77,11 +78,11 @@ pub fn run(opts: DepsRunOptions) -> Result<()> {
     let DepsRunOptions {
         manifest_path,
         project_path,
-        github_token_override,
         jobs,
         include_dev,
         include_build,
         include_optional,
+        refresh,
         json_out,
         fail_on_high,
         verbose,
@@ -89,11 +90,18 @@ pub fn run(opts: DepsRunOptions) -> Result<()> {
 
     let manifest_path = resolve_manifest_path(manifest_path, project_path)?;
     let metadata = read_manifest_metadata(&manifest_path)?;
-    let project_root = project_root_from_metadata(&metadata, &manifest_path)?;
+    let project_root = metadata.workspace_root.clone();
     let inventory =
         collect_dependency_inventory(&metadata, include_dev, include_build, include_optional)?;
     let action_specs = collect_workflow_action_specs(&project_root)?;
     if inventory.specs.is_empty() && action_specs.is_empty() {
+        let summary = AuditSummary {
+            skipped_local: inventory.skipped_local_count(),
+            ..AuditSummary::default()
+        };
+        if let Some(path) = json_out {
+            write_json_report(path, &manifest_path, &summary, &[], &[])?;
+        }
         if inventory.skipped_local_count() > 0 {
             println!(
                 "No external dependencies found for audit; skipped {} internal/path {}.",
@@ -116,7 +124,7 @@ pub fn run(opts: DepsRunOptions) -> Result<()> {
         worker_count
     );
     let skipped_local = inventory.skipped_local_count();
-    let api = Arc::new(ApiClient::new(github_token_override)?);
+    let api = Arc::new(ApiClient::new(refresh)?);
     let mut records = audit_dependencies(Arc::clone(&api), inventory.specs, worker_count)?;
     let mut actions = audit_actions(Arc::clone(&api), action_specs, worker_count)?;
     sort_records(&mut records);
@@ -199,6 +207,7 @@ where
     F: Fn(T) -> Result<R> + Sync,
 {
     let progress = build_progress(items.len() as u64);
+    let jobs = normalize_jobs(jobs, items.len());
     let queue = Arc::new(Mutex::new(VecDeque::from(items)));
     let records = Arc::new(Mutex::new(Vec::new()));
     let first_error: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
@@ -332,20 +341,7 @@ fn canonical_manifest_path(path: PathBuf) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn project_root_from_metadata(metadata: &CargoMetadata, manifest_path: &Path) -> Result<PathBuf> {
-    if let Some(root) = metadata.workspace_root.as_ref()
-        && !root.as_os_str().is_empty()
-    {
-        return fs::canonicalize(root)
-            .with_context(|| format!("cannot resolve workspace root {}", root.display()));
-    }
-    manifest_path
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow!("manifest path has no parent: {}", manifest_path.display()))
-}
-
-fn read_manifest_metadata(manifest_path: &Path) -> Result<CargoMetadata> {
+fn read_manifest_metadata(manifest_path: &Path) -> Result<WorkspaceManifest> {
     let workspace_manifest_path = discover_workspace_manifest(manifest_path)?;
     let workspace_manifest = read_cargo_manifest(&workspace_manifest_path)?;
     let workspace_root = manifest_parent(&workspace_manifest_path)?.to_path_buf();
@@ -353,15 +349,14 @@ fn read_manifest_metadata(manifest_path: &Path) -> Result<CargoMetadata> {
         .workspace
         .as_ref()
         .map(|workspace| &workspace.dependencies);
+    let workspace_rust_version = workspace_manifest
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.package.rust_version.as_deref());
 
     let member_manifest_paths =
         workspace_member_manifest_paths(&workspace_root, &workspace_manifest)?;
-    let selected_manifest_path = fs::canonicalize(manifest_path)
-        .with_context(|| format!("cannot resolve manifest path {}", manifest_path.display()))?;
-
     let mut packages = Vec::new();
-    let mut workspace_members = Vec::new();
-    let mut root = None;
 
     for path in member_manifest_paths {
         let manifest = read_cargo_manifest(&path)?;
@@ -369,35 +364,58 @@ fn read_manifest_metadata(manifest_path: &Path) -> Result<CargoMetadata> {
             continue;
         };
 
-        let id = manifest_package_id(&path);
-        if path == selected_manifest_path {
-            root = Some(id.clone());
-        }
-        workspace_members.push(id.clone());
-        packages.push(CargoPackage {
-            id,
-            name: package.name.clone(),
-            source: None,
-            dependencies: collect_manifest_dependencies(&manifest, workspace_dependencies),
+        let rust_version = package
+            .rust_version
+            .as_ref()
+            .and_then(|value| value.resolve(workspace_rust_version));
+        let default_enabled_optional =
+            default_enabled_optional_dependencies(&manifest, workspace_dependencies);
+        packages.push(WorkspacePackage {
+            rust_version,
+            dependencies: collect_manifest_dependencies(
+                &manifest,
+                workspace_dependencies,
+                &default_enabled_optional,
+            ),
         });
     }
 
-    if root.is_none() && workspace_members.len() == 1 {
-        root = workspace_members.first().cloned();
-    }
-
-    Ok(CargoMetadata {
+    Ok(WorkspaceManifest {
         packages,
-        workspace_members,
-        root,
-        workspace_root: Some(workspace_root),
-        resolve: None,
+        workspace_root,
     })
 }
 
 fn discover_workspace_manifest(manifest_path: &Path) -> Result<PathBuf> {
     let selected_manifest = fs::canonicalize(manifest_path)
         .with_context(|| format!("cannot resolve manifest path {}", manifest_path.display()))?;
+    let selected = read_cargo_manifest(&selected_manifest)?;
+    if let Some(workspace) = selected
+        .package
+        .as_ref()
+        .and_then(|package| package.workspace.as_deref())
+    {
+        let workspace_path = manifest_parent(&selected_manifest)?.join(workspace);
+        let workspace_manifest = if workspace_path.is_dir() {
+            workspace_path.join("Cargo.toml")
+        } else {
+            workspace_path
+        };
+        let workspace_manifest = fs::canonicalize(&workspace_manifest).with_context(|| {
+            format!(
+                "cannot resolve explicit package workspace {}",
+                workspace_manifest.display()
+            )
+        })?;
+        let manifest = read_cargo_manifest(&workspace_manifest)?;
+        if manifest.workspace.is_none() {
+            bail!(
+                "explicit package workspace has no `[workspace]` table: {}",
+                workspace_manifest.display()
+            );
+        }
+        return Ok(workspace_manifest);
+    }
     let mut dir = Some(manifest_parent(&selected_manifest)?);
 
     while let Some(current_dir) = dir {
@@ -467,7 +485,71 @@ fn workspace_member_manifest_paths(
         }
     }
 
+    let mut queue = VecDeque::from_iter(paths.iter().cloned());
+    let mut scanned = BTreeSet::new();
+    while let Some(manifest_path) = queue.pop_front() {
+        if !scanned.insert(manifest_path.clone()) {
+            continue;
+        }
+        let member = read_cargo_manifest(&manifest_path)?;
+        for dependency in manifest_path_dependencies(&member, Some(&workspace.dependencies)) {
+            let dependency_root = if dependency.workspace_relative {
+                workspace_root
+            } else {
+                manifest_parent(&manifest_path)?
+            };
+            let candidate = dependency_root.join(dependency.path);
+            let candidate = if candidate.is_dir() {
+                candidate.join("Cargo.toml")
+            } else {
+                candidate
+            };
+            if !candidate.is_file() {
+                continue;
+            }
+            let candidate = fs::canonicalize(&candidate).with_context(|| {
+                format!(
+                    "cannot resolve path dependency manifest {}",
+                    candidate.display()
+                )
+            })?;
+            if candidate.starts_with(workspace_root)
+                && !excluded.contains(&candidate)
+                && paths.insert(candidate.clone())
+            {
+                queue.push_back(candidate);
+            }
+        }
+    }
+
     Ok(paths.into_iter().collect())
+}
+
+fn manifest_path_dependencies(
+    manifest: &CargoManifest,
+    workspace_dependencies: Option<&BTreeMap<String, ManifestDependency>>,
+) -> Vec<ManifestPathDependency> {
+    manifest_dependency_aliases(manifest)
+        .into_iter()
+        .filter_map(|(alias, dependency)| {
+            let attrs = ManifestDependencyAttrs::from_dependency(dependency);
+            if attrs.workspace {
+                let path = workspace_dependencies
+                    .and_then(|dependencies| dependencies.get(alias))
+                    .map(ManifestDependencyAttrs::from_dependency)?
+                    .path?;
+                Some(ManifestPathDependency {
+                    path,
+                    workspace_relative: true,
+                })
+            } else {
+                attrs.path.map(|path| ManifestPathDependency {
+                    path,
+                    workspace_relative: false,
+                })
+            }
+        })
+        .collect()
 }
 
 fn expand_workspace_member_pattern(workspace_root: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
@@ -508,7 +590,30 @@ fn expand_workspace_pattern_parts(
         return Ok(());
     };
 
-    if part.contains('*') {
+    if *part == "**" {
+        // Cargo workspace globs use `**` for zero or more path components.
+        expand_workspace_pattern_parts(current, rest, out)?;
+        if !current.is_dir() {
+            return Ok(());
+        }
+        let mut entries = fs::read_dir(current)
+            .with_context(|| format!("read workspace directory {}", current.display()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("read workspace entries {}", current.display()))?;
+        entries.sort_by_key(|entry| entry.path());
+        for entry in entries {
+            if entry
+                .file_type()
+                .with_context(|| format!("read file type for {}", entry.path().display()))?
+                .is_dir()
+            {
+                expand_workspace_pattern_parts(&entry.path(), parts, out)?;
+            }
+        }
+        return Ok(());
+    }
+
+    if part.contains(['*', '?']) {
         if !current.is_dir() {
             return Ok(());
         }
@@ -533,31 +638,31 @@ fn expand_workspace_pattern_parts(
 }
 
 fn wildcard_component_matches(pattern: &str, value: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-
-    let mut remainder = value;
-    let mut first = true;
-    for segment in pattern.split('*') {
-        if segment.is_empty() {
-            continue;
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let value = value.chars().collect::<Vec<_>>();
+    let mut previous = vec![false; value.len() + 1];
+    previous[0] = true;
+    for token in pattern {
+        let mut current = vec![false; value.len() + 1];
+        match token {
+            '*' => {
+                current[0] = previous[0];
+                for index in 1..=value.len() {
+                    current[index] = previous[index] || current[index - 1];
+                }
+            }
+            '?' => {
+                current[1..(value.len() + 1)].copy_from_slice(&previous[..value.len()]);
+            }
+            literal => {
+                for index in 1..=value.len() {
+                    current[index] = previous[index - 1] && value[index - 1] == literal;
+                }
+            }
         }
-        if first && !pattern.starts_with('*') {
-            let Some(stripped) = remainder.strip_prefix(segment) else {
-                return false;
-            };
-            remainder = stripped;
-        } else {
-            let Some(index) = remainder.find(segment) else {
-                return false;
-            };
-            remainder = &remainder[index + segment.len()..];
-        }
-        first = false;
+        previous = current;
     }
-
-    pattern.ends_with('*') || remainder.is_empty()
+    previous[value.len()]
 }
 
 fn read_cargo_manifest(path: &Path) -> Result<CargoManifest> {
@@ -572,32 +677,32 @@ fn manifest_parent(manifest_path: &Path) -> Result<&Path> {
         .ok_or_else(|| anyhow!("manifest path has no parent: {}", manifest_path.display()))
 }
 
-fn manifest_package_id(manifest_path: &Path) -> String {
-    manifest_path.display().to_string()
-}
-
 fn collect_manifest_dependencies(
     manifest: &CargoManifest,
     workspace_dependencies: Option<&BTreeMap<String, ManifestDependency>>,
-) -> Vec<CargoDependency> {
+    default_enabled_optional: &BTreeSet<String>,
+) -> Vec<WorkspaceDependency> {
     let mut deps = Vec::new();
     collect_manifest_dependency_table(
         &mut deps,
         &manifest.dependencies,
         None,
         workspace_dependencies,
+        default_enabled_optional,
     );
     collect_manifest_dependency_table(
         &mut deps,
         &manifest.dev_dependencies,
         Some("dev"),
         workspace_dependencies,
+        default_enabled_optional,
     );
     collect_manifest_dependency_table(
         &mut deps,
         &manifest.build_dependencies,
         Some("build"),
         workspace_dependencies,
+        default_enabled_optional,
     );
 
     for target in manifest.target.values() {
@@ -606,18 +711,21 @@ fn collect_manifest_dependencies(
             &target.dependencies,
             None,
             workspace_dependencies,
+            default_enabled_optional,
         );
         collect_manifest_dependency_table(
             &mut deps,
             &target.dev_dependencies,
             Some("dev"),
             workspace_dependencies,
+            default_enabled_optional,
         );
         collect_manifest_dependency_table(
             &mut deps,
             &target.build_dependencies,
             Some("build"),
             workspace_dependencies,
+            default_enabled_optional,
         );
     }
 
@@ -625,21 +733,21 @@ fn collect_manifest_dependencies(
 }
 
 fn collect_manifest_dependency_table(
-    out: &mut Vec<CargoDependency>,
+    out: &mut Vec<WorkspaceDependency>,
     table: &BTreeMap<String, ManifestDependency>,
     kind: Option<&str>,
     workspace_dependencies: Option<&BTreeMap<String, ManifestDependency>>,
+    default_enabled_optional: &BTreeSet<String>,
 ) {
     for (alias, dep) in table {
         if let Some(resolved) = resolve_manifest_dependency(alias, dep, workspace_dependencies) {
-            out.push(CargoDependency {
+            out.push(WorkspaceDependency {
                 name: resolved.name,
-                source: resolved
-                    .crates_io
-                    .then(|| "registry+https://github.com/rust-lang/crates.io-index".to_string()),
+                source: resolved.source,
                 req: resolved.req,
                 kind: kind.map(ToOwned::to_owned),
                 optional: resolved.optional,
+                enabled_by_default: default_enabled_optional.contains(alias),
             });
         }
     }
@@ -660,16 +768,124 @@ fn resolve_manifest_dependency(
         attrs
     };
 
+    let source = if let Some(path) = attrs.path {
+        DependencySource::Path(path)
+    } else if let Some(git) = attrs.git {
+        DependencySource::Git(git)
+    } else if let Some(registry) = attrs.registry.or(attrs.registry_index) {
+        DependencySource::Registry(registry)
+    } else {
+        DependencySource::CratesIo
+    };
+    let requirement = attrs
+        .version
+        .or_else(|| attrs.rev.map(|value| format!("rev:{value}")))
+        .or_else(|| attrs.tag.map(|value| format!("tag:{value}")))
+        .or_else(|| attrs.branch.map(|value| format!("branch:{value}")))
+        .unwrap_or_else(|| "*".to_string());
+
     Some(ResolvedManifestDependency {
         name: attrs.package.unwrap_or_else(|| alias.to_string()),
-        req: attrs.version.unwrap_or_else(|| "*".to_string()),
-        crates_io: attrs.path.is_none() && attrs.git.is_none(),
+        req: requirement,
+        source,
         optional: attrs.optional.unwrap_or(false),
     })
 }
 
+fn default_enabled_optional_dependencies(
+    manifest: &CargoManifest,
+    workspace_dependencies: Option<&BTreeMap<String, ManifestDependency>>,
+) -> BTreeSet<String> {
+    let optional_aliases = manifest_dependency_aliases(manifest)
+        .into_iter()
+        .filter(|(alias, dep)| {
+            resolve_manifest_dependency(alias, dep, workspace_dependencies)
+                .is_some_and(|resolved| resolved.optional)
+        })
+        .map(|(alias, _)| alias.to_string())
+        .collect::<BTreeSet<_>>();
+
+    let mut active = BTreeSet::new();
+    let mut visited_features = BTreeSet::new();
+    let mut queue = VecDeque::from(["default".to_string()]);
+    while let Some(feature) = queue.pop_front() {
+        if !visited_features.insert(feature.clone()) {
+            continue;
+        }
+        let Some(entries) = manifest.features.get(&feature) else {
+            if optional_aliases.contains(&feature) {
+                active.insert(feature);
+            }
+            continue;
+        };
+        for entry in entries {
+            if let Some(dep) = entry.strip_prefix("dep:") {
+                if optional_aliases.contains(dep) {
+                    active.insert(dep.to_string());
+                }
+                continue;
+            }
+            if let Some((dep, _)) = entry.split_once('/') {
+                if !dep.ends_with('?') && optional_aliases.contains(dep) {
+                    active.insert(dep.to_string());
+                }
+                continue;
+            }
+            if manifest.features.contains_key(entry) {
+                queue.push_back(entry.clone());
+            } else if optional_aliases.contains(entry) {
+                active.insert(entry.clone());
+            }
+        }
+    }
+    active
+}
+
+fn manifest_dependency_aliases(manifest: &CargoManifest) -> Vec<(&str, &ManifestDependency)> {
+    let mut dependencies = Vec::new();
+    dependencies.extend(
+        manifest
+            .dependencies
+            .iter()
+            .map(|(name, dep)| (name.as_str(), dep)),
+    );
+    dependencies.extend(
+        manifest
+            .dev_dependencies
+            .iter()
+            .map(|(name, dep)| (name.as_str(), dep)),
+    );
+    dependencies.extend(
+        manifest
+            .build_dependencies
+            .iter()
+            .map(|(name, dep)| (name.as_str(), dep)),
+    );
+    for target in manifest.target.values() {
+        dependencies.extend(
+            target
+                .dependencies
+                .iter()
+                .map(|(name, dep)| (name.as_str(), dep)),
+        );
+        dependencies.extend(
+            target
+                .dev_dependencies
+                .iter()
+                .map(|(name, dep)| (name.as_str(), dep)),
+        );
+        dependencies.extend(
+            target
+                .build_dependencies
+                .iter()
+                .map(|(name, dep)| (name.as_str(), dep)),
+        );
+    }
+    dependencies
+}
+
 fn collect_dependency_specs(
-    metadata: &CargoMetadata,
+    metadata: &WorkspaceManifest,
     include_dev: bool,
     include_build: bool,
     include_optional: bool,
@@ -678,63 +894,43 @@ fn collect_dependency_specs(
 }
 
 fn collect_dependency_inventory(
-    metadata: &CargoMetadata,
+    metadata: &WorkspaceManifest,
     include_dev: bool,
     include_build: bool,
     include_optional: bool,
 ) -> Result<DependencyInventory> {
     let mut collector = DependencyCollector::new(metadata, include_dev, include_build);
-    let used_resolve = collector.collect_resolved_dependency_specs()?;
-
-    if include_optional {
-        collector
-            .collect_declared_dependency_specs(true, DeclaredDependencySelection::OptionalOnly)?;
-    }
-
-    if !used_resolve {
-        collector.collect_declared_dependency_specs(
-            include_optional,
-            DeclaredDependencySelection::All,
-        )?;
-    }
-
+    collector.collect_declared_dependency_specs(include_optional);
     Ok(collector.finish())
 }
 
 struct DependencyCollector<'a> {
-    metadata: &'a CargoMetadata,
-    package_by_id: BTreeMap<&'a str, &'a CargoPackage>,
-    package_ids: Vec<&'a str>,
-    workspace_member_ids: BTreeSet<&'a str>,
+    metadata: &'a WorkspaceManifest,
     include_dev: bool,
     include_build: bool,
-    collected: BTreeMap<String, DependencySpecBuilder>,
-    skipped_local: BTreeMap<String, DependencySpecBuilder>,
+    collected: BTreeMap<DependencyKey, DependencySpecBuilder>,
+    skipped_local: BTreeMap<DependencyKey, DependencySpecBuilder>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DependencyKey {
+    name: String,
+    source: DependencySource,
 }
 
 struct CollectedDependencyEntry {
-    local: bool,
     name: String,
+    source: DependencySource,
     requirement: String,
     kind: String,
+    project_rust_version: Option<String>,
     optional: bool,
 }
 
 impl<'a> DependencyCollector<'a> {
-    fn new(metadata: &'a CargoMetadata, include_dev: bool, include_build: bool) -> Self {
-        let mut package_by_id: BTreeMap<&str, &CargoPackage> = BTreeMap::new();
-        for pkg in &metadata.packages {
-            package_by_id.insert(pkg.id.as_str(), pkg);
-        }
+    fn new(metadata: &'a WorkspaceManifest, include_dev: bool, include_build: bool) -> Self {
         Self {
             metadata,
-            package_by_id,
-            package_ids: target_package_ids(metadata),
-            workspace_member_ids: metadata
-                .workspace_members
-                .iter()
-                .map(String::as_str)
-                .collect(),
             include_dev,
             include_build,
             collected: BTreeMap::new(),
@@ -742,100 +938,27 @@ impl<'a> DependencyCollector<'a> {
         }
     }
 
-    fn collect_resolved_dependency_specs(&mut self) -> Result<bool> {
-        let Some(resolve) = self.metadata.resolve.as_ref() else {
-            return Ok(false);
-        };
-
-        let mut node_by_id: BTreeMap<&str, &CargoResolveNode> = BTreeMap::new();
-        for node in &resolve.nodes {
-            node_by_id.insert(node.id.as_str(), node);
-        }
-
-        let mut collected = BTreeMap::new();
-        let mut skipped_local = BTreeMap::new();
-
-        for package_id in self.package_ids.clone() {
-            let package = self.package(package_id)?;
-            let Some(node) = node_by_id.get(package_id) else {
-                return Ok(false);
-            };
-
-            for dep in &node.deps {
-                let dep_package = self
-                    .package_by_id
-                    .get(dep.pkg.as_str())
-                    .ok_or_else(|| anyhow!("resolved dependency package not found: {}", dep.pkg))?;
-                for entry in self.resolved_dependency_entries(package, dep_package, dep) {
-                    Self::insert_entry_into(&mut collected, &mut skipped_local, entry);
-                }
-            }
-        }
-
-        self.collected = collected;
-        self.skipped_local = skipped_local;
-        Ok(true)
-    }
-
-    fn resolved_dependency_entries(
-        &self,
-        package: &CargoPackage,
-        dep_package: &CargoPackage,
-        dep: &CargoResolveNodeDep,
-    ) -> Vec<CollectedDependencyEntry> {
-        let mut entries = Vec::new();
-        for kind in dependency_kinds_from_resolve(dep) {
-            if !should_include_kind(kind, self.include_dev, self.include_build) {
-                continue;
-            }
-
-            let declarations = matching_dependency_declarations(package, &dep_package.name, kind);
-            let requirement = declarations
-                .iter()
-                .map(|dep| dep.req.as_str())
-                .collect::<BTreeSet<_>>();
-            let optional = declarations.iter().all(|dep| dep.optional);
-            entries.push(CollectedDependencyEntry {
-                local: self.is_local_package(dep_package),
-                name: dep_package.name.clone(),
-                requirement: join_str_set(&requirement),
-                kind: kind.to_string(),
-                optional,
-            });
-        }
-        entries
-    }
-
-    fn collect_declared_dependency_specs(
-        &mut self,
-        include_optional: bool,
-        selection: DeclaredDependencySelection,
-    ) -> Result<()> {
-        for package_id in self.package_ids.clone() {
-            let package = self.package(package_id)?;
+    fn collect_declared_dependency_specs(&mut self, include_optional: bool) {
+        for package in &self.metadata.packages {
             let entries = package
                 .dependencies
                 .iter()
-                .filter_map(|dep| self.declared_dependency_entry(dep, include_optional, selection))
+                .filter_map(|dep| self.declared_dependency_entry(package, dep, include_optional))
                 .collect::<Vec<_>>();
 
             for entry in entries {
                 self.insert_entry(entry);
             }
         }
-        Ok(())
     }
 
     fn declared_dependency_entry(
         &self,
-        dep: &CargoDependency,
+        package: &WorkspacePackage,
+        dep: &WorkspaceDependency,
         include_optional: bool,
-        selection: DeclaredDependencySelection,
     ) -> Option<CollectedDependencyEntry> {
-        if !selection.matches(dep.optional) {
-            return None;
-        }
-        if dep.optional && !include_optional {
+        if dep.optional && !dep.enabled_by_default && !include_optional {
             return None;
         }
 
@@ -845,10 +968,11 @@ impl<'a> DependencyCollector<'a> {
         }
 
         Some(CollectedDependencyEntry {
-            local: self.declared_dependency_is_local(dep),
             name: dep.name.clone(),
+            source: dep.source.clone(),
             requirement: dep.req.clone(),
             kind: kind.to_string(),
+            project_rust_version: package.rust_version.clone(),
             optional: dep.optional,
         })
     }
@@ -858,11 +982,11 @@ impl<'a> DependencyCollector<'a> {
     }
 
     fn insert_entry_into(
-        collected: &mut BTreeMap<String, DependencySpecBuilder>,
-        skipped_local: &mut BTreeMap<String, DependencySpecBuilder>,
+        collected: &mut BTreeMap<DependencyKey, DependencySpecBuilder>,
+        skipped_local: &mut BTreeMap<DependencyKey, DependencySpecBuilder>,
         entry: CollectedDependencyEntry,
     ) {
-        let target = if entry.local {
+        let target = if entry.source.is_local() {
             skipped_local
         } else {
             collected
@@ -870,27 +994,12 @@ impl<'a> DependencyCollector<'a> {
         insert_dependency_spec(
             target,
             entry.name,
+            entry.source,
             entry.requirement,
             entry.kind,
+            entry.project_rust_version,
             entry.optional,
         );
-    }
-
-    fn package(&self, package_id: &str) -> Result<&'a CargoPackage> {
-        self.package_by_id
-            .get(package_id)
-            .copied()
-            .ok_or_else(|| anyhow!("workspace package id not found in metadata: {package_id}"))
-    }
-
-    fn is_local_package(&self, package: &CargoPackage) -> bool {
-        package.source.is_none() || self.workspace_member_ids.contains(package.id.as_str())
-    }
-
-    fn declared_dependency_is_local(&self, dep: &CargoDependency) -> bool {
-        // Manifest parsing leaves `source` empty for path, workspace-local, and git deps.
-        // Registry dependencies carry a concrete source even when they are inactive optional deps.
-        dep.source.is_none()
     }
 
     fn finish(self) -> DependencyInventory {
@@ -902,14 +1011,19 @@ impl<'a> DependencyCollector<'a> {
 }
 
 fn build_dependency_specs(
-    collected: BTreeMap<String, DependencySpecBuilder>,
+    collected: BTreeMap<DependencyKey, DependencySpecBuilder>,
 ) -> Vec<DependencySpec> {
     let mut out = Vec::with_capacity(collected.len());
-    for (name, builder) in collected {
+    for (key, builder) in collected {
         out.push(DependencySpec {
-            name,
-            requirement: join_set(&builder.requirements),
+            name: key.name,
+            source: key.source,
+            requirement: join_requirements(&builder.requirements),
             kinds: join_set(&builder.kinds),
+            project_rust_version: builder
+                .project_rust_versions_complete
+                .then(|| minimum_rust_version(&builder.project_rust_versions))
+                .flatten(),
             optional: builder.optional,
         });
     }
@@ -917,52 +1031,23 @@ fn build_dependency_specs(
 }
 
 fn insert_dependency_spec(
-    collected: &mut BTreeMap<String, DependencySpecBuilder>,
+    collected: &mut BTreeMap<DependencyKey, DependencySpecBuilder>,
     name: String,
+    source: DependencySource,
     requirement: String,
     kind: String,
+    project_rust_version: Option<String>,
     optional: bool,
 ) {
-    let entry = collected.entry(name).or_default();
+    let entry = collected.entry(DependencyKey { name, source }).or_default();
     entry.requirements.insert(requirement);
     entry.kinds.insert(kind);
+    if let Some(rust_version) = project_rust_version {
+        entry.project_rust_versions.insert(rust_version);
+    } else {
+        entry.project_rust_versions_complete = false;
+    }
     entry.optional = entry.optional && optional;
-}
-
-fn matching_dependency_declarations<'a>(
-    package: &'a CargoPackage,
-    dep_package_name: &str,
-    kind: &str,
-) -> Vec<&'a CargoDependency> {
-    let mut matches = package
-        .dependencies
-        .iter()
-        .filter(|dep| {
-            dependency_name_matches(dep.name.as_str(), dep_package_name)
-                && dependency_kind(dep.kind.as_deref()) == kind
-        })
-        .collect::<Vec<_>>();
-
-    if matches.is_empty() {
-        matches = package
-            .dependencies
-            .iter()
-            .filter(|dep| dependency_name_matches(dep.name.as_str(), dep_package_name))
-            .collect::<Vec<_>>();
-    }
-
-    matches
-}
-
-fn dependency_kinds_from_resolve(dep: &CargoResolveNodeDep) -> BTreeSet<&str> {
-    let mut kinds = BTreeSet::new();
-    for dep_kind in &dep.dep_kinds {
-        kinds.insert(dependency_kind(dep_kind.kind.as_deref()));
-    }
-    if kinds.is_empty() {
-        kinds.insert("normal");
-    }
-    kinds
 }
 
 fn dependency_kind(kind: Option<&str>) -> &str {
@@ -978,27 +1063,8 @@ fn should_include_kind(kind: &str, include_dev: bool, include_build: bool) -> bo
     }
 }
 
-fn dependency_name_matches(left: &str, right: &str) -> bool {
-    left == right || normalize_dependency_name(left) == normalize_dependency_name(right)
-}
-
 fn normalize_dependency_name(name: &str) -> String {
     name.replace('-', "_")
-}
-
-fn join_str_set(set: &BTreeSet<&str>) -> String {
-    set.iter().copied().collect::<Vec<_>>().join(",")
-}
-
-fn target_package_ids(metadata: &CargoMetadata) -> Vec<&str> {
-    if !metadata.workspace_members.is_empty() {
-        return metadata
-            .workspace_members
-            .iter()
-            .map(String::as_str)
-            .collect();
-    }
-    metadata.root.as_deref().into_iter().collect()
 }
 
 fn dependency_label(count: usize) -> &'static str {
@@ -1025,6 +1091,10 @@ fn join_set(set: &BTreeSet<String>) -> String {
     set.iter().cloned().collect::<Vec<_>>().join(",")
 }
 
+fn join_requirements(requirements: &BTreeSet<String>) -> String {
+    requirements.iter().cloned().collect::<Vec<_>>().join(" | ")
+}
+
 #[derive(Debug, Clone)]
 struct WorkflowActionSpec {
     action: String,
@@ -1032,6 +1102,7 @@ struct WorkflowActionSpec {
     repo: String,
     path: Option<String>,
     ref_name: String,
+    version_hint: Option<String>,
     locations: Vec<ActionLocation>,
 }
 
@@ -1077,6 +1148,9 @@ fn collect_workflow_action_specs(project_root: &Path) -> Result<Vec<WorkflowActi
             let key = spec.key();
             if let Some(existing) = grouped.get_mut(&key) {
                 existing.locations.extend(spec.locations);
+                if existing.version_hint.is_none() {
+                    existing.version_hint = spec.version_hint;
+                }
             } else {
                 grouped.insert(key, spec);
             }
@@ -1096,7 +1170,7 @@ fn parse_workflow_uses_line(line: &str) -> Option<WorkflowActionSpec> {
     let trimmed = line.trim_start();
     let trimmed = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim_start();
     let raw_value = trimmed.strip_prefix("uses:")?.trim();
-    let value = normalize_workflow_uses_value(raw_value)?;
+    let (value, version_hint) = normalize_workflow_uses_value(raw_value)?;
     if value.starts_with("./")
         || value.starts_with("../")
         || value.starts_with("docker://")
@@ -1123,22 +1197,35 @@ fn parse_workflow_uses_line(line: &str) -> Option<WorkflowActionSpec> {
         repo: repo.to_string(),
         path: (!rest.is_empty()).then(|| rest.join("/")),
         ref_name: ref_name.to_string(),
+        version_hint,
         locations: Vec::new(),
     })
 }
 
-fn normalize_workflow_uses_value(raw: &str) -> Option<String> {
+fn normalize_workflow_uses_value(raw: &str) -> Option<(String, Option<String>)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let without_comment = trimmed
+    let (without_comment, comment) = trimmed
         .split_once(" #")
-        .map(|(value, _)| value)
-        .unwrap_or(trimmed)
-        .trim();
+        .map_or((trimmed, None), |(value, comment)| (value, Some(comment)));
+    let without_comment = without_comment.trim();
     let value = strip_matching_quotes(without_comment).unwrap_or(without_comment);
-    (!value.is_empty()).then(|| value.to_string())
+    let version_hint = comment.and_then(extract_action_version_hint);
+    (!value.is_empty()).then(|| (value.to_string(), version_hint))
+}
+
+fn extract_action_version_hint(comment: &str) -> Option<String> {
+    comment
+        .split(|character: char| {
+            character.is_ascii_whitespace() || character == ',' || character == ';'
+        })
+        .map(|token| {
+            token.trim_matches(|character: char| matches!(character, '(' | ')' | '[' | ']'))
+        })
+        .find(|token| parse_action_tag_version(token).is_some())
+        .map(ToOwned::to_owned)
 }
 
 fn strip_matching_quotes(value: &str) -> Option<&str> {
@@ -1190,7 +1277,7 @@ fn sort_action_records(records: &mut [ActionAuditRecord]) {
 
 fn build_action_audit_record(
     spec: WorkflowActionSpec,
-    latest_tags: std::result::Result<Vec<String>, String>,
+    latest_tags: std::result::Result<Vec<GitHubTagSnapshot>, String>,
 ) -> ActionAuditRecord {
     let mut record = ActionAuditRecord {
         action: spec.action,
@@ -1199,16 +1286,11 @@ fn build_action_audit_record(
         path: spec.path,
         current_ref: spec.ref_name,
         latest_ref: None,
+        latest_sha: None,
         update_plan: ActionUpdatePlan::Review,
         note: None,
         locations: spec.locations,
     };
-
-    if is_full_commit_sha(&record.current_ref) {
-        record.update_plan = ActionUpdatePlan::Keep;
-        record.note = Some("sha-pinned".to_string());
-        return record;
-    }
 
     let tags = match latest_tags {
         Ok(tags) => tags,
@@ -1223,19 +1305,85 @@ fn build_action_audit_record(
     };
 
     record.latest_ref = Some(latest.tag.clone());
-    let Some(current) = parse_action_tag_version(&record.current_ref) else {
-        record.note = Some("floating or non-semver ref; review manually".to_string());
+    record.latest_sha = latest.sha.clone();
+    let sha_pinned = is_full_commit_sha(&record.current_ref);
+    let tagged_current = if sha_pinned {
+        tags.iter()
+            .filter(|tag| tag.sha.eq_ignore_ascii_case(&record.current_ref))
+            .filter_map(action_tag_version)
+            .max_by(compare_action_tag_versions)
+    } else {
+        None
+    };
+    let current_from_hint = sha_pinned && tagged_current.is_none();
+    let current = if tagged_current.is_some() {
+        tagged_current
+    } else if sha_pinned {
+        spec.version_hint
+            .as_deref()
+            .and_then(parse_action_tag_version)
+    } else {
+        parse_action_tag_version(&record.current_ref)
+    };
+    let Some(current) = current else {
+        record.note = Some(if is_full_commit_sha(&record.current_ref) {
+            "sha pin has no semver tag; review manually".to_string()
+        } else {
+            "floating or non-semver ref; review manually".to_string()
+        });
         return record;
     };
+    if current_from_hint {
+        if current.precision != ActionTagPrecision::Patch {
+            record.note = Some("sha pin needs an exact version hint; review manually".to_string());
+            return record;
+        }
+        if current.version == latest.version
+            && latest
+                .sha
+                .as_deref()
+                .is_some_and(|sha| !sha.eq_ignore_ascii_case(&record.current_ref))
+        {
+            record.note = Some("sha pin does not match the hinted release tag".to_string());
+            return record;
+        }
+    }
 
     if current_action_ref_is_outdated(&current, &latest) {
         record.update_plan = ActionUpdatePlan::Bump;
         record.note = Some("newer action tag available".to_string());
     } else {
         record.update_plan = ActionUpdatePlan::Keep;
-        record.note = Some("current ref is up to date".to_string());
+        record.note = Some(if sha_pinned {
+            "sha-pinned and up to date".to_string()
+        } else {
+            "current ref is up to date".to_string()
+        });
     }
     record
+}
+
+fn compare_action_tag_versions(
+    left: &ActionTagVersion,
+    right: &ActionTagVersion,
+) -> std::cmp::Ordering {
+    left.version
+        .cmp(&right.version)
+        .then_with(|| left.precision.weight().cmp(&right.precision.weight()))
+        .then_with(|| left.tag.cmp(&right.tag))
+}
+
+fn action_tag_version(tag: &GitHubTagSnapshot) -> Option<ActionTagVersion> {
+    let mut version = parse_action_tag_version(&tag.name)?;
+    version.sha = Some(tag.sha.clone());
+    Some(version)
+}
+
+fn latest_stable_action_tag(tags: &[GitHubTagSnapshot]) -> Option<ActionTagVersion> {
+    tags.iter()
+        .filter_map(action_tag_version)
+        .filter(|version| version.version.pre.is_empty())
+        .max_by(compare_action_tag_versions)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1243,6 +1391,7 @@ struct ActionTagVersion {
     tag: String,
     version: Version,
     precision: ActionTagPrecision,
+    sha: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1252,11 +1401,14 @@ enum ActionTagPrecision {
     Patch,
 }
 
-fn latest_stable_action_tag(tags: &[String]) -> Option<ActionTagVersion> {
-    tags.iter()
-        .filter_map(|tag| parse_action_tag_version(tag))
-        .filter(|version| version.version.pre.is_empty())
-        .max_by(|a, b| a.version.cmp(&b.version).then_with(|| a.tag.cmp(&b.tag)))
+impl ActionTagPrecision {
+    fn weight(self) -> u8 {
+        match self {
+            Self::Major => 1,
+            Self::Minor => 2,
+            Self::Patch => 3,
+        }
+    }
 }
 
 fn parse_action_tag_version(tag: &str) -> Option<ActionTagVersion> {
@@ -1271,7 +1423,7 @@ fn parse_action_tag_version(tag: &str) -> Option<ActionTagVersion> {
     }
     if parts
         .iter()
-        .any(|part| part.bytes().any(|b| !b.is_ascii_digit()))
+        .any(|part| part.bytes().any(|byte| !byte.is_ascii_digit()))
     {
         return None;
     }
@@ -1292,6 +1444,7 @@ fn parse_action_tag_version(tag: &str) -> Option<ActionTagVersion> {
             3 => ActionTagPrecision::Patch,
             _ => return None,
         },
+        sha: None,
     })
 }
 
@@ -1307,7 +1460,25 @@ fn current_action_ref_is_outdated(current: &ActionTagVersion, latest: &ActionTag
 }
 
 fn is_full_commit_sha(value: &str) -> bool {
-    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+// Keep tag and immutable commit together so update advice can preserve SHA pinning.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct GitHubTagSnapshot {
+    name: String,
+    sha: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubTagResponse {
+    name: String,
+    commit: GitHubTagCommitResponse,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubTagCommitResponse {
+    sha: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1324,11 +1495,16 @@ struct CargoManifest {
     build_dependencies: BTreeMap<String, ManifestDependency>,
     #[serde(default)]
     target: BTreeMap<String, ManifestTargetDependencies>,
+    #[serde(default)]
+    features: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ManifestPackage {
-    name: String,
+    #[serde(default, rename = "rust-version")]
+    rust_version: Option<InheritableString>,
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1339,6 +1515,14 @@ struct ManifestWorkspace {
     exclude: Vec<String>,
     #[serde(default, rename = "dependencies")]
     dependencies: BTreeMap<String, ManifestDependency>,
+    #[serde(default)]
+    package: ManifestWorkspacePackage,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ManifestWorkspacePackage {
+    #[serde(default, rename = "rust-version")]
+    rust_version: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1369,6 +1553,16 @@ struct ManifestDependencyDetail {
     #[serde(default)]
     git: Option<String>,
     #[serde(default)]
+    registry: Option<String>,
+    #[serde(default, rename = "registry-index")]
+    registry_index: Option<String>,
+    #[serde(default)]
+    rev: Option<String>,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
     workspace: bool,
     #[serde(default)]
     optional: Option<bool>,
@@ -1380,6 +1574,11 @@ struct ManifestDependencyAttrs {
     version: Option<String>,
     path: Option<String>,
     git: Option<String>,
+    registry: Option<String>,
+    registry_index: Option<String>,
+    rev: Option<String>,
+    tag: Option<String>,
+    branch: Option<String>,
     workspace: bool,
     optional: Option<bool>,
 }
@@ -1396,6 +1595,11 @@ impl ManifestDependencyAttrs {
                 version: detail.version.clone(),
                 path: detail.path.clone(),
                 git: detail.git.clone(),
+                registry: detail.registry.clone(),
+                registry_index: detail.registry_index.clone(),
+                rev: detail.rev.clone(),
+                tag: detail.tag.clone(),
+                branch: detail.branch.clone(),
                 workspace: detail.workspace,
                 optional: detail.optional,
             },
@@ -1408,6 +1612,11 @@ impl ManifestDependencyAttrs {
             version: self.version.or(workspace.version),
             path: self.path.or(workspace.path),
             git: self.git.or(workspace.git),
+            registry: self.registry.or(workspace.registry),
+            registry_index: self.registry_index.or(workspace.registry_index),
+            rev: self.rev.or(workspace.rev),
+            tag: self.tag.or(workspace.tag),
+            branch: self.branch.or(workspace.branch),
             workspace: false,
             optional: self.optional.or(workspace.optional),
         }
@@ -1417,67 +1626,52 @@ impl ManifestDependencyAttrs {
 struct ResolvedManifestDependency {
     name: String,
     req: String,
-    crates_io: bool,
+    source: DependencySource,
     optional: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct CargoMetadata {
-    packages: Vec<CargoPackage>,
-    workspace_members: Vec<String>,
-    root: Option<String>,
-    #[serde(default)]
-    workspace_root: Option<PathBuf>,
-    resolve: Option<CargoResolve>,
+struct ManifestPathDependency {
+    path: String,
+    workspace_relative: bool,
 }
 
 #[derive(Debug, Deserialize)]
-struct CargoPackage {
-    id: String,
-    name: String,
-    #[serde(default)]
-    source: Option<String>,
-    dependencies: Vec<CargoDependency>,
+#[serde(untagged)]
+enum InheritableString {
+    Value(String),
+    Workspace { workspace: bool },
 }
 
-#[derive(Debug, Deserialize)]
-struct CargoDependency {
+impl InheritableString {
+    fn resolve(&self, workspace_value: Option<&str>) -> Option<String> {
+        match self {
+            Self::Value(value) => Some(value.clone()),
+            Self::Workspace { workspace: true } => workspace_value.map(ToOwned::to_owned),
+            Self::Workspace { workspace: false } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WorkspaceManifest {
+    packages: Vec<WorkspacePackage>,
+    workspace_root: PathBuf,
+}
+
+#[derive(Debug)]
+struct WorkspacePackage {
+    rust_version: Option<String>,
+    dependencies: Vec<WorkspaceDependency>,
+}
+
+#[derive(Debug)]
+struct WorkspaceDependency {
     name: String,
-    #[serde(default)]
-    source: Option<String>,
+    source: DependencySource,
     req: String,
     kind: Option<String>,
     optional: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct CargoResolve {
-    nodes: Vec<CargoResolveNode>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CargoResolveNode {
-    id: String,
-    #[serde(default)]
-    deps: Vec<CargoResolveNodeDep>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CargoResolveNodeDep {
-    pkg: String,
-    #[serde(default)]
-    dep_kinds: Vec<CargoResolveDepKind>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CargoResolveDepKind {
-    kind: Option<String>,
-}
-
-#[derive(Clone, Copy)]
-enum DeclaredDependencySelection {
-    All,
-    OptionalOnly,
+    enabled_by_default: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1489,15 +1683,6 @@ struct DependencyInventory {
 impl DependencyInventory {
     fn skipped_local_count(&self) -> usize {
         self.skipped_local.len()
-    }
-}
-
-impl DeclaredDependencySelection {
-    fn matches(self, optional: bool) -> bool {
-        match self {
-            Self::All => true,
-            Self::OptionalOnly => optional,
-        }
     }
 }
 
@@ -1544,11 +1729,6 @@ struct GitHubRepoResponse {
     stargazers_count: u64,
     archived: bool,
     pushed_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct GitHubTagResponse {
-    name: String,
 }
 
 #[cfg(test)]

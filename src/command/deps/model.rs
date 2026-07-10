@@ -7,6 +7,8 @@ use std::time::SystemTime;
 pub(super) struct DependencySpecBuilder {
     pub(super) requirements: BTreeSet<String>,
     pub(super) kinds: BTreeSet<String>,
+    pub(super) project_rust_versions: BTreeSet<String>,
+    pub(super) project_rust_versions_complete: bool,
     pub(super) optional: bool,
 }
 
@@ -15,7 +17,33 @@ impl Default for DependencySpecBuilder {
         Self {
             requirements: BTreeSet::new(),
             kinds: BTreeSet::new(),
+            project_rust_versions: BTreeSet::new(),
+            project_rust_versions_complete: true,
             optional: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub(super) enum DependencySource {
+    CratesIo,
+    Git(String),
+    Registry(String),
+    Path(String),
+}
+
+impl DependencySource {
+    pub(super) fn is_local(&self) -> bool {
+        matches!(self, Self::Path(_))
+    }
+
+    pub(super) fn label(&self) -> &str {
+        match self {
+            Self::CratesIo => "crates.io",
+            Self::Git(_) => "git",
+            Self::Registry(_) => "registry",
+            Self::Path(_) => "path",
         }
     }
 }
@@ -23,8 +51,10 @@ impl Default for DependencySpecBuilder {
 #[derive(Debug, Clone)]
 pub(super) struct DependencySpec {
     pub(super) name: String,
+    pub(super) source: DependencySource,
     pub(super) requirement: String,
     pub(super) kinds: String,
+    pub(super) project_rust_version: Option<String>,
     pub(super) optional: bool,
 }
 
@@ -72,6 +102,8 @@ pub(super) struct ActionAuditRecord {
     pub(super) path: Option<String>,
     pub(super) current_ref: String,
     pub(super) latest_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) latest_sha: Option<String>,
     pub(super) update_plan: ActionUpdatePlan,
     pub(super) note: Option<String>,
     pub(super) locations: Vec<ActionLocation>,
@@ -102,8 +134,10 @@ impl ActionUpdatePlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct DepAuditRecord {
     pub(super) name: String,
+    pub(super) source: DependencySource,
     pub(super) requirement: String,
     pub(super) kinds: String,
+    pub(super) project_rust_version: Option<String>,
     pub(super) optional: bool,
     pub(super) latest_version: Option<String>,
     pub(super) update_plan: Option<DependencyUpdatePlan>,
@@ -111,6 +145,7 @@ pub(super) struct DepAuditRecord {
     pub(super) update_note: Option<String>,
     pub(super) latest_version_license: Option<String>,
     pub(super) latest_version_rust_version: Option<String>,
+    pub(super) msrv_compatible: Option<bool>,
     pub(super) latest_version_yanked: Option<bool>,
     pub(super) crate_updated_at: Option<String>,
     pub(super) latest_release_at: Option<String>,
@@ -323,6 +358,59 @@ pub(super) fn build_manifest_update_plan(
     )
 }
 
+pub(super) fn dependency_msrv_compatible(
+    project_rust_version: Option<&str>,
+    dependency_rust_version: Option<&str>,
+) -> Option<bool> {
+    let project = parse_rust_version(project_rust_version?)?;
+    let dependency = parse_rust_version(dependency_rust_version?)?;
+    Some(dependency <= project)
+}
+
+pub(super) fn apply_dependency_msrv_policy(record: &mut DepAuditRecord) {
+    record.msrv_compatible = dependency_msrv_compatible(
+        record.project_rust_version.as_deref(),
+        record.latest_version_rust_version.as_deref(),
+    );
+    if record.msrv_compatible != Some(false) {
+        return;
+    }
+    record.update_plan = Some(DependencyUpdatePlan::Review);
+    record.suggested_requirement = None;
+    record.update_note = Some(format!(
+        "latest requires Rust {}; project declares {}",
+        record
+            .latest_version_rust_version
+            .as_deref()
+            .unwrap_or("unknown"),
+        record.project_rust_version.as_deref().unwrap_or("unknown")
+    ));
+}
+
+pub(super) fn minimum_rust_version(versions: &BTreeSet<String>) -> Option<String> {
+    versions
+        .iter()
+        .filter_map(|raw| parse_rust_version(raw).map(|version| (version, raw)))
+        .min_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, raw)| raw.clone())
+}
+
+fn parse_rust_version(raw: &str) -> Option<Version> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(version) = Version::parse(raw) {
+        return Some(version);
+    }
+    let components = raw.split('.').count();
+    match components {
+        1 => Version::parse(&format!("{raw}.0.0")).ok(),
+        2 => Version::parse(&format!("{raw}.0")).ok(),
+        _ => None,
+    }
+}
+
 pub(super) fn elevate(current: &mut RiskLevel, next: RiskLevel) {
     if next.weight() > current.weight() {
         *current = next;
@@ -422,15 +510,18 @@ impl GitHubCacheEntry {
 #[cfg(test)]
 mod tests {
     use super::{
-        DepAuditRecord, DependencyUpdatePlan, RiskLevel, build_manifest_update_plan, classify_risk,
-        elevate, github_repo_from_url, parse_owner_repo,
+        DepAuditRecord, DependencySource, DependencyUpdatePlan, RiskLevel,
+        apply_dependency_msrv_policy, build_manifest_update_plan, classify_risk, elevate,
+        github_repo_from_url, parse_owner_repo,
     };
 
     fn base_record() -> DepAuditRecord {
         DepAuditRecord {
             name: "demo".to_string(),
+            source: DependencySource::CratesIo,
             requirement: "^1".to_string(),
             kinds: "normal".to_string(),
+            project_rust_version: Some("1.70".to_string()),
             optional: false,
             latest_version: Some("1.2.3".to_string()),
             update_plan: Some(DependencyUpdatePlan::Keep),
@@ -438,6 +529,7 @@ mod tests {
             update_note: Some("current requirement already accepts latest".to_string()),
             latest_version_license: Some("MIT".to_string()),
             latest_version_rust_version: Some("1.70".to_string()),
+            msrv_compatible: Some(true),
             latest_version_yanked: Some(false),
             crate_updated_at: None,
             latest_release_at: Some("2025-01-01T00:00:00Z".to_string()),
@@ -515,6 +607,25 @@ mod tests {
         assert_eq!(
             note.as_deref(),
             Some("major or nontrivial upgrade; review compatibility")
+        );
+    }
+
+    #[test]
+    fn msrv_policy_blocks_incompatible_upgrade_suggestions() {
+        let mut record = base_record();
+        record.project_rust_version = Some("1.75".to_string());
+        record.latest_version_rust_version = Some("1.80.0".to_string());
+        record.update_plan = Some(DependencyUpdatePlan::Bump);
+        record.suggested_requirement = Some("2.0.0".to_string());
+
+        apply_dependency_msrv_policy(&mut record);
+
+        assert_eq!(record.msrv_compatible, Some(false));
+        assert_eq!(record.update_plan, Some(DependencyUpdatePlan::Review));
+        assert_eq!(record.suggested_requirement, None);
+        assert_eq!(
+            record.update_note.as_deref(),
+            Some("latest requires Rust 1.80.0; project declares 1.75")
         );
     }
 

@@ -21,6 +21,7 @@ use super::{
 };
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -209,6 +210,33 @@ fn tar_asset_detection_works() {
     assert!(!source::is_tar_xz_asset("codex"));
     assert!(!source::is_zip_asset("a.tar.gz"));
     assert!(!source::is_zip_asset("codex"));
+}
+
+#[test]
+fn zip_archive_extraction_supports_zip_v8() {
+    let (root, _) = temp_tool_home("zip-v8-extraction");
+    fs::create_dir_all(&root).expect("create test root");
+    let archive_path = root.join("tool.zip");
+    let output_dir = root.join("output");
+
+    let file = fs::File::create(&archive_path).expect("create zip archive");
+    let mut archive = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .unix_permissions(0o755);
+    archive
+        .start_file("bin/demo", options)
+        .expect("start zip entry");
+    archive.write_all(b"demo\n").expect("write zip entry");
+    archive.finish().expect("finish zip archive");
+
+    source::extract_archive_into_dir(&archive_path, &output_dir).expect("extract zip archive");
+    assert_eq!(
+        fs::read(output_dir.join("bin/demo")).expect("read extracted file"),
+        b"demo\n"
+    );
+
+    fs::remove_dir_all(root).expect("remove test root");
 }
 
 #[test]

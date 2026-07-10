@@ -3,7 +3,7 @@ name = "za"
 description = "AI-native CLI for context, tools, and dependency health."
 version = "0.1.95"
 edition = "2024"
-rust-version = "1.96.0"
+rust-version = "1.97.0"
 license = "MIT"
 authors = ["lvillis <lvillis@outlook.com>"]
 repository = "https://github.com/lvillis/za"
@@ -42,17 +42,17 @@ tokio = { version = "1.52.3", default-features = false, features = ["rt"] }
 serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.149", default-features = false, features = ["std"] }
 toml = { version = "1.1.2", default-features = false, features = ["parse", "serde", "display"] }
-graviola = { version = "0.3.4", default-features = false }
+graviola = { version = "0.4.1", default-features = false }
 
 # HTTP transport and TLS crypto provider.
-reqx = { version = "0.1.40", default-features = false, features = ["blocking-tls-rustls-ring"] }
+reqx = { version = "0.1.41", default-features = false, features = ["blocking-tls-rustls-ring"] }
 rustls = { version = "0.23.36", default-features = false, features = ["ring"] }
 
 # Archive extraction for downloaded binaries.
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 tar = { version = "0.4.45", default-features = false }
 xz2 = { version = "0.1.7", default-features = false }
-zip = { version = "4.6.1", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 
 [features]
 default = []

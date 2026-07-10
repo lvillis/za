@@ -14,6 +14,7 @@ pub(super) struct ApiClient {
     github_cache: Mutex<BTreeMap<String, GitHubCacheEntry>>,
     github_tags_cache: Mutex<BTreeMap<String, GitHubTagsCacheEntry>>,
     cache: Mutex<DepsCacheState>,
+    refresh_cache: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -38,6 +39,26 @@ impl Default for DepsCacheFile {
     }
 }
 
+impl DepsCacheFile {
+    fn prune_expired(&mut self, now: u64) -> bool {
+        let crates_before = self.crates.len();
+        let github_before = self.github.len();
+        let tags_before = self.github_tags.len();
+        self.crates.retain(|_, entry| {
+            cache_entry_is_fresh(now, entry.fetched_at_unix_secs, CRATES_CACHE_TTL_SECS)
+        });
+        self.github.retain(|_, entry| {
+            cache_entry_is_fresh(now, entry.fetched_at_unix_secs, GITHUB_CACHE_TTL_SECS)
+        });
+        self.github_tags.retain(|_, entry| {
+            cache_entry_is_fresh(now, entry.fetched_at_unix_secs, GITHUB_CACHE_TTL_SECS)
+        });
+        crates_before != self.crates.len()
+            || github_before != self.github.len()
+            || tags_before != self.github_tags.len()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedCrateSnapshot {
     fetched_at_unix_secs: u64,
@@ -53,7 +74,7 @@ struct CachedGitHubSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedGitHubTagsSnapshot {
     fetched_at_unix_secs: u64,
-    tags: Vec<String>,
+    tags: Vec<GitHubTagSnapshot>,
 }
 
 #[derive(Debug, Default)]
@@ -70,12 +91,12 @@ struct DepsCacheLock {
 
 #[derive(Clone)]
 enum GitHubTagsCacheEntry {
-    Hit(Vec<String>),
+    Hit(Vec<GitHubTagSnapshot>),
     Miss(String),
 }
 
 impl GitHubTagsCacheEntry {
-    fn into_result(self) -> Result<Vec<String>> {
+    fn into_result(self) -> Result<Vec<GitHubTagSnapshot>> {
         match self {
             Self::Hit(tags) => Ok(tags),
             Self::Miss(err) => bail!("{err}"),
@@ -99,32 +120,13 @@ impl DepsCacheState {
             return Self::default();
         };
 
-        let data = match fs::read(&path) {
-            Ok(raw) => match serde_json::from_slice::<DepsCacheFile>(&raw) {
-                Ok(parsed) if parsed.schema_version == DEPS_CACHE_SCHEMA_VERSION => parsed,
-                Ok(_) => DepsCacheFile::default(),
-                Err(err) => {
-                    eprintln!(
-                        "warning: dependency cache parse failed at {}: {err}",
-                        path.display()
-                    );
-                    DepsCacheFile::default()
-                }
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => DepsCacheFile::default(),
-            Err(err) => {
-                eprintln!(
-                    "warning: dependency cache read failed at {}: {err}",
-                    path.display()
-                );
-                DepsCacheFile::default()
-            }
-        };
+        let mut data = read_cache_file(&path);
 
+        let dirty = data.prune_expired(now_unix_secs());
         Self {
             path: Some(path),
             data,
-            dirty: false,
+            dirty,
         }
     }
 
@@ -136,13 +138,69 @@ impl DepsCacheState {
             return Ok(());
         };
         let _lock = DepsCacheLock::acquire(&path)?;
-        self.data.schema_version = DEPS_CACHE_SCHEMA_VERSION;
-        let content =
-            serde_json::to_vec_pretty(&self.data).context("serialize dependency cache")?;
+        let mut merged = read_cache_file(&path);
+        merged.prune_expired(now_unix_secs());
+        merge_cache_entries(
+            &mut merged.crates,
+            std::mem::take(&mut self.data.crates),
+            |entry| entry.fetched_at_unix_secs,
+        );
+        merge_cache_entries(
+            &mut merged.github,
+            std::mem::take(&mut self.data.github),
+            |entry| entry.fetched_at_unix_secs,
+        );
+        merge_cache_entries(
+            &mut merged.github_tags,
+            std::mem::take(&mut self.data.github_tags),
+            |entry| entry.fetched_at_unix_secs,
+        );
+        merged.schema_version = DEPS_CACHE_SCHEMA_VERSION;
+        let content = serde_json::to_vec_pretty(&merged).context("serialize dependency cache")?;
         write_file_atomically(&path, content)
             .with_context(|| format!("write dependency cache {}", path.display()))?;
+        self.data = merged;
         self.dirty = false;
         Ok(())
+    }
+}
+
+fn read_cache_file(path: &Path) -> DepsCacheFile {
+    match fs::read(path) {
+        Ok(raw) => match serde_json::from_slice::<DepsCacheFile>(&raw) {
+            Ok(parsed) if parsed.schema_version == DEPS_CACHE_SCHEMA_VERSION => parsed,
+            Ok(_) => DepsCacheFile::default(),
+            Err(err) => {
+                eprintln!(
+                    "warning: dependency cache parse failed at {}: {err}",
+                    path.display()
+                );
+                DepsCacheFile::default()
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => DepsCacheFile::default(),
+        Err(err) => {
+            eprintln!(
+                "warning: dependency cache read failed at {}: {err}",
+                path.display()
+            );
+            DepsCacheFile::default()
+        }
+    }
+}
+
+pub(super) fn merge_cache_entries<T>(
+    target: &mut BTreeMap<String, T>,
+    incoming: BTreeMap<String, T>,
+    fetched_at: impl Fn(&T) -> u64,
+) {
+    for (key, value) in incoming {
+        if target
+            .get(&key)
+            .is_none_or(|existing| fetched_at(&value) >= fetched_at(existing))
+        {
+            target.insert(key, value);
+        }
     }
 }
 
@@ -173,12 +231,12 @@ impl Drop for DepsCacheLock {
 }
 
 impl ApiClient {
-    pub(super) fn new(github_token_override: Option<String>) -> Result<Self> {
+    pub(super) fn new(refresh_cache: bool) -> Result<Self> {
         let crates_http =
             build_http_client("https://crates.io").context("build crates.io HTTP client")?;
         let github_http =
             build_http_client("https://api.github.com").context("build GitHub HTTP client")?;
-        let github_token = resolve_github_token(github_token_override)?;
+        let github_token = resolve_github_token()?;
         Ok(Self {
             crates_http,
             github_http,
@@ -187,6 +245,7 @@ impl ApiClient {
             github_cache: Mutex::new(BTreeMap::new()),
             github_tags_cache: Mutex::new(BTreeMap::new()),
             cache: Mutex::new(DepsCacheState::load()),
+            refresh_cache,
         })
     }
 
@@ -203,10 +262,13 @@ impl ApiClient {
     }
 
     pub(super) fn audit_one(&self, spec: DependencySpec) -> Result<DepAuditRecord> {
+        let source = spec.source.clone();
         let mut record = DepAuditRecord {
             name: spec.name.clone(),
+            source: spec.source,
             requirement: spec.requirement.clone(),
             kinds: spec.kinds,
+            project_rust_version: spec.project_rust_version,
             optional: spec.optional,
             latest_version: None,
             update_plan: None,
@@ -214,6 +276,7 @@ impl ApiClient {
             update_note: None,
             latest_version_license: None,
             latest_version_rust_version: None,
+            msrv_compatible: None,
             latest_version_yanked: None,
             crate_updated_at: None,
             latest_release_at: None,
@@ -228,27 +291,57 @@ impl ApiClient {
             notes: Vec::new(),
         };
 
-        match self.fetch_crate(&spec.name) {
-            Ok(crate_resp) => {
-                let (update_plan, suggested_requirement, update_note) =
-                    model::build_manifest_update_plan(&spec.requirement, &crate_resp.max_version);
-                record.latest_version = Some(crate_resp.max_version.clone());
-                record.update_plan = Some(update_plan);
-                record.suggested_requirement = suggested_requirement;
-                record.update_note = update_note;
-                record.latest_version_license = crate_resp.latest_version_license.clone();
-                record.latest_version_rust_version = crate_resp.latest_version_rust_version.clone();
-                record.latest_version_yanked = crate_resp.latest_version_yanked;
-                record.crate_updated_at = crate_resp.updated_at.clone();
-                record.latest_release_at = crate_resp.latest_release_at.clone();
-                record.latest_release_age_days = crate_resp
-                    .latest_release_at
-                    .as_deref()
-                    .and_then(age_days_from_now);
-                record.repository = crate_resp.repository.clone();
+        match source {
+            DependencySource::CratesIo => match self.fetch_crate(&spec.name) {
+                Ok(crate_resp) => {
+                    let (update_plan, suggested_requirement, update_note) =
+                        model::build_manifest_update_plan(
+                            &spec.requirement,
+                            &crate_resp.max_version,
+                        );
+                    record.latest_version = Some(crate_resp.max_version.clone());
+                    record.update_plan = Some(update_plan);
+                    record.suggested_requirement = suggested_requirement;
+                    record.update_note = update_note;
+                    record.latest_version_license = crate_resp.latest_version_license.clone();
+                    record.latest_version_rust_version =
+                        crate_resp.latest_version_rust_version.clone();
+                    model::apply_dependency_msrv_policy(&mut record);
+                    record.latest_version_yanked = crate_resp.latest_version_yanked;
+                    record.crate_updated_at = crate_resp.updated_at.clone();
+                    record.latest_release_at = crate_resp.latest_release_at.clone();
+                    record.latest_release_age_days = crate_resp
+                        .latest_release_at
+                        .as_deref()
+                        .and_then(age_days_from_now);
+                    record.repository = crate_resp.repository.clone();
+                }
+                Err(err) => {
+                    record.notes.push(format!("crates.io query failed: {err}"));
+                    classify_risk(&mut record);
+                    return Ok(record);
+                }
+            },
+            DependencySource::Git(url) => {
+                record.repository = Some(url);
+                record.update_plan = Some(DependencyUpdatePlan::Review);
+                record.update_note =
+                    Some("git dependency revision requires manual review".to_string());
             }
-            Err(err) => {
-                record.notes.push(format!("crates.io query failed: {err}"));
+            DependencySource::Registry(registry) => {
+                record.update_plan = Some(DependencyUpdatePlan::Review);
+                record.update_note = Some(format!(
+                    "alternate registry `{registry}` requires registry-specific resolution"
+                ));
+                record
+                    .notes
+                    .push("alternate registry metadata not queried".to_string());
+                classify_risk(&mut record);
+                return Ok(record);
+            }
+            DependencySource::Path(path) => {
+                record.update_plan = Some(DependencyUpdatePlan::Review);
+                record.update_note = Some(format!("unexpected path dependency `{path}`"));
                 classify_risk(&mut record);
                 return Ok(record);
             }
@@ -321,7 +414,7 @@ impl ApiClient {
         entry.into_result()
     }
 
-    fn fetch_github_tags_cached(&self, owner: &str, repo: &str) -> Result<Vec<String>> {
+    fn fetch_github_tags_cached(&self, owner: &str, repo: &str) -> Result<Vec<GitHubTagSnapshot>> {
         let key = format!("{owner}/{repo}");
         if let Some(tags) = self.cache_get_github_tags(&key)? {
             return Ok(tags);
@@ -473,76 +566,90 @@ impl ApiClient {
         })
     }
 
-    fn fetch_github_tags(&self, owner: &str, repo: &str) -> Result<Vec<String>> {
+    fn fetch_github_tags(&self, owner: &str, repo: &str) -> Result<Vec<GitHubTagSnapshot>> {
         if self.github_api_blocked.load(Ordering::Relaxed) {
             bail!("skipped after GitHub API 403 (set GITHUB_TOKEN for stable quota)");
         }
 
-        self.retry_with_backoff("request GitHub tags API", || {
-            let mut req = self.github_http.get(format!(
-                "/repos/{owner}/{repo}/tags?per_page={WORKFLOW_ACTION_REF_MAX_TAGS}"
-            ));
-            req = req
-                .try_header("user-agent", HTTP_USER_AGENT)
-                .map_err(|err| AttemptError::Fatal(anyhow!("set user-agent header: {err}")))?;
-            req = req
-                .try_header("accept", "application/vnd.github+json")
-                .map_err(|err| {
-                    AttemptError::Fatal(anyhow!("set accept header for GitHub request: {err}"))
-                })?;
-            if let Some(token) = self.github_token.as_deref() {
+        let mut tags = Vec::new();
+        for page in 1..=WORKFLOW_ACTION_REF_MAX_PAGES {
+            let page_tags = self.retry_with_backoff("request GitHub tags API", || {
+                let mut req = self.github_http.get(format!(
+                    "/repos/{owner}/{repo}/tags?per_page={WORKFLOW_ACTION_REF_MAX_TAGS}&page={page}"
+                ));
                 req = req
-                    .try_header("authorization", &format!("Bearer {token}"))
+                    .try_header("user-agent", HTTP_USER_AGENT)
+                    .map_err(|err| AttemptError::Fatal(anyhow!("set user-agent header: {err}")))?;
+                req = req
+                    .try_header("accept", "application/vnd.github+json")
                     .map_err(|err| {
-                        AttemptError::Fatal(anyhow!(
-                            "set authorization header for GitHub request: {err}"
-                        ))
+                        AttemptError::Fatal(anyhow!("set accept header for GitHub request: {err}"))
                     })?;
-            }
-
-            let response = req.send_response().map_err(|err| {
-                AttemptError::Retryable(anyhow!("request GitHub tags API failed: {err}"))
-            })?;
-            let status = response.status();
-            if !status.is_success() {
-                let body = text_render::truncate_end(&response.text_lossy(), 200);
-                if status.as_u16() == 403 {
-                    self.github_api_blocked.store(true, Ordering::Relaxed);
-                    return Err(AttemptError::Fatal(anyhow!(
-                        "status {} (rate-limited or forbidden); body {}",
-                        status,
-                        body
-                    )));
+                if let Some(token) = self.github_token.as_deref() {
+                    req = req
+                        .try_header("authorization", &format!("Bearer {token}"))
+                        .map_err(|err| {
+                            AttemptError::Fatal(anyhow!(
+                                "set authorization header for GitHub request: {err}"
+                            ))
+                        })?;
                 }
-                if is_retryable_status(status.as_u16()) {
-                    return Err(AttemptError::Retryable(anyhow!(
+
+                let response = req.send_response().map_err(|err| {
+                    AttemptError::Retryable(anyhow!("request GitHub tags API failed: {err}"))
+                })?;
+                let status = response.status();
+                if !status.is_success() {
+                    let body = text_render::truncate_end(&response.text_lossy(), 200);
+                    if status.as_u16() == 403 {
+                        self.github_api_blocked.store(true, Ordering::Relaxed);
+                        return Err(AttemptError::Fatal(anyhow!(
+                            "status {} (rate-limited or forbidden); body {}",
+                            status,
+                            body
+                        )));
+                    }
+                    if is_retryable_status(status.as_u16()) {
+                        return Err(AttemptError::Retryable(anyhow!(
+                            "status {} body {}",
+                            status,
+                            body
+                        )));
+                    }
+                    return Err(AttemptError::Fatal(anyhow!(
                         "status {} body {}",
                         status,
                         body
                     )));
                 }
-                return Err(AttemptError::Fatal(anyhow!(
-                    "status {} body {}",
-                    status,
-                    body
-                )));
-            }
 
-            response
-                .json::<Vec<GitHubTagResponse>>()
-                .map(|tags| tags.into_iter().map(|tag| tag.name).collect())
-                .map_err(|err| AttemptError::Fatal(anyhow!("parse GitHub tags JSON: {err}")))
-        })
+                response
+                    .json::<Vec<GitHubTagResponse>>()
+                    .map_err(|err| AttemptError::Fatal(anyhow!("parse GitHub tags JSON: {err}")))
+            })?;
+            let page_len = page_tags.len();
+            tags.extend(page_tags.into_iter().map(|tag| GitHubTagSnapshot {
+                name: tag.name,
+                sha: tag.commit.sha,
+            }));
+            if page_len < WORKFLOW_ACTION_REF_MAX_TAGS {
+                break;
+            }
+        }
+        Ok(tags)
     }
 
     fn cache_get_crate(&self, name: &str) -> Result<Option<CrateSnapshot>> {
+        if self.refresh_cache {
+            return Ok(None);
+        }
         let now = now_unix_secs();
         let mut cache = self
             .cache
             .lock()
             .map_err(|_| anyhow!("dependency cache lock poisoned"))?;
         if let Some(entry) = cache.data.crates.get(name) {
-            if now.saturating_sub(entry.fetched_at_unix_secs) <= CRATES_CACHE_TTL_SECS {
+            if cache_entry_is_fresh(now, entry.fetched_at_unix_secs, CRATES_CACHE_TTL_SECS) {
                 return Ok(Some(entry.snapshot.clone()));
             }
             cache.data.crates.remove(name);
@@ -568,13 +675,16 @@ impl ApiClient {
     }
 
     fn cache_get_github(&self, repo_key: &str) -> Result<Option<GitHubRepoResponse>> {
+        if self.refresh_cache {
+            return Ok(None);
+        }
         let now = now_unix_secs();
         let mut cache = self
             .cache
             .lock()
             .map_err(|_| anyhow!("dependency cache lock poisoned"))?;
         if let Some(entry) = cache.data.github.get(repo_key) {
-            if now.saturating_sub(entry.fetched_at_unix_secs) <= GITHUB_CACHE_TTL_SECS {
+            if cache_entry_is_fresh(now, entry.fetched_at_unix_secs, GITHUB_CACHE_TTL_SECS) {
                 return Ok(Some(entry.snapshot.clone()));
             }
             cache.data.github.remove(repo_key);
@@ -599,14 +709,17 @@ impl ApiClient {
         Ok(())
     }
 
-    fn cache_get_github_tags(&self, repo_key: &str) -> Result<Option<Vec<String>>> {
+    fn cache_get_github_tags(&self, repo_key: &str) -> Result<Option<Vec<GitHubTagSnapshot>>> {
+        if self.refresh_cache {
+            return Ok(None);
+        }
         let now = now_unix_secs();
         let mut cache = self
             .cache
             .lock()
             .map_err(|_| anyhow!("dependency cache lock poisoned"))?;
         if let Some(entry) = cache.data.github_tags.get(repo_key) {
-            if now.saturating_sub(entry.fetched_at_unix_secs) <= GITHUB_CACHE_TTL_SECS {
+            if cache_entry_is_fresh(now, entry.fetched_at_unix_secs, GITHUB_CACHE_TTL_SECS) {
                 return Ok(Some(entry.tags.clone()));
             }
             cache.data.github_tags.remove(repo_key);
@@ -615,7 +728,7 @@ impl ApiClient {
         Ok(None)
     }
 
-    fn cache_put_github_tags(&self, repo_key: &str, tags: Vec<String>) -> Result<()> {
+    fn cache_put_github_tags(&self, repo_key: &str, tags: Vec<GitHubTagSnapshot>) -> Result<()> {
         let mut cache = self
             .cache
             .lock()
@@ -762,14 +875,7 @@ fn build_http_client(base_url: &str) -> Result<Client> {
         .with_context(|| format!("build HTTP client for `{base_url}`"))
 }
 
-fn resolve_github_token(override_token: Option<String>) -> Result<Option<String>> {
-    if let Some(token) = override_token {
-        let trimmed = token.trim();
-        if !trimmed.is_empty() {
-            return Ok(Some(trimmed.to_string()));
-        }
-    }
-
+fn resolve_github_token() -> Result<Option<String>> {
     if let Ok(token) = env::var("GITHUB_TOKEN") {
         let trimmed = token.trim();
         if !trimmed.is_empty() {
@@ -796,6 +902,10 @@ fn is_retryable_status(status_code: u16) -> bool {
     status_code == 408 || status_code == 429 || (500..=599).contains(&status_code)
 }
 
+pub(super) fn cache_entry_is_fresh(now: u64, fetched_at: u64, ttl_secs: u64) -> bool {
+    fetched_at <= now && now - fetched_at <= ttl_secs
+}
+
 fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -804,10 +914,10 @@ fn now_unix_secs() -> u64 {
 }
 
 fn deps_cache_path() -> Option<PathBuf> {
-    if let Some(base) = env::var_os("XDG_CACHE_HOME") {
+    if let Some(base) = env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
         return Some(PathBuf::from(base).join("za").join(DEPS_CACHE_FILE_NAME));
     }
-    let home = env::var_os("HOME")?;
+    let home = env::var_os("HOME").filter(|value| !value.is_empty())?;
     Some(
         PathBuf::from(home)
             .join(".cache")

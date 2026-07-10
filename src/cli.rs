@@ -582,9 +582,6 @@ pub struct DepsAuditArgs {
     /// Optional project directory or Cargo.toml path to audit.
     #[arg(long, value_name = "PATH")]
     pub path: Option<PathBuf>,
-    /// Optional GitHub token override for this run.
-    #[arg(long, value_name = "TOKEN")]
-    pub github_token: Option<String>,
     /// Number of concurrent workers for API queries (default: auto, based on CPU count).
     #[arg(long, value_name = "JOBS")]
     pub jobs: Option<usize>,
@@ -594,9 +591,12 @@ pub struct DepsAuditArgs {
     /// Include build-dependencies in audit.
     #[arg(long)]
     pub include_build: bool,
-    /// Also include optional dependencies that are not active in the current resolved feature set.
+    /// Also include optional dependencies that are not enabled by default features.
     #[arg(long)]
     pub include_optional: bool,
+    /// Ignore cached metadata and refresh remote dependency data.
+    #[arg(long)]
+    pub refresh: bool,
     /// Write full audit report to JSON.
     #[arg(long, value_name = "PATH")]
     pub json: Option<PathBuf>,
@@ -630,9 +630,12 @@ pub enum DepsCommands {
         /// Include build-dependencies when reading crates from a manifest.
         #[arg(long)]
         include_build: bool,
-        /// Also include optional dependencies when reading crates from a manifest.
+        /// Also include optional dependencies that are not enabled by default features.
         #[arg(long)]
         include_optional: bool,
+        /// Ignore cached metadata and refresh remote dependency data.
+        #[arg(long)]
+        refresh: bool,
         /// Print JSON output for scripting.
         #[arg(long, conflicts_with = "toml")]
         json: bool,
@@ -1586,11 +1589,11 @@ mod tests {
                 assert!(cmd.is_none());
                 assert!(audit.manifest_path.is_none());
                 assert!(audit.path.is_none());
-                assert!(audit.github_token.is_none());
                 assert!(audit.jobs.is_none());
                 assert!(!audit.include_dev);
                 assert!(!audit.include_build);
                 assert!(!audit.include_optional);
+                assert!(!audit.refresh);
                 assert!(audit.json.is_none());
                 assert!(!audit.fail_on_high);
                 assert!(audit.verbose);
@@ -1611,6 +1614,19 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn deps_refresh_is_explicit_and_token_cli_is_rejected() {
+        let cli = Cli::try_parse_from(["za", "deps", "--refresh"]).expect("must parse");
+        match cli.cmd {
+            Commands::Deps { audit, cmd } => {
+                assert!(cmd.is_none());
+                assert!(audit.refresh);
+            }
+            _ => panic!("unexpected command"),
+        }
+        assert!(Cli::try_parse_from(["za", "deps", "--github-token", "secret"]).is_err());
     }
 
     #[test]
@@ -1635,6 +1651,7 @@ mod tests {
                     include_dev,
                     include_build,
                     include_optional,
+                    refresh,
                     json,
                     toml,
                     suggest,
@@ -1646,6 +1663,7 @@ mod tests {
                     assert!(!include_dev);
                     assert!(!include_build);
                     assert!(!include_optional);
+                    assert!(!refresh);
                     assert!(!json);
                     assert!(toml);
                     assert!(!suggest);

@@ -1,17 +1,18 @@
+use super::api::{cache_entry_is_fresh, merge_cache_entries};
 use super::latest::{
     LatestQuerySource, LatestRecord, LatestStatus, LatestSuggestionKind, LatestSummary,
     render_empty_latest,
 };
 use super::render::{render_latest_lines, render_latest_toml, render_report_lines};
 use super::{
-    ActionAuditRecord, ActionLocation, ActionUpdatePlan, AuditSummary, CargoDependency,
-    CargoMetadata, CargoPackage, CargoResolve, CargoResolveDepKind, CargoResolveNode,
-    CargoResolveNodeDep, DepAuditRecord, DependencyUpdatePlan, RiskLevel, WorkflowActionSpec,
+    ActionAuditRecord, ActionLocation, ActionUpdatePlan, AuditSummary, DepAuditRecord,
+    DependencySource, DependencyUpdatePlan, DepsRunOptions, GitHubTagSnapshot, RiskLevel,
+    WorkflowActionSpec, WorkspaceDependency, WorkspaceManifest, WorkspacePackage,
     build_action_audit_record, collect_dependency_inventory, collect_dependency_specs,
     derive_auto_jobs, latest_stable_action_tag, parse_action_tag_version, parse_workflow_uses_line,
-    read_manifest_metadata,
+    read_manifest_metadata, run,
 };
-use std::{fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 #[test]
 fn auto_jobs_is_bounded() {
@@ -23,7 +24,32 @@ fn auto_jobs_is_bounded() {
 }
 
 #[test]
-fn collect_dependency_specs_uses_resolved_active_direct_dependencies() {
+fn cache_freshness_rejects_future_and_expired_entries() {
+    assert!(cache_entry_is_fresh(1_000, 950, 60));
+    assert!(!cache_entry_is_fresh(1_000, 900, 60));
+    assert!(!cache_entry_is_fresh(1_000, 1_001, 60));
+}
+
+#[test]
+fn cache_merge_keeps_newest_entries_from_concurrent_writers() {
+    let mut persisted = BTreeMap::from([
+        ("shared".to_string(), (20_u64, "persisted")),
+        ("persisted-only".to_string(), (10_u64, "persisted-only")),
+    ]);
+    let local = BTreeMap::from([
+        ("shared".to_string(), (15_u64, "stale-local")),
+        ("local-only".to_string(), (30_u64, "local-only")),
+    ]);
+
+    merge_cache_entries(&mut persisted, local, |entry| entry.0);
+
+    assert_eq!(persisted["shared"].1, "persisted");
+    assert_eq!(persisted["persisted-only"].1, "persisted-only");
+    assert_eq!(persisted["local-only"].1, "local-only");
+}
+
+#[test]
+fn collect_dependency_specs_uses_default_enabled_optional_dependencies() {
     let metadata = sample_metadata();
 
     let specs = collect_dependency_specs(&metadata, false, false, false).unwrap();
@@ -73,6 +99,27 @@ fn collect_dependency_specs_scans_all_workspace_members_even_when_root_is_set() 
 }
 
 #[test]
+fn collect_dependency_specs_preserves_distinct_workspace_requirements() {
+    let mut metadata = workspace_metadata();
+    metadata.packages[1].dependencies.push(workspace_dependency(
+        "serde",
+        DependencySource::CratesIo,
+        "^2",
+        false,
+        true,
+    ));
+
+    let specs = collect_dependency_specs(&metadata, false, false, false).unwrap();
+    let serde = specs
+        .iter()
+        .find(|spec| spec.name == "serde")
+        .expect("serde dependency");
+
+    assert_eq!(serde.requirement, "^1 | ^2");
+    assert_eq!(serde.project_rust_version.as_deref(), Some("1.75"));
+}
+
+#[test]
 fn collect_dependency_inventory_skips_workspace_and_local_path_crates() {
     let metadata = workspace_metadata();
 
@@ -104,6 +151,9 @@ fn read_manifest_metadata_scans_workspace_manifests_without_resolving_deps() {
             [workspace]
             members = ["crates/*"]
 
+            [workspace.package]
+            rust-version = "1.75"
+
             [workspace.dependencies]
             anyhow = "1"
             serde = "1"
@@ -117,6 +167,11 @@ fn read_manifest_metadata_scans_workspace_manifests_without_resolving_deps() {
             [package]
             name = "app"
             version = "0.1.0"
+            rust-version.workspace = true
+
+            [features]
+            default = ["network"]
+            network = ["dep:reqx"]
 
             [dependencies]
             anyhow = { workspace = true }
@@ -124,6 +179,8 @@ fn read_manifest_metadata_scans_workspace_manifests_without_resolving_deps() {
             local-helper = { workspace = true }
             runtime = { package = "tokio", version = "1" }
             reqx = { version = "0.1", optional = true }
+            git-tool = { git = "https://github.com/example/git-tool", rev = "abc123" }
+            private-api = { version = "2", registry = "company" }
 
             [target.'cfg(unix)'.dependencies]
             regex = "1"
@@ -141,8 +198,6 @@ fn read_manifest_metadata_scans_workspace_manifests_without_resolving_deps() {
     .expect("write local manifest");
 
     let metadata = read_manifest_metadata(&root.join("Cargo.toml")).expect("read metadata");
-    assert!(metadata.resolve.is_none());
-
     let inventory =
         collect_dependency_inventory(&metadata, false, false, false).expect("collect deps");
     let names = inventory
@@ -156,40 +211,238 @@ fn read_manifest_metadata_scans_workspace_manifests_without_resolving_deps() {
         .map(|spec| spec.name.as_str())
         .collect::<Vec<_>>();
 
-    assert_eq!(names, vec!["anyhow", "regex", "serde", "tokio"]);
+    assert_eq!(
+        names,
+        vec![
+            "anyhow",
+            "git-tool",
+            "private-api",
+            "regex",
+            "reqx",
+            "serde",
+            "tokio"
+        ]
+    );
     assert_eq!(skipped, vec!["local-helper"]);
+    let git = inventory
+        .specs
+        .iter()
+        .find(|spec| spec.name == "git-tool")
+        .expect("git dependency");
+    assert!(matches!(git.source, DependencySource::Git(_)));
+    assert_eq!(git.requirement, "rev:abc123");
+    let private = inventory
+        .specs
+        .iter()
+        .find(|spec| spec.name == "private-api")
+        .expect("registry dependency");
+    assert_eq!(
+        private.source,
+        DependencySource::Registry("company".to_string())
+    );
+    let reqx = inventory
+        .specs
+        .iter()
+        .find(|spec| spec.name == "reqx")
+        .expect("default-enabled optional dependency");
+    assert_eq!(reqx.project_rust_version.as_deref(), Some("1.75"));
 }
 
 #[test]
-fn collect_dependency_specs_discards_partial_resolve_before_declared_fallback() {
-    let mut metadata = workspace_metadata();
-    metadata.packages[0].dependencies.push(CargoDependency {
-        name: "hyper".to_string(),
-        source: Some(registry_source()),
-        req: "^1".to_string(),
-        kind: None,
-        optional: true,
-    });
-    metadata.packages.push(CargoPackage {
-        id: "pkg-hyper".to_string(),
-        name: "hyper".to_string(),
-        source: Some(registry_source()),
-        dependencies: Vec::new(),
-    });
-    let resolve = metadata.resolve.as_mut().unwrap();
-    resolve.nodes[0].deps.push(CargoResolveNodeDep {
-        pkg: "pkg-hyper".to_string(),
-        dep_kinds: vec![CargoResolveDepKind { kind: None }],
-    });
-    resolve.nodes.retain(|node| node.id != "pkg-workspace-core");
+fn workspace_discovery_supports_question_globs_and_implicit_path_members() {
+    let root = temp_root("deps-workspace-discovery");
+    fs::create_dir_all(root.join("crates/app")).expect("create app crate");
+    fs::create_dir_all(root.join("crates/helper")).expect("create helper crate");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"
+            [workspace]
+            members = ["crates/a?p"]
+        "#,
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        root.join("crates/app/Cargo.toml"),
+        r#"
+            [package]
+            name = "app"
+            version = "0.1.0"
 
-    let specs = collect_dependency_specs(&metadata, false, false, false).unwrap();
-    let names = specs
-        .iter()
-        .map(|spec| spec.name.as_str())
-        .collect::<Vec<_>>();
+            [dependencies]
+            helper = { path = "../helper" }
+        "#,
+    )
+    .expect("write app manifest");
+    fs::write(
+        root.join("crates/helper/Cargo.toml"),
+        r#"
+            [package]
+            name = "helper"
+            version = "0.1.0"
 
-    assert_eq!(names, vec!["serde", "tokio"]);
+            [dependencies]
+            serde = "1"
+        "#,
+    )
+    .expect("write helper manifest");
+
+    let metadata = read_manifest_metadata(&root.join("Cargo.toml")).expect("read metadata");
+    assert_eq!(metadata.packages.len(), 2);
+    let inventory =
+        collect_dependency_inventory(&metadata, false, false, false).expect("collect deps");
+    assert_eq!(
+        inventory
+            .specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["serde"]
+    );
+    assert_eq!(
+        inventory
+            .skipped_local
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["helper"]
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_discovery_resolves_inherited_paths_from_workspace_root() {
+    let root = temp_root("deps-workspace-inherited-path");
+    fs::create_dir_all(root.join("apps/cli")).expect("create app crate");
+    fs::create_dir_all(root.join("crates/nested/helper")).expect("create helper crate");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"
+            [workspace]
+            members = ["apps/cli"]
+
+            [workspace.dependencies]
+            helper = { path = "crates/nested/helper" }
+        "#,
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        root.join("apps/cli/Cargo.toml"),
+        r#"
+            [package]
+            name = "cli"
+            version = "0.1.0"
+
+            [dependencies]
+            helper.workspace = true
+        "#,
+    )
+    .expect("write app manifest");
+    fs::write(
+        root.join("crates/nested/helper/Cargo.toml"),
+        r#"
+            [package]
+            name = "helper"
+            version = "0.1.0"
+
+            [dependencies]
+            serde = "1"
+        "#,
+    )
+    .expect("write helper manifest");
+
+    let metadata = read_manifest_metadata(&root.join("Cargo.toml")).expect("read metadata");
+    assert_eq!(metadata.packages.len(), 2);
+    let inventory =
+        collect_dependency_inventory(&metadata, false, false, false).expect("collect deps");
+    assert_eq!(
+        inventory
+            .specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["serde"]
+    );
+    assert_eq!(
+        inventory
+            .skipped_local
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["helper"]
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_discovery_supports_recursive_member_globs() {
+    let root = temp_root("deps-workspace-recursive-glob");
+    fs::create_dir_all(root.join("crates/group/member")).expect("create nested member");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"
+            [workspace]
+            members = ["crates/**"]
+        "#,
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        root.join("crates/group/member/Cargo.toml"),
+        r#"
+            [package]
+            name = "member"
+            version = "0.1.0"
+
+            [dependencies]
+            anyhow = "1"
+        "#,
+    )
+    .expect("write member manifest");
+
+    let metadata = read_manifest_metadata(&root.join("Cargo.toml")).expect("read metadata");
+    assert_eq!(metadata.packages.len(), 1);
+    let inventory =
+        collect_dependency_inventory(&metadata, false, false, false).expect("collect deps");
+    assert_eq!(inventory.specs[0].name, "anyhow");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn empty_audit_writes_requested_json_report() {
+    let root = temp_root("deps-empty-json");
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"
+            [package]
+            name = "empty"
+            version = "0.1.0"
+        "#,
+    )
+    .expect("write manifest");
+    let report = root.join("deps.json");
+
+    run(DepsRunOptions {
+        manifest_path: Some(root.join("Cargo.toml")),
+        project_path: None,
+        jobs: Some(1),
+        include_dev: false,
+        include_build: false,
+        include_optional: false,
+        refresh: false,
+        json_out: Some(report.clone()),
+        fail_on_high: false,
+        verbose: false,
+    })
+    .expect("run empty audit");
+
+    let output = fs::read_to_string(&report).expect("read report");
+    let json: serde_json::Value = serde_json::from_str(&output).expect("parse report");
+    assert_eq!(json["dependencies"], serde_json::json!([]));
+    assert_eq!(json["actions"], serde_json::Value::Null);
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -393,10 +646,9 @@ fn render_report_lines_reviews_floating_action_refs_without_fake_latest() {
 #[test]
 fn workflow_action_version_selection_uses_highest_stable_tag() {
     let tags = vec![
-        "v4".to_string(),
-        "v6".to_string(),
-        "v5.1.0".to_string(),
-        "v7.0.0-beta.1".to_string(),
+        action_tag("v4", "4444444444444444444444444444444444444444"),
+        action_tag("v6", "6666666666666666666666666666666666666666"),
+        action_tag("v5.1.0", "5555555555555555555555555555555555555555"),
     ];
 
     assert_eq!(
@@ -412,7 +664,13 @@ fn workflow_action_version_selection_uses_highest_stable_tag() {
 #[test]
 fn build_action_audit_record_classifies_version_refs() {
     let spec = sample_workflow_action_spec("actions/checkout", "v4");
-    let record = build_action_audit_record(spec, Ok(vec!["v4".to_string(), "v6".to_string()]));
+    let record = build_action_audit_record(
+        spec,
+        Ok(vec![
+            action_tag("v4", "4444444444444444444444444444444444444444"),
+            action_tag("v6", "6666666666666666666666666666666666666666"),
+        ]),
+    );
 
     assert_eq!(record.latest_ref.as_deref(), Some("v6"));
     assert_eq!(record.update_plan, ActionUpdatePlan::Bump);
@@ -422,7 +680,13 @@ fn build_action_audit_record_classifies_version_refs() {
 #[test]
 fn build_action_audit_record_keeps_major_refs_on_same_major() {
     let spec = sample_workflow_action_spec("actions/checkout", "v6");
-    let record = build_action_audit_record(spec, Ok(vec!["v6".to_string(), "v6.0.2".to_string()]));
+    let record = build_action_audit_record(
+        spec,
+        Ok(vec![
+            action_tag("v6", "6666666666666666666666666666666666666666"),
+            action_tag("v6.0.2", "6666666666666666666666666666666666666666"),
+        ]),
+    );
 
     assert_eq!(record.latest_ref.as_deref(), Some("v6.0.2"));
     assert_eq!(record.update_plan, ActionUpdatePlan::Keep);
@@ -430,16 +694,72 @@ fn build_action_audit_record_keeps_major_refs_on_same_major() {
 }
 
 #[test]
-fn build_action_audit_record_keeps_sha_pinned_refs() {
+fn build_action_audit_record_updates_outdated_sha_pins() {
     let spec = sample_workflow_action_spec(
         "actions/checkout",
         "0123456789abcdef0123456789abcdef01234567",
     );
-    let record = build_action_audit_record(spec, Ok(vec!["v6".to_string()]));
+    let record = build_action_audit_record(
+        spec,
+        Ok(vec![
+            action_tag("v4.2.2", "0123456789abcdef0123456789abcdef01234567"),
+            action_tag("v6.0.2", "abcdef0123456789abcdef0123456789abcdef01"),
+        ]),
+    );
 
-    assert_eq!(record.latest_ref, None);
-    assert_eq!(record.update_plan, ActionUpdatePlan::Keep);
-    assert_eq!(record.note.as_deref(), Some("sha-pinned"));
+    assert_eq!(record.latest_ref.as_deref(), Some("v6.0.2"));
+    assert_eq!(
+        record.latest_sha.as_deref(),
+        Some("abcdef0123456789abcdef0123456789abcdef01")
+    );
+    assert_eq!(record.update_plan, ActionUpdatePlan::Bump);
+    assert_eq!(record.note.as_deref(), Some("newer action tag available"));
+}
+
+#[test]
+fn build_action_audit_record_reviews_sha_with_ambiguous_version_hint() {
+    let mut spec = sample_workflow_action_spec(
+        "actions/checkout",
+        "0123456789abcdef0123456789abcdef01234567",
+    );
+    spec.version_hint = Some("v6".to_string());
+
+    let record = build_action_audit_record(
+        spec,
+        Ok(vec![action_tag(
+            "v6.0.2",
+            "abcdef0123456789abcdef0123456789abcdef01",
+        )]),
+    );
+
+    assert_eq!(record.update_plan, ActionUpdatePlan::Review);
+    assert_eq!(
+        record.note.as_deref(),
+        Some("sha pin needs an exact version hint; review manually")
+    );
+}
+
+#[test]
+fn build_action_audit_record_reviews_mismatched_sha_hint() {
+    let mut spec = sample_workflow_action_spec(
+        "actions/checkout",
+        "0123456789abcdef0123456789abcdef01234567",
+    );
+    spec.version_hint = Some("v6.0.2".to_string());
+
+    let record = build_action_audit_record(
+        spec,
+        Ok(vec![action_tag(
+            "v6.0.2",
+            "abcdef0123456789abcdef0123456789abcdef01",
+        )]),
+    );
+
+    assert_eq!(record.update_plan, ActionUpdatePlan::Review);
+    assert_eq!(
+        record.note.as_deref(),
+        Some("sha pin does not match the hinted release tag")
+    );
 }
 
 #[test]
@@ -454,32 +774,64 @@ fn parse_workflow_uses_line_reads_quoted_remote_actions() {
 }
 
 #[test]
+fn parse_workflow_uses_line_reads_sha_version_hint() {
+    let spec = parse_workflow_uses_line(
+        "- uses: actions/checkout@0123456789abcdef0123456789abcdef01234567 # v4.2.2",
+    )
+    .expect("must parse action");
+
+    assert_eq!(spec.version_hint.as_deref(), Some("v4.2.2"));
+}
+
+#[test]
 fn render_latest_lines_show_summary_and_failure_note() {
     let summary = LatestSummary {
-        total: 2,
+        total: 3,
         resolved: 1,
+        review: 1,
         failed: 1,
     };
     let records = vec![
         LatestRecord {
             name: "serde".to_string(),
+            dependency_source: DependencySource::CratesIo,
             requirement: Some("^1".to_string()),
             kinds: Some("normal".to_string()),
             source: LatestQuerySource::Manifest,
             status: LatestStatus::Resolved,
             latest_version: Some("1.0.228".to_string()),
+            project_rust_version: Some("1.70".to_string()),
+            msrv_compatible: Some(true),
             suggestion_kind: None,
             suggested_requirement: None,
             note: None,
             suggestion_note: None,
         },
         LatestRecord {
+            name: "internal-sdk".to_string(),
+            dependency_source: DependencySource::Registry("company".to_string()),
+            requirement: Some("1".to_string()),
+            kinds: Some("normal".to_string()),
+            source: LatestQuerySource::Manifest,
+            status: LatestStatus::Review,
+            latest_version: None,
+            project_rust_version: None,
+            msrv_compatible: None,
+            suggestion_kind: Some(LatestSuggestionKind::Review),
+            suggested_requirement: None,
+            note: Some("registry dependency requires source-specific resolution".to_string()),
+            suggestion_note: None,
+        },
+        LatestRecord {
             name: "mystery".to_string(),
+            dependency_source: DependencySource::CratesIo,
             requirement: None,
             kinds: None,
             source: LatestQuerySource::Args,
             status: LatestStatus::Failed,
             latest_version: None,
+            project_rust_version: None,
+            msrv_compatible: None,
             suggestion_kind: None,
             suggested_requirement: None,
             note: Some("crates.io query failed: timeout".to_string()),
@@ -496,11 +848,14 @@ fn render_latest_lines_show_summary_and_failure_note() {
     let output = lines.join("\n");
     assert!(output.contains("latest"));
     assert!(output.contains("1 resolved"));
+    assert!(output.contains("1 review"));
     assert!(output.contains("1 failed"));
     assert!(output.contains("serde"));
     assert!(output.contains("1.0.228"));
     assert!(output.contains("mystery"));
     assert!(output.contains("timeout"));
+    assert!(output.contains("internal-sdk"));
+    assert!(output.contains("source-specific"));
     assert!(output.contains("manifest  /tmp/work/Cargo.toml"));
 }
 
@@ -518,11 +873,14 @@ fn render_latest_toml_comments_failed_entries() {
     let rendered = render_latest_toml(&[
         LatestRecord {
             name: "serde".to_string(),
+            dependency_source: DependencySource::CratesIo,
             requirement: None,
             kinds: None,
             source: LatestQuerySource::Args,
             status: LatestStatus::Resolved,
             latest_version: Some("1.0.228".to_string()),
+            project_rust_version: None,
+            msrv_compatible: None,
             suggestion_kind: None,
             suggested_requirement: None,
             note: None,
@@ -530,11 +888,14 @@ fn render_latest_toml_comments_failed_entries() {
         },
         LatestRecord {
             name: "broken".to_string(),
+            dependency_source: DependencySource::CratesIo,
             requirement: None,
             kinds: None,
             source: LatestQuerySource::Args,
             status: LatestStatus::Failed,
             latest_version: None,
+            project_rust_version: None,
+            msrv_compatible: None,
             suggestion_kind: None,
             suggested_requirement: None,
             note: Some("crates.io query failed: eof".to_string()),
@@ -551,16 +912,20 @@ fn render_latest_lines_suggest_mode_surfaces_plan_and_suggestion() {
     let summary = LatestSummary {
         total: 2,
         resolved: 2,
+        review: 0,
         failed: 0,
     };
     let records = vec![
         LatestRecord {
             name: "serde".to_string(),
+            dependency_source: DependencySource::CratesIo,
             requirement: Some("^1".to_string()),
             kinds: Some("normal".to_string()),
             source: LatestQuerySource::Manifest,
             status: LatestStatus::Resolved,
             latest_version: Some("1.0.228".to_string()),
+            project_rust_version: Some("1.70".to_string()),
+            msrv_compatible: Some(true),
             suggestion_kind: Some(LatestSuggestionKind::Keep),
             suggested_requirement: None,
             note: None,
@@ -568,11 +933,14 @@ fn render_latest_lines_suggest_mode_surfaces_plan_and_suggestion() {
         },
         LatestRecord {
             name: "reqx".to_string(),
+            dependency_source: DependencySource::CratesIo,
             requirement: Some("0.1.29".to_string()),
             kinds: Some("normal".to_string()),
             source: LatestQuerySource::Manifest,
             status: LatestStatus::Resolved,
             latest_version: Some("0.1.31".to_string()),
+            project_rust_version: Some("1.70".to_string()),
+            msrv_compatible: Some(true),
             suggestion_kind: Some(LatestSuggestionKind::Bump),
             suggested_requirement: Some("0.1.31".to_string()),
             note: None,
@@ -598,8 +966,10 @@ fn render_latest_lines_suggest_mode_surfaces_plan_and_suggestion() {
 fn sample_record(name: &str, risk: RiskLevel, notes: &[&str]) -> DepAuditRecord {
     DepAuditRecord {
         name: name.to_string(),
+        source: DependencySource::CratesIo,
         requirement: "^1".to_string(),
         kinds: "normal".to_string(),
+        project_rust_version: Some("1.70".to_string()),
         optional: false,
         latest_version: Some("1.0.0".to_string()),
         update_plan: Some(DependencyUpdatePlan::Keep),
@@ -607,6 +977,7 @@ fn sample_record(name: &str, risk: RiskLevel, notes: &[&str]) -> DepAuditRecord 
         update_note: Some("current requirement already accepts latest".to_string()),
         latest_version_license: Some("MIT".to_string()),
         latest_version_rust_version: Some("1.70".to_string()),
+        msrv_compatible: Some(true),
         latest_version_yanked: Some(false),
         crate_updated_at: Some("2026-03-01T00:00:00Z".to_string()),
         latest_release_at: Some("2026-03-01T00:00:00Z".to_string()),
@@ -640,6 +1011,7 @@ fn sample_action_record(
         path: (!rest.is_empty()).then(|| rest.join("/")),
         current_ref: current_ref.to_string(),
         latest_ref: latest_ref.map(ToOwned::to_owned),
+        latest_sha: None,
         update_plan,
         note: Some(note.to_string()),
         locations: vec![ActionLocation {
@@ -660,6 +1032,7 @@ fn sample_workflow_action_spec(action: &str, ref_name: &str) -> WorkflowActionSp
         repo,
         path: (!rest.is_empty()).then(|| rest.join("/")),
         ref_name: ref_name.to_string(),
+        version_hint: None,
         locations: vec![ActionLocation {
             file: ".github/workflows/ci.yaml".to_string(),
             line: 12,
@@ -667,194 +1040,96 @@ fn sample_workflow_action_spec(action: &str, ref_name: &str) -> WorkflowActionSp
     }
 }
 
-fn sample_metadata() -> CargoMetadata {
-    CargoMetadata {
-        packages: vec![
-            CargoPackage {
-                id: "pkg-root".to_string(),
-                name: "sample".to_string(),
-                source: None,
-                dependencies: vec![
-                    CargoDependency {
-                        name: "bytes".to_string(),
-                        source: Some(registry_source()),
-                        req: "^1".to_string(),
-                        kind: None,
-                        optional: false,
-                    },
-                    CargoDependency {
-                        name: "futures-core".to_string(),
-                        source: Some(registry_source()),
-                        req: "^0.3".to_string(),
-                        kind: None,
-                        optional: true,
-                    },
-                    CargoDependency {
-                        name: "hyper".to_string(),
-                        source: Some(registry_source()),
-                        req: "^1".to_string(),
-                        kind: None,
-                        optional: true,
-                    },
-                    CargoDependency {
-                        name: "criterion".to_string(),
-                        source: Some(registry_source()),
-                        req: "^0.5".to_string(),
-                        kind: Some("dev".to_string()),
-                        optional: false,
-                    },
-                ],
-            },
-            CargoPackage {
-                id: "pkg-bytes".to_string(),
-                name: "bytes".to_string(),
-                source: Some(registry_source()),
-                dependencies: Vec::new(),
-            },
-            CargoPackage {
-                id: "pkg-futures-core".to_string(),
-                name: "futures-core".to_string(),
-                source: Some(registry_source()),
-                dependencies: Vec::new(),
-            },
-            CargoPackage {
-                id: "pkg-hyper".to_string(),
-                name: "hyper".to_string(),
-                source: Some(registry_source()),
-                dependencies: Vec::new(),
-            },
-            CargoPackage {
-                id: "pkg-criterion".to_string(),
-                name: "criterion".to_string(),
-                source: Some(registry_source()),
-                dependencies: Vec::new(),
-            },
-        ],
-        workspace_members: vec!["pkg-root".to_string()],
-        root: None,
-        workspace_root: Some("/tmp/work".into()),
-        resolve: Some(CargoResolve {
-            nodes: vec![CargoResolveNode {
-                id: "pkg-root".to_string(),
-                deps: vec![
-                    CargoResolveNodeDep {
-                        pkg: "pkg-bytes".to_string(),
-                        dep_kinds: vec![CargoResolveDepKind { kind: None }],
-                    },
-                    CargoResolveNodeDep {
-                        pkg: "pkg-futures-core".to_string(),
-                        dep_kinds: vec![CargoResolveDepKind { kind: None }],
-                    },
-                    CargoResolveNodeDep {
-                        pkg: "pkg-criterion".to_string(),
-                        dep_kinds: vec![CargoResolveDepKind {
-                            kind: Some("dev".to_string()),
-                        }],
-                    },
-                ],
-            }],
-        }),
+fn action_tag(name: &str, sha: &str) -> GitHubTagSnapshot {
+    GitHubTagSnapshot {
+        name: name.to_string(),
+        sha: sha.to_string(),
     }
 }
 
-fn workspace_metadata() -> CargoMetadata {
-    CargoMetadata {
-        packages: vec![
-            CargoPackage {
-                id: "pkg-app".to_string(),
-                name: "app".to_string(),
-                source: None,
-                dependencies: vec![
-                    CargoDependency {
-                        name: "serde".to_string(),
-                        source: Some(registry_source()),
-                        req: "^1".to_string(),
-                        kind: None,
-                        optional: false,
-                    },
-                    CargoDependency {
-                        name: "workspace-core".to_string(),
-                        source: None,
-                        req: "^0.1".to_string(),
-                        kind: None,
-                        optional: false,
-                    },
-                    CargoDependency {
-                        name: "local-helper".to_string(),
-                        source: None,
-                        req: "^0.1".to_string(),
-                        kind: None,
-                        optional: false,
-                    },
-                ],
-            },
-            CargoPackage {
-                id: "pkg-workspace-core".to_string(),
-                name: "workspace-core".to_string(),
-                source: None,
-                dependencies: vec![CargoDependency {
-                    name: "tokio".to_string(),
-                    source: Some(registry_source()),
-                    req: "^1".to_string(),
-                    kind: None,
-                    optional: false,
-                }],
-            },
-            CargoPackage {
-                id: "pkg-local-helper".to_string(),
-                name: "local-helper".to_string(),
-                source: None,
-                dependencies: Vec::new(),
-            },
-            CargoPackage {
-                id: "pkg-serde".to_string(),
-                name: "serde".to_string(),
-                source: Some(registry_source()),
-                dependencies: Vec::new(),
-            },
-            CargoPackage {
-                id: "pkg-tokio".to_string(),
-                name: "tokio".to_string(),
-                source: Some(registry_source()),
-                dependencies: Vec::new(),
-            },
-        ],
-        workspace_members: vec!["pkg-app".to_string(), "pkg-workspace-core".to_string()],
-        root: Some("pkg-app".to_string()),
-        workspace_root: Some("/tmp/work".into()),
-        resolve: Some(CargoResolve {
-            nodes: vec![
-                CargoResolveNode {
-                    id: "pkg-app".to_string(),
-                    deps: vec![
-                        CargoResolveNodeDep {
-                            pkg: "pkg-serde".to_string(),
-                            dep_kinds: vec![CargoResolveDepKind { kind: None }],
-                        },
-                        CargoResolveNodeDep {
-                            pkg: "pkg-workspace-core".to_string(),
-                            dep_kinds: vec![CargoResolveDepKind { kind: None }],
-                        },
-                        CargoResolveNodeDep {
-                            pkg: "pkg-local-helper".to_string(),
-                            dep_kinds: vec![CargoResolveDepKind { kind: None }],
-                        },
-                    ],
-                },
-                CargoResolveNode {
-                    id: "pkg-workspace-core".to_string(),
-                    deps: vec![CargoResolveNodeDep {
-                        pkg: "pkg-tokio".to_string(),
-                        dep_kinds: vec![CargoResolveDepKind { kind: None }],
-                    }],
+fn sample_metadata() -> WorkspaceManifest {
+    WorkspaceManifest {
+        packages: vec![WorkspacePackage {
+            rust_version: Some("1.70".to_string()),
+            dependencies: vec![
+                workspace_dependency("bytes", DependencySource::CratesIo, "^1", false, true),
+                workspace_dependency(
+                    "futures-core",
+                    DependencySource::CratesIo,
+                    "^0.3",
+                    true,
+                    true,
+                ),
+                workspace_dependency("hyper", DependencySource::CratesIo, "^1", true, false),
+                WorkspaceDependency {
+                    kind: Some("dev".to_string()),
+                    ..workspace_dependency(
+                        "criterion",
+                        DependencySource::CratesIo,
+                        "^0.5",
+                        false,
+                        true,
+                    )
                 },
             ],
-        }),
+        }],
+        workspace_root: "/tmp/work".into(),
     }
 }
 
-fn registry_source() -> String {
-    "registry+https://github.com/rust-lang/crates.io-index".to_string()
+fn workspace_metadata() -> WorkspaceManifest {
+    WorkspaceManifest {
+        packages: vec![
+            WorkspacePackage {
+                rust_version: Some("1.75".to_string()),
+                dependencies: vec![
+                    workspace_dependency("serde", DependencySource::CratesIo, "^1", false, true),
+                    workspace_dependency(
+                        "workspace-core",
+                        DependencySource::Path("crates/workspace-core".to_string()),
+                        "^0.1",
+                        false,
+                        true,
+                    ),
+                    workspace_dependency(
+                        "local-helper",
+                        DependencySource::Path("crates/local-helper".to_string()),
+                        "^0.1",
+                        false,
+                        true,
+                    ),
+                ],
+            },
+            WorkspacePackage {
+                rust_version: Some("1.80".to_string()),
+                dependencies: vec![workspace_dependency(
+                    "tokio",
+                    DependencySource::CratesIo,
+                    "^1",
+                    false,
+                    true,
+                )],
+            },
+        ],
+        workspace_root: "/tmp/work".into(),
+    }
+}
+
+fn workspace_dependency(
+    name: &str,
+    source: DependencySource,
+    requirement: &str,
+    optional: bool,
+    enabled_by_default: bool,
+) -> WorkspaceDependency {
+    WorkspaceDependency {
+        name: name.to_string(),
+        source,
+        req: requirement.to_string(),
+        kind: None,
+        optional,
+        enabled_by_default,
+    }
 }
 
 fn temp_root(label: &str) -> std::path::PathBuf {

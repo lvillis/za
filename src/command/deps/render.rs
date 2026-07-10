@@ -672,6 +672,14 @@ fn action_latest_label(record: &ActionAuditRecord) -> String {
 
 fn summarize_record_note(record: &DepAuditRecord) -> String {
     let mut notes = Vec::<String>::new();
+    match &record.source {
+        DependencySource::CratesIo => {}
+        DependencySource::Git(_) => push_compact_note(&mut notes, "source:git"),
+        DependencySource::Registry(registry) => {
+            push_compact_note(&mut notes, format!("registry:{registry}"));
+        }
+        DependencySource::Path(_) => push_compact_note(&mut notes, "source:path"),
+    }
     if record
         .update_plan
         .is_some_and(DependencyUpdatePlan::needs_attention)
@@ -698,7 +706,7 @@ fn compact_action_note(note: Option<&str>) -> String {
     let Some(note) = note else {
         return tty_style::dim("-");
     };
-    if note == "sha-pinned" {
+    if matches!(note, "sha-pinned" | "sha-pinned and up to date") {
         return "sha-pinned".to_string();
     }
     if note == "current ref is up to date" {
@@ -709,6 +717,9 @@ fn compact_action_note(note: Option<&str>) -> String {
     }
     if note == "floating or non-semver ref; review manually" {
         return "floating-ref".to_string();
+    }
+    if note == "sha pin has no semver tag; review manually" {
+        return "sha-unresolved".to_string();
     }
     if note == "no semver tags found" {
         return "no-tags".to_string();
@@ -727,6 +738,15 @@ fn push_compact_note(notes: &mut Vec<String>, note: impl Into<String>) {
 }
 
 fn compact_update_note(note: &str) -> String {
+    if let Some(rest) = note.strip_prefix("latest requires Rust ") {
+        return format!("msrv:{rest}");
+    }
+    if note == "git dependency revision requires manual review" {
+        return "git-revision".to_string();
+    }
+    if note.starts_with("alternate registry `") {
+        return "registry-review".to_string();
+    }
     match note {
         "latest version format needs manual review" => "bad-latest".to_string(),
         "dependency has no explicit manifest requirement" => "no-req".to_string(),
@@ -759,6 +779,9 @@ fn compact_record_note(note: &str) -> String {
     }
     if note == "insufficient maintenance signals" {
         return "no-signals".to_string();
+    }
+    if note == "alternate registry metadata not queried" {
+        return "registry-unavailable".to_string();
     }
     if note.starts_with("GitHub signals unavailable") {
         return "github-unavailable".to_string();
@@ -917,7 +940,7 @@ pub(super) fn render_latest_lines(
     records: &[LatestRecord],
     suggest: bool,
 ) -> Vec<String> {
-    let verdict = if summary.failed > 0 {
+    let verdict = if summary.failed > 0 || summary.review > 0 {
         tty_style::warning(format!("{:<5}", "WARN"))
     } else {
         tty_style::success(format!("{:<5}", "OK"))
@@ -1112,6 +1135,9 @@ fn render_latest_summary(summary: &LatestSummary) -> String {
     if summary.resolved > 0 {
         parts.push(tty_style::success(format!("{} resolved", summary.resolved)));
     }
+    if summary.review > 0 {
+        parts.push(tty_style::warning(format!("{} review", summary.review)));
+    }
     if summary.failed > 0 {
         parts.push(tty_style::warning(format!("{} failed", summary.failed)));
     }
@@ -1125,6 +1151,7 @@ fn render_latest_summary(summary: &LatestSummary) -> String {
 fn style_latest_status(status: LatestStatus) -> String {
     match status {
         LatestStatus::Resolved => tty_style::success(format!("{:<5}", "OK")),
+        LatestStatus::Review => tty_style::warning(format!("{:<5}", "CHECK")),
         LatestStatus::Failed => tty_style::warning(format!("{:<5}", "WARN")),
     }
 }
@@ -1133,6 +1160,7 @@ fn style_latest_version_cell(value: &str, width: usize, status: LatestStatus) ->
     let padded = format!("{value:<width$}");
     match status {
         LatestStatus::Resolved => tty_style::active(padded),
+        LatestStatus::Review => tty_style::dim(padded),
         LatestStatus::Failed => tty_style::dim(padded),
     }
 }

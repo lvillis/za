@@ -4,8 +4,10 @@ use super::*;
 #[derive(Debug, Clone)]
 pub(crate) struct LatestQuery {
     pub(super) name: String,
+    pub(super) dependency_source: DependencySource,
     pub(super) requirement: Option<String>,
     pub(super) kinds: Option<String>,
+    pub(super) project_rust_version: Option<String>,
     pub(super) source: LatestQuerySource,
 }
 
@@ -20,6 +22,7 @@ pub(crate) enum LatestQuerySource {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LatestStatus {
     Resolved,
+    Review,
     Failed,
 }
 
@@ -35,6 +38,7 @@ pub(crate) enum LatestSuggestionKind {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct LatestRecord {
     pub(super) name: String,
+    pub(super) dependency_source: DependencySource,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) requirement: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,6 +47,10 @@ pub(crate) struct LatestRecord {
     pub(super) status: LatestStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) latest_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) project_rust_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) msrv_compatible: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) suggestion_kind: Option<LatestSuggestionKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -57,6 +65,7 @@ pub(crate) struct LatestRecord {
 pub(crate) struct LatestSummary {
     pub(super) total: usize,
     pub(super) resolved: usize,
+    pub(super) review: usize,
     pub(super) failed: usize,
 }
 
@@ -77,6 +86,7 @@ pub(super) fn run_latest(opts: DepsLatestOptions) -> Result<()> {
         include_dev,
         include_build,
         include_optional,
+        refresh,
         json,
         toml,
         suggest,
@@ -106,7 +116,7 @@ pub(super) fn run_latest(opts: DepsLatestOptions) -> Result<()> {
         );
     }
 
-    let api = Arc::new(ApiClient::new(None)?);
+    let api = Arc::new(ApiClient::new(refresh)?);
     let mut records = resolve_latest_records(Arc::clone(&api), queries, worker_count)?;
     records.sort_by(|a, b| a.name.cmp(&b.name));
     let summary = build_latest_summary(&records);
@@ -171,14 +181,14 @@ pub(super) fn collect_latest_queries(
     include_build: bool,
     include_optional: bool,
 ) -> Result<(Option<PathBuf>, Vec<LatestQuery>)> {
-    let mut queries = BTreeMap::<String, LatestQuery>::new();
+    let mut queries = BTreeMap::<(String, DependencySource), LatestQuery>::new();
     let manifest_path = if manifest_path.is_some() || project_path.is_some() {
         let manifest_path = resolve_manifest_path(manifest_path, project_path)?;
         let metadata = read_manifest_metadata(&manifest_path)?;
         let specs =
             collect_dependency_specs(&metadata, include_dev, include_build, include_optional)?;
         for spec in specs {
-            let key = normalize_dependency_name(&spec.name);
+            let key = (normalize_dependency_name(&spec.name), spec.source.clone());
             queries
                 .entry(key)
                 .and_modify(|query| {
@@ -192,8 +202,10 @@ pub(super) fn collect_latest_queries(
                 })
                 .or_insert_with(|| LatestQuery {
                     name: spec.name,
+                    dependency_source: spec.source,
                     requirement: Some(spec.requirement),
                     kinds: Some(spec.kinds),
+                    project_rust_version: spec.project_rust_version,
                     source: LatestQuerySource::Manifest,
                 });
         }
@@ -207,11 +219,16 @@ pub(super) fn collect_latest_queries(
         if trimmed.is_empty() {
             continue;
         }
-        let key = normalize_dependency_name(trimmed);
+        let key = (
+            normalize_dependency_name(trimmed),
+            DependencySource::CratesIo,
+        );
         queries.entry(key).or_insert_with(|| LatestQuery {
             name: trimmed.to_string(),
+            dependency_source: DependencySource::CratesIo,
             requirement: None,
             kinds: None,
+            project_rust_version: None,
             source: LatestQuerySource::Args,
         });
     }
@@ -234,6 +251,28 @@ pub(super) fn resolve_latest_records(
 }
 
 fn resolve_latest_record(api: &ApiClient, query: LatestQuery) -> LatestRecord {
+    if !matches!(query.dependency_source, DependencySource::CratesIo) {
+        let source_label = query.dependency_source.label().to_string();
+        return LatestRecord {
+            name: query.name,
+            dependency_source: query.dependency_source,
+            requirement: query.requirement,
+            kinds: query.kinds,
+            source: query.source,
+            status: LatestStatus::Review,
+            latest_version: None,
+            project_rust_version: query.project_rust_version,
+            msrv_compatible: None,
+            suggestion_kind: Some(LatestSuggestionKind::Review),
+            suggested_requirement: None,
+            note: Some(format!(
+                "{} dependency requires source-specific resolution",
+                source_label
+            )),
+            suggestion_note: None,
+        };
+    }
+
     match api.fetch_crate(&query.name) {
         Ok(snapshot) => {
             let mut notes = Vec::new();
@@ -243,15 +282,34 @@ fn resolve_latest_record(api: &ApiClient, query: LatestQuery) -> LatestRecord {
             if let Some(rust_version) = snapshot.latest_version_rust_version.as_deref() {
                 notes.push(format!("rust {rust_version}"));
             }
-            let (suggestion_kind, suggested_requirement, suggestion_note) =
+            let msrv_compatible = model::dependency_msrv_compatible(
+                query.project_rust_version.as_deref(),
+                snapshot.latest_version_rust_version.as_deref(),
+            );
+            let (mut suggestion_kind, mut suggested_requirement, mut suggestion_note) =
                 build_latest_suggestion(&query, &snapshot.max_version);
+            if msrv_compatible == Some(false) {
+                suggestion_kind = Some(LatestSuggestionKind::Review);
+                suggested_requirement = None;
+                suggestion_note = Some(format!(
+                    "latest requires Rust {}; project declares {}",
+                    snapshot
+                        .latest_version_rust_version
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    query.project_rust_version.as_deref().unwrap_or("unknown")
+                ));
+            }
             LatestRecord {
                 name: query.name,
+                dependency_source: query.dependency_source,
                 requirement: query.requirement,
                 kinds: query.kinds,
                 source: query.source,
                 status: LatestStatus::Resolved,
                 latest_version: Some(snapshot.max_version),
+                project_rust_version: query.project_rust_version,
+                msrv_compatible,
                 suggestion_kind,
                 suggested_requirement,
                 note: (!notes.is_empty()).then(|| notes.join("; ")),
@@ -260,11 +318,14 @@ fn resolve_latest_record(api: &ApiClient, query: LatestQuery) -> LatestRecord {
         }
         Err(err) => LatestRecord {
             name: query.name,
+            dependency_source: query.dependency_source,
             requirement: query.requirement,
             kinds: query.kinds,
             source: query.source,
             status: LatestStatus::Failed,
             latest_version: None,
+            project_rust_version: query.project_rust_version,
+            msrv_compatible: None,
             suggestion_kind: None,
             suggested_requirement: None,
             note: Some(format!("crates.io query failed: {err}")),
@@ -281,6 +342,7 @@ fn build_latest_summary(records: &[LatestRecord]) -> LatestSummary {
     for record in records {
         match record.status {
             LatestStatus::Resolved => summary.resolved += 1,
+            LatestStatus::Review => summary.review += 1,
             LatestStatus::Failed => summary.failed += 1,
         }
     }
