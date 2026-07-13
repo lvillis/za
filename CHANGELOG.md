@@ -1,3 +1,8 @@
+## [0.1.97] - 2026-07-13
+
+### 🐛 Bug Fixes
+
+- *(tool)* Prevent invalid updates and package validation failures
 ## [0.1.96] - 2026-07-10
 
 ### 🚀 Features
@@ -7,6 +12,10 @@
 ### 🐛 Bug Fixes
 
 - *(cli)* [**breaking**] Harden process and scripting contracts
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.96
 ## [0.1.95] - 2026-07-10
 
 ### 🚀 Features
