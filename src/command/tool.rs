@@ -1259,7 +1259,7 @@ fn validate_package_payload(home: &ToolHome, tool: &ToolRef) -> Result<()> {
             &tool.name,
             &payload_dir,
             relpath,
-            package_relpath_requires_execute(relpath),
+            package_relpath_requires_execute(package, relpath),
         )?;
     }
     Ok(())
@@ -1283,7 +1283,7 @@ fn package_required_relpaths(package: PackagePolicy) -> Vec<&'static str> {
     relpaths
 }
 
-fn package_relpath_requires_execute(relpath: &str) -> bool {
+fn package_relpath_requires_execute(package: PackagePolicy, relpath: &str) -> bool {
     #[cfg(not(unix))]
     {
         let _ = relpath;
@@ -1291,7 +1291,11 @@ fn package_relpath_requires_execute(relpath: &str) -> bool {
     }
     #[cfg(unix)]
     {
-        !relpath.ends_with(".json")
+        if relpath == package.entry_relpath {
+            package.entry_executable
+        } else {
+            !relpath.ends_with(".json")
+        }
     }
 }
 

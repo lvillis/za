@@ -213,6 +213,31 @@ fn run_tool_batch_inner(input: ToolBatchRun<'_>) -> Result<()> {
                 continue;
             }
         };
+        if kind == ToolBatchKind::Update && requested.version.is_none() {
+            let target = resolved_spec.version.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "latest version resolution for `{}` returned no version",
+                    resolved_spec.name
+                )
+            })?;
+            if let Some(current) = read_current_version(home, &resolved_spec.name)?
+                && automatic_update_is_downgrade(&current, target)
+            {
+                let err = anyhow!(
+                    "refusing automatic downgrade for `{}`: {} -> {}",
+                    resolved_spec.name,
+                    current,
+                    target
+                );
+                summary.failed += 1;
+                failed_tools.push(requested.name.clone());
+                print_tool_stage("fail", format!("`{}` {err}", requested.name));
+                if total == 1 {
+                    return Err(err);
+                }
+                continue;
+            }
+        }
 
         let options = match kind {
             ToolBatchKind::Install => InstallOptions::install(za_config::ProxyScope::Tool),
@@ -344,6 +369,12 @@ fn run_tool_batch_inner(input: ToolBatchRun<'_>) -> Result<()> {
         failed_tools.len(),
         failed_tools.join(", ")
     )
+}
+
+pub(super) fn automatic_update_is_downgrade(current: &str, target: &str) -> bool {
+    let current = semver::Version::parse(&normalize_version(current));
+    let target = semver::Version::parse(&normalize_version(target));
+    matches!((current, target), (Ok(current), Ok(target)) if target < current)
 }
 
 pub(super) fn split_supported_managed_tool_names(names: Vec<String>) -> (Vec<String>, Vec<String>) {

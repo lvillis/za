@@ -1,7 +1,7 @@
 use super::integrations::{
     blesh_bash_init_bottom_block, blesh_bash_init_top_block, ide_terminal_bash_helper_block,
 };
-use super::policy::{GithubReleaseVerification, ToolLayout};
+use super::policy::{GithubReleaseTrack, GithubReleaseVerification, ToolLayout};
 use super::{
     BLESH_BASH_INIT_BOTTOM_END_MARKER, BLESH_BASH_INIT_BOTTOM_START_MARKER,
     BLESH_BASH_INIT_TOP_END_MARKER, BLESH_BASH_INIT_TOP_START_MARKER, BatchProgressStatus,
@@ -9,14 +9,15 @@ use super::{
     LatestCheck, LatestResolutionMode, ManagedBlockPosition, ManagedFileChange,
     STARSHIP_BASH_INIT_END_MARKER, STARSHIP_BASH_INIT_START_MARKER, TOOL_UPDATE_CACHE_TTL_SECS,
     ToolBatchKind, ToolBatchSummary, ToolHome, ToolRef, ToolScope, ToolScopeRequest, ToolSpec,
-    ToolUpdateChannel, canonical_tool_name, classify_tool_executable_scope,
-    cleanup_legacy_current_dir_artifacts, collect_managed_tool_names, command_candidates,
-    compact_install_plan, extract_version_from_text, find_tool_policy,
-    latest_check_progress_message, latest_resolution_mode_for_batch, list_update_status,
-    load_sync_specs_from_manifest, normalize_requested_tool_names, normalize_version,
-    prune_non_active_versions, render_batch_progress_header, render_batch_progress_line,
-    render_batch_summary, resolve_update_channel_request, should_parallel_materialize_batch,
-    source, split_supported_managed_tool_names, starship_bash_init_block, supported_tool_names_csv,
+    ToolUpdateChannel, automatic_update_is_downgrade, canonical_tool_name,
+    classify_tool_executable_scope, cleanup_legacy_current_dir_artifacts,
+    collect_managed_tool_names, command_candidates, compact_install_plan,
+    extract_version_from_text, find_tool_policy, latest_check_progress_message,
+    latest_resolution_mode_for_batch, list_update_status, load_sync_specs_from_manifest,
+    normalize_requested_tool_names, normalize_version, prune_non_active_versions,
+    render_batch_progress_header, render_batch_progress_line, render_batch_summary,
+    resolve_update_channel_request, should_parallel_materialize_batch, source,
+    split_supported_managed_tool_names, starship_bash_init_block, supported_tool_names_csv,
     tool_update_cache_entry_is_fresh, unsupported_tool_message, upsert_managed_block,
 };
 use std::{
@@ -766,6 +767,10 @@ fn tool_policy_matches_alias_and_canonical() {
             .verification,
         GithubReleaseVerification::RequiredSha256Digest
     );
+    assert_eq!(
+        cargo_release.github_release.expect("github policy").track,
+        GithubReleaseTrack::VersionedTagsBySemver
+    );
     let nextest = find_tool_policy("cargo-nextest").expect("canonical policy");
     assert_eq!(nextest.canonical_name, "cargo-nextest");
     assert_eq!(nextest.source_label, "GitHub Release (SHA-256 verified)");
@@ -797,6 +802,7 @@ fn tool_policy_matches_alias_and_canonical() {
     let blesh = find_tool_policy("ble.sh").expect("canonical policy");
     assert_eq!(blesh_alias.canonical_name, "ble.sh");
     assert_eq!(blesh.canonical_name, "ble.sh");
+    assert!(!blesh.package.expect("package policy").entry_executable);
     assert_eq!(
         blesh.source_label,
         "GitHub nightly rolling release (commit-tracked; SHA-256 unavailable)"
@@ -806,6 +812,17 @@ fn tool_policy_matches_alias_and_canonical() {
         GithubReleaseVerification::NoSha256Digest
     );
     assert!(find_tool_policy("unknown-tool").is_none());
+}
+
+#[test]
+fn automatic_update_rejects_semver_downgrades_only() {
+    assert!(automatic_update_is_downgrade("1.1.2", "1.1.0"));
+    assert!(!automatic_update_is_downgrade("1.1.2", "1.1.2"));
+    assert!(!automatic_update_is_downgrade("1.1.2", "1.2.0"));
+    assert!(!automatic_update_is_downgrade(
+        "nightly-20260711+d69e4d5",
+        "nightly-20260712+abcdef0"
+    ));
 }
 
 #[test]
@@ -1697,6 +1714,20 @@ fn validate_package_payload_rejects_incomplete_codex_package() {
         format!("{err:#}").contains("bin/codex-code-mode-host"),
         "unexpected error: {err:#}"
     );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn validate_package_payload_accepts_non_executable_blesh_entry() {
+    let (root, home) = temp_tool_home("validate-blesh-source-entry");
+    let tool = ToolRef {
+        name: "ble.sh".to_string(),
+        version: "nightly-20260711+d69e4d5".to_string(),
+    };
+    write_test_file(&home.package_payload_dir(&tool).join("ble.sh"), false);
+
+    super::validate_package_payload(&home, &tool).expect("accept source-only package entry");
 
     let _ = fs::remove_dir_all(&root);
 }

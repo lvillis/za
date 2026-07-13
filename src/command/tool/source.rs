@@ -369,6 +369,14 @@ pub(super) fn fetch_fast_latest_version_from_github_release(
         GithubReleaseTrack::VersionedTags => {
             fetch_latest_stable_version_from_github_latest(tool_policy, release_policy, proxy_scope)
         }
+        GithubReleaseTrack::VersionedTagsBySemver => {
+            fetch_latest_stable_version_from_github_release(
+                tool_policy,
+                release_policy,
+                proxy_scope,
+                true,
+            )
+        }
         GithubReleaseTrack::RollingTagAssets {
             tag,
             asset_prefix,
@@ -404,7 +412,16 @@ fn fetch_exact_latest_version_from_github_release(
             tool_policy,
             release_policy,
             proxy_scope,
+            false,
         ),
+        GithubReleaseTrack::VersionedTagsBySemver => {
+            fetch_latest_stable_version_from_github_release(
+                tool_policy,
+                release_policy,
+                proxy_scope,
+                true,
+            )
+        }
         GithubReleaseTrack::RollingTagAssets {
             tag,
             asset_prefix,
@@ -434,8 +451,10 @@ fn fetch_latest_stable_version_from_github_release(
     tool_policy: ToolPolicy,
     release_policy: GithubReleasePolicy,
     proxy_scope: za_config::ProxyScope,
+    exhaustive: bool,
 ) -> Result<String> {
-    let releases = fetch_versioned_release_candidates(release_policy, None, proxy_scope)?;
+    let releases =
+        fetch_versioned_release_candidates(release_policy, None, proxy_scope, exhaustive)?;
     latest_stable_version_for_tags(&releases, release_policy.tag_prefix).with_context(|| {
         format!(
             "resolve latest stable release for `{}`",
@@ -488,14 +507,18 @@ fn fetch_latest_prerelease_version_from_github_release(
     channel: &str,
     proxy_scope: za_config::ProxyScope,
 ) -> Result<String> {
-    if release_policy.track != GithubReleaseTrack::VersionedTags {
+    if !matches!(
+        release_policy.track,
+        GithubReleaseTrack::VersionedTags | GithubReleaseTrack::VersionedTagsBySemver
+    ) {
         bail!(
             "`{}` does not support semver pre-release channels",
             tool_policy.canonical_name
         );
     }
 
-    let releases = fetch_versioned_release_candidates(release_policy, Some(channel), proxy_scope)?;
+    let releases =
+        fetch_versioned_release_candidates(release_policy, Some(channel), proxy_scope, false)?;
     latest_prerelease_version_for_channel(&releases, release_policy.tag_prefix, channel)
         .with_context(|| {
             format!(
@@ -509,6 +532,7 @@ fn fetch_versioned_release_candidates(
     release_policy: GithubReleasePolicy,
     prerelease_channel: Option<&str>,
     proxy_scope: za_config::ProxyScope,
+    exhaustive: bool,
 ) -> Result<Vec<GithubRelease>> {
     let mut releases = Vec::new();
     for page in 1..=GITHUB_RELEASE_SCAN_MAX_PAGES {
@@ -527,7 +551,7 @@ fn fetch_versioned_release_candidates(
             }
         });
         releases.append(&mut page_releases);
-        if page_has_candidate || is_last_page {
+        if (!exhaustive && page_has_candidate) || is_last_page {
             break;
         }
     }
@@ -682,7 +706,7 @@ fn resolve_github_release_asset(
 ) -> Result<(GithubReleaseAsset, Option<String>)> {
     let version = normalize_version(&tool.version);
     let asset = match release_policy.track {
-        GithubReleaseTrack::VersionedTags => {
+        GithubReleaseTrack::VersionedTags | GithubReleaseTrack::VersionedTagsBySemver => {
             let expected_asset_name = (release_policy.expected_asset_name.ok_or_else(|| {
                 anyhow!(
                     "release policy for `{}` has no expected asset resolver",

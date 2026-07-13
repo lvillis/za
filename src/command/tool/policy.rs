@@ -80,6 +80,7 @@ pub(super) enum ToolLayout {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PackagePolicy {
     pub(super) entry_relpath: &'static str,
+    pub(super) entry_executable: bool,
     pub(super) bin_relpath: Option<&'static str>,
     pub(super) required_relpaths: &'static [&'static str],
     pub(super) required_linux_relpaths: &'static [&'static str],
@@ -90,6 +91,7 @@ pub(super) struct PackagePolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum GithubReleaseTrack {
     VersionedTags,
+    VersionedTagsBySemver,
     RollingTagAssets {
         tag: &'static str,
         asset_prefix: &'static str,
@@ -161,6 +163,7 @@ const TOOL_POLICIES: [ToolPolicy; 23] = [
         layout: ToolLayout::Package,
         package: Some(PackagePolicy {
             entry_relpath: "bin/codex",
+            entry_executable: true,
             bin_relpath: Some("bin/codex"),
             required_relpaths: &[
                 "codex-package.json",
@@ -454,7 +457,7 @@ const TOOL_POLICIES: [ToolPolicy; 23] = [
             tag_prefix: CARGO_RELEASE_GITHUB_TAG_PREFIX,
             expected_asset_name: Some(cargo_release_expected_asset_name),
             verification: GithubReleaseVerification::RequiredSha256Digest,
-            track: GithubReleaseTrack::VersionedTags,
+            track: GithubReleaseTrack::VersionedTagsBySemver,
         }),
     },
     ToolPolicy {
@@ -512,6 +515,7 @@ const TOOL_POLICIES: [ToolPolicy; 23] = [
         layout: ToolLayout::Package,
         package: Some(PackagePolicy {
             entry_relpath: "ble.sh",
+            entry_executable: false,
             bin_relpath: None,
             required_relpaths: &["ble.sh"],
             required_linux_relpaths: &[],
