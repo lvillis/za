@@ -737,6 +737,13 @@ fn tool_policy_matches_alias_and_canonical() {
         protoc.github_release.expect("github policy").verification,
         GithubReleaseVerification::RequiredSha256Digest
     );
+    let yazi = find_tool_policy("yazi").expect("canonical policy");
+    assert_eq!(yazi.canonical_name, "yazi");
+    assert_eq!(yazi.source_label, "GitHub Release (SHA-256 verified)");
+    assert_eq!(
+        yazi.github_release.expect("github policy").verification,
+        GithubReleaseVerification::RequiredSha256Digest
+    );
     let starship = find_tool_policy("starship").expect("canonical policy");
     assert_eq!(starship.canonical_name, "starship");
     assert_eq!(starship.source_label, "GitHub Release (SHA-256 verified)");
@@ -897,6 +904,7 @@ fn canonical_tool_name_resolves_aliases() {
     assert_eq!(canonical_tool_name("sccache"), "sccache");
     assert_eq!(canonical_tool_name("protobuf"), "protoc");
     assert_eq!(canonical_tool_name("protoc"), "protoc");
+    assert_eq!(canonical_tool_name("yazi"), "yazi");
     assert_eq!(canonical_tool_name("starship"), "starship");
     assert_eq!(canonical_tool_name("git-cliff"), "git-cliff");
     assert_eq!(canonical_tool_name("cargo-release"), "cargo-release");
@@ -931,6 +939,7 @@ fn supported_tool_names_csv_contains_all_aliases() {
     assert!(csv.contains("sccache"));
     assert!(csv.contains("protoc"));
     assert!(csv.contains("protobuf"));
+    assert!(csv.contains("yazi"));
     assert!(csv.contains("starship"));
     assert!(csv.contains("git-cliff"));
     assert!(csv.contains("cargo-release"));
@@ -1397,6 +1406,26 @@ fn protoc_policy_expected_asset_name_matches_supported_zip() {
         other => panic!("unsupported local test platform: {other:?}"),
     };
     assert_eq!(asset_name, format!("protoc-35.1-{expected_target}.zip"));
+}
+
+#[test]
+fn yazi_policy_expected_asset_name_matches_supported_zip() {
+    let policy = find_tool_policy("yazi")
+        .expect("policy")
+        .github_release
+        .expect("github policy");
+    let asset_name =
+        (policy.expected_asset_name.expect("asset resolver"))("26.5.6").expect("asset name");
+    let expected_target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+        ("linux", "aarch64") => "aarch64-unknown-linux-musl",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+        ("windows", "aarch64") => "aarch64-pc-windows-msvc",
+        other => panic!("unsupported local test platform: {other:?}"),
+    };
+    assert_eq!(asset_name, format!("yazi-{expected_target}.zip"));
 }
 
 #[test]

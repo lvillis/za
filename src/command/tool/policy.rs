@@ -49,6 +49,9 @@ const SCCACHE_GITHUB_TAG_PREFIX: &str = "v";
 const PROTOBUF_GITHUB_OWNER: &str = "protocolbuffers";
 const PROTOBUF_GITHUB_REPO: &str = "protobuf";
 const PROTOBUF_GITHUB_TAG_PREFIX: &str = "v";
+const YAZI_GITHUB_OWNER: &str = "sxyazi";
+const YAZI_GITHUB_REPO: &str = "yazi";
+const YAZI_GITHUB_TAG_PREFIX: &str = "v";
 const STARSHIP_GITHUB_OWNER: &str = "starship";
 const STARSHIP_GITHUB_REPO: &str = "starship";
 const STARSHIP_GITHUB_TAG_PREFIX: &str = "v";
@@ -139,7 +142,7 @@ impl ToolPolicy {
     }
 }
 
-const TOOL_POLICIES: [ToolPolicy; 23] = [
+const TOOL_POLICIES: [ToolPolicy; 24] = [
     ToolPolicy {
         canonical_name: "za",
         aliases: &[],
@@ -413,6 +416,22 @@ const TOOL_POLICIES: [ToolPolicy; 23] = [
         }),
     },
     ToolPolicy {
+        canonical_name: "yazi",
+        aliases: &[],
+        source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
+        github_release: Some(GithubReleasePolicy {
+            project_label: "yazi",
+            owner: YAZI_GITHUB_OWNER,
+            repo: YAZI_GITHUB_REPO,
+            tag_prefix: YAZI_GITHUB_TAG_PREFIX,
+            expected_asset_name: Some(yazi_expected_asset_name),
+            verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
+        }),
+    },
+    ToolPolicy {
         canonical_name: "starship",
         aliases: &[],
         source_label: "GitHub Release (SHA-256 verified)",
@@ -644,6 +663,10 @@ fn sccache_expected_asset_name(version: &str) -> Result<String> {
 
 fn protoc_expected_asset_name(version: &str) -> Result<String> {
     Ok(format!("protoc-{version}-{}.zip", protoc_target()?))
+}
+
+fn yazi_expected_asset_name(_version: &str) -> Result<String> {
+    Ok(format!("yazi-{}.zip", yazi_target_triple()?))
 }
 
 fn starship_expected_asset_name(_version: &str) -> Result<String> {
@@ -897,6 +920,22 @@ fn protoc_target() -> Result<&'static str> {
         ("windows", "x86") => Ok("win32"),
         _ => bail!(
             "unsupported platform for protobuf protoc release asset: {}-{}",
+            env::consts::ARCH,
+            env::consts::OS
+        ),
+    }
+}
+
+fn yazi_target_triple() -> Result<&'static str> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
+        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
+        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
+        ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
+        _ => bail!(
+            "unsupported platform for yazi release asset: {}-{}",
             env::consts::ARCH,
             env::consts::OS
         ),
