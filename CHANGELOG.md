@@ -1,8 +1,17 @@
+## [0.1.98] - 2026-08-03
+
+### 🚀 Features
+
+- *(tool)* Add yazi release management
 ## [0.1.97] - 2026-07-13
 
 ### 🐛 Bug Fixes
 
 - *(tool)* Prevent invalid updates and package validation failures
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.97
 ## [0.1.96] - 2026-07-10
 
 ### 🚀 Features
