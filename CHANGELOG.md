@@ -1,8 +1,17 @@
+## [0.1.99] - 2026-09-21
+
+### 🚀 Features
+
+- Add agent-browser
 ## [0.1.98] - 2026-08-03
 
 ### 🚀 Features
 
 - *(tool)* Add yazi release management
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.98
 ## [0.1.97] - 2026-07-13
 
 ### 🐛 Bug Fixes
