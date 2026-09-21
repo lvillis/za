@@ -173,8 +173,8 @@ fn doctor_completion(shell: CompletionShell, path_override: Option<PathBuf>) -> 
                 }
                 exit_code
             }
-            Err(ShellcompError::Failure(failure)) => {
-                print_completion_failure(shell, &target_path, legacy, &failure);
+            Err(ShellcompError::Failure { report, .. }) => {
+                print_completion_failure(shell, &target_path, legacy, &report);
                 1
             }
             Err(err) => return Err(err).context("detect completion status"),

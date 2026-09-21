@@ -917,6 +917,7 @@ fn canonical_tool_name_resolves_aliases() {
 #[test]
 fn supported_tool_names_csv_contains_all_aliases() {
     let csv = supported_tool_names_csv();
+    assert!(csv.contains("agent-browser"));
     assert!(csv.contains("za"));
     assert!(csv.contains("codex"));
     assert!(csv.contains("codex-cli"));
@@ -948,6 +949,64 @@ fn supported_tool_names_csv_contains_all_aliases() {
     assert!(csv.contains("cross"));
     assert!(csv.contains("ble.sh"));
     assert!(csv.contains("blesh"));
+}
+
+#[test]
+fn agent_browser_policy_resolves_verified_standalone_binary() {
+    let tool = ToolSpec::parse("agent-browser@v0.38.1").expect("tool spec");
+    assert_eq!(tool.name, "agent-browser");
+    assert_eq!(tool.version.as_deref(), Some("0.38.1"));
+    let policy = find_tool_policy(&tool.name).expect("agent-browser policy");
+    assert_eq!(policy.layout, ToolLayout::Binary);
+    assert!(policy.package.is_none());
+    let release = policy.github_release.expect("github policy");
+    assert_eq!(
+        (release.owner, release.repo, release.tag_prefix),
+        ("vercel-labs", "agent-browser", "v")
+    );
+    assert_eq!(release.track, GithubReleaseTrack::VersionedTags);
+    assert_eq!(
+        release.verification,
+        GithubReleaseVerification::RequiredSha256Digest
+    );
+    let target = super::policy::agent_browser_target(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(target_env = "musl"),
+    );
+    let asset = (release.expected_asset_name.expect("asset resolver"))("0.38.1");
+    match target {
+        Ok(target) => assert_eq!(
+            asset.expect("asset name"),
+            format!("agent-browser-{target}")
+        ),
+        Err(_) => assert!(asset.is_err()),
+    }
+}
+
+#[test]
+fn agent_browser_targets_match_upstream_release_assets() {
+    for (os, arch, musl, expected) in [
+        ("linux", "x86_64", false, "linux-x64"),
+        ("linux", "aarch64", false, "linux-arm64"),
+        ("linux", "x86_64", true, "linux-musl-x64"),
+        ("linux", "aarch64", true, "linux-musl-arm64"),
+        ("macos", "x86_64", false, "darwin-x64"),
+        ("macos", "aarch64", false, "darwin-arm64"),
+        ("windows", "x86_64", false, "win32-x64.exe"),
+    ] {
+        assert_eq!(
+            super::policy::agent_browser_target(os, arch, musl).unwrap(),
+            expected
+        );
+    }
+    for (os, arch) in [
+        ("linux", "arm"),
+        ("windows", "aarch64"),
+        ("freebsd", "x86_64"),
+    ] {
+        assert!(super::policy::agent_browser_target(os, arch, false).is_err());
+    }
 }
 
 #[test]

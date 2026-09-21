@@ -4,6 +4,9 @@ use std::env;
 const CODEX_GITHUB_OWNER: &str = "openai";
 const CODEX_GITHUB_REPO: &str = "codex";
 const CODEX_GITHUB_TAG_PREFIX: &str = "rust-v";
+const AGENT_BROWSER_GITHUB_OWNER: &str = "vercel-labs";
+const AGENT_BROWSER_GITHUB_REPO: &str = "agent-browser";
+const AGENT_BROWSER_GITHUB_TAG_PREFIX: &str = "v";
 const ZA_GITHUB_OWNER: &str = "lvillis";
 const ZA_GITHUB_REPO: &str = "za";
 const ZA_GITHUB_TAG_PREFIX: &str = "";
@@ -142,7 +145,23 @@ impl ToolPolicy {
     }
 }
 
-const TOOL_POLICIES: [ToolPolicy; 24] = [
+const TOOL_POLICIES: [ToolPolicy; 25] = [
+    ToolPolicy {
+        canonical_name: "agent-browser",
+        aliases: &[],
+        source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
+        github_release: Some(GithubReleasePolicy {
+            project_label: "agent-browser",
+            owner: AGENT_BROWSER_GITHUB_OWNER,
+            repo: AGENT_BROWSER_GITHUB_REPO,
+            tag_prefix: AGENT_BROWSER_GITHUB_TAG_PREFIX,
+            expected_asset_name: Some(agent_browser_expected_asset_name),
+            verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
+        }),
+    },
     ToolPolicy {
         canonical_name: "za",
         aliases: &[],
@@ -585,6 +604,28 @@ pub(super) fn canonical_tool_name(name: &str) -> String {
 
 fn codex_expected_asset_name(_version: &str) -> Result<String> {
     Ok(format!("codex-package-{}.tar.gz", codex_target_triple()?))
+}
+
+fn agent_browser_expected_asset_name(_version: &str) -> Result<String> {
+    let target = agent_browser_target(
+        env::consts::OS,
+        env::consts::ARCH,
+        cfg!(target_env = "musl"),
+    )?;
+    Ok(format!("agent-browser-{target}"))
+}
+
+pub(super) fn agent_browser_target(os: &str, arch: &str, musl: bool) -> Result<&'static str> {
+    match (os, arch, musl) {
+        ("linux", "x86_64", false) => Ok("linux-x64"),
+        ("linux", "aarch64", false) => Ok("linux-arm64"),
+        ("linux", "x86_64", true) => Ok("linux-musl-x64"),
+        ("linux", "aarch64", true) => Ok("linux-musl-arm64"),
+        ("macos", "x86_64", _) => Ok("darwin-x64"),
+        ("macos", "aarch64", _) => Ok("darwin-arm64"),
+        ("windows", "x86_64", _) => Ok("win32-x64.exe"),
+        _ => bail!("unsupported platform for agent-browser release asset: {arch}-{os}"),
+    }
 }
 
 fn za_expected_asset_name(version: &str) -> Result<String> {
