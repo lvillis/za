@@ -216,7 +216,7 @@ fn start_managed_session(
     launcher: &str,
     args: &[String],
 ) -> Result<()> {
-    let command = build_codex_launch_command(&ctx.workspace_root, mode, args)?;
+    let command = build_codex_launch_command(mode, args)?;
     tmux_new_session(&ctx.session_name, &ctx.workspace_root, &command)?;
     ensure_codex_session_is_alive(&ctx.session_name, mode)?;
     apply_to_live_codex_session(&ctx.session_name, mode, || {
@@ -535,15 +535,10 @@ fn codex_session_exited_message(mode: CodexLaunchMode) -> String {
     )
 }
 
-fn build_codex_launch_command(
-    workspace_root: &Path,
-    mode: CodexLaunchMode,
-    extra_args: &[String],
-) -> Result<String> {
+fn build_codex_launch_command(mode: CodexLaunchMode, extra_args: &[String]) -> Result<String> {
     let codex = crate::command::run::resolve_executable_path("codex")?;
     let listener = top_listener_state_for_launch(extra_args)?;
     let mut env_vars = crate::command::run::normalized_proxy_env_from_system()?;
-    env_vars.extend(crate::command::ai::codex_env_overrides(workspace_root)?);
     if listener.is_some() {
         ensure_local_listener_no_proxy(&mut env_vars);
     }

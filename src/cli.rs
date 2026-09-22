@@ -17,49 +17,17 @@ pub struct Cli {
 /// Sub-command definitions
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Session-local AI command surface for coding agents
-    Ai {
-        #[command(subcommand)]
-        cmd: AiCommands,
-    },
     /// Print or install shell completions
     Completion {
         #[command(subcommand)]
         cmd: CompletionCommands,
     },
-    /// Review current Git workspace changes
-    Diff {
-        #[command(flatten)]
-        args: DiffArgs,
-        #[command(subcommand)]
-        cmd: Option<DiffCommands>,
-    },
-    /// Generate a project context snapshot
-    Gen {
-        #[arg(long, default_value_t = crate::command::DEFAULT_MAX_LINES_PER_FILE)]
-        max_lines: usize,
-        #[arg(long, default_value = "CONTEXT.md")]
-        output: PathBuf,
-        #[arg(long)]
-        include_binary: bool,
-        /// Optional GitHub repository URL, e.g. https://github.com/owner/repo
-        #[arg(long)]
-        repo: Option<String>,
-        /// Optional ref for remote snapshot (branch/tag/commit). Defaults to `HEAD`.
-        #[arg(long, value_name = "REF")]
-        r#ref: Option<String>,
-    },
-    /// Audit Rust dependency updates, risk, and maintenance signals
+    /// Check project dependency updates; audit or resolve dependencies
     Deps {
         #[command(flatten)]
-        audit: DepsAuditArgs,
+        args: DepsArgs,
         #[command(subcommand)]
         cmd: Option<DepsCommands>,
-    },
-    /// Resolve package and GitHub Action references into copy-pastable pins
-    Pin {
-        #[command(subcommand)]
-        cmd: PinCommands,
     },
     /// Inspect local TCP/UDP port bindings
     Port {
@@ -123,59 +91,6 @@ pub enum Commands {
     Gh {
         #[command(subcommand)]
         cmd: GhCommands,
-    },
-}
-
-#[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
-pub struct DiffArgs {
-    /// Open the continuous review TUI.
-    #[arg(long, conflicts_with_all = ["json", "files", "name_only"])]
-    pub tui: bool,
-    /// Print JSON output for scripting.
-    #[arg(long)]
-    pub json: bool,
-    /// Include per-file additions/deletions in JSON output.
-    #[arg(long)]
-    pub files: bool,
-    /// Only print status/scope/path rows, without numeric diff columns.
-    #[arg(long)]
-    pub name_only: bool,
-    /// Only include staged changes.
-    #[arg(long)]
-    pub staged: bool,
-    /// Only include unstaged changes.
-    #[arg(long)]
-    pub unstaged: bool,
-    /// Only include untracked changes.
-    #[arg(long)]
-    pub untracked: bool,
-    /// Restrict results to paths matching this gitignore-style glob. Repeatable.
-    #[arg(long, value_name = "GLOB")]
-    pub path: Vec<String>,
-    /// Only include files matching these change kinds. Repeatable.
-    #[arg(long, value_enum, value_name = "KIND")]
-    pub kind: Vec<DiffKindFilter>,
-    /// Hide files carrying the selected review risk tag. Repeatable.
-    #[arg(long, value_enum, value_name = "RISK")]
-    pub exclude_risk: Vec<DiffRiskFilter>,
-}
-
-#[derive(Subcommand)]
-pub enum DiffCommands {
-    /// Show committed change volume grouped by day
-    Stats {
-        /// Git revision date range passed to `git log --since`.
-        #[arg(long, default_value = "7d", value_name = "RANGE")]
-        since: String,
-        /// Include the current uncommitted workspace as a separate worktree row.
-        #[arg(long)]
-        include_worktree: bool,
-        /// Print JSON output for scripting.
-        #[arg(long)]
-        json: bool,
-        /// Only include files matching these change kinds. Repeatable.
-        #[arg(long, value_enum, value_name = "KIND")]
-        kind: Vec<DiffKindFilter>,
     },
 }
 
@@ -484,94 +399,35 @@ pub enum CompletionCommands {
     },
 }
 
-#[derive(Subcommand)]
-pub enum AiCommands {
-    /// Print a session-local shell snippet with AI-aware command wrappers
-    Shell {
-        #[arg(value_enum)]
-        shell: AiShell,
-    },
-    /// Print AI session environment exports for the current shell
-    Env,
-    /// Explain the AI session command surface
-    Explain,
-    /// Show token-savings analytics for AI-routed commands
-    Gain {
-        /// Look back this many days.
-        #[arg(long, default_value_t = 7)]
-        days: u64,
-        /// Aggregate across all recorded workspaces.
-        #[arg(long)]
-        all: bool,
-        /// Show day-by-day savings instead of the route summary.
-        #[arg(long, conflicts_with_all = ["history", "graph"])]
-        daily: bool,
-        /// Show recent AI-routed command history.
-        #[arg(long, conflicts_with_all = ["daily", "graph"])]
-        history: bool,
-        /// Show an ASCII savings graph across the selected range.
-        #[arg(long, conflicts_with_all = ["daily", "history"])]
-        graph: bool,
-        /// Print JSON output for scripting.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Inspect whether the current shell is running with AI session markers
-    Doctor {
-        /// Print JSON output for scripting.
-        #[arg(long)]
-        json: bool,
-    },
-    /// AI-friendly summaries for high-signal Git commands
-    Git {
-        #[command(subcommand)]
-        cmd: AiGitCommands,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum AiGitCommands {
-    /// Summarize current Git workspace status for AI review
-    Status {
-        #[command(flatten)]
-        args: AiGitStatusArgs,
-    },
-    /// Summarize current Git diff for AI review
-    Diff {
-        #[command(flatten)]
-        args: AiGitDiffArgs,
-    },
-}
-
 #[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
-pub struct AiGitStatusArgs {
-    /// Print JSON output for scripting.
+pub struct DepsArgs {
+    /// Cargo.toml to inspect; defaults to the current project.
+    #[arg(long, value_name = "PATH", conflicts_with = "path")]
+    pub manifest_path: Option<PathBuf>,
+    /// Project directory or Cargo.toml to inspect.
+    #[arg(long, value_name = "PATH")]
+    pub path: Option<PathBuf>,
+    /// Number of concurrent API workers.
+    #[arg(long, value_name = "JOBS")]
+    pub jobs: Option<usize>,
+    /// Include dev-dependencies.
     #[arg(long)]
+    pub include_dev: bool,
+    /// Include build-dependencies.
+    #[arg(long)]
+    pub include_build: bool,
+    /// Include disabled optional dependencies.
+    #[arg(long)]
+    pub include_optional: bool,
+    /// Refresh cached dependency metadata.
+    #[arg(long)]
+    pub refresh: bool,
+    /// Print structured results to stdout.
+    #[arg(long, conflicts_with = "emit")]
     pub json: bool,
-    /// Include per-file additions/deletions in JSON output.
-    #[arg(long)]
-    pub files: bool,
-    /// Only print status/scope/path rows, without numeric diff columns.
-    #[arg(long)]
-    pub name_only: bool,
-    /// Restrict results to paths matching this gitignore-style glob. Repeatable.
-    #[arg(long, value_name = "GLOB")]
-    pub path: Vec<String>,
-    /// Only include files matching these change kinds. Repeatable.
-    #[arg(long, value_enum, value_name = "KIND")]
-    pub kind: Vec<DiffKindFilter>,
-    /// Hide files carrying the selected review risk tag. Repeatable.
-    #[arg(long, value_enum, value_name = "RISK")]
-    pub exclude_risk: Vec<DiffRiskFilter>,
-}
-
-#[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
-pub struct AiGitDiffArgs {
-    #[command(flatten)]
-    pub common: AiGitStatusArgs,
-    /// Show staged changes only.
-    #[arg(long, alias = "cached")]
-    pub staged: bool,
+    /// Emit TOML dependency entries instead of an update overview.
+    #[arg(long, value_enum)]
+    pub emit: Option<CrateEmit>,
 }
 
 #[derive(Args, Clone, Debug, Default, Eq, PartialEq)]
@@ -610,46 +466,20 @@ pub struct DepsAuditArgs {
 
 #[derive(Subcommand)]
 pub enum DepsCommands {
-    /// Resolve latest stable versions for one or more crates
-    Latest {
-        /// Crate names to resolve. Omit only when `--manifest-path` or `--path` is used.
-        #[arg(value_name = "CRATE")]
-        crates: Vec<String>,
-        /// Optional path to Cargo.toml used to source crate names.
-        #[arg(long, alias = "manifest", value_name = "PATH", conflicts_with = "path")]
-        manifest_path: Option<PathBuf>,
-        /// Optional project directory or Cargo.toml path used to source crate names.
-        #[arg(long, value_name = "PATH")]
-        path: Option<PathBuf>,
-        /// Number of concurrent workers for API queries (default: auto, based on CPU count).
-        #[arg(long, value_name = "JOBS")]
-        jobs: Option<usize>,
-        /// Include dev-dependencies when reading crates from a manifest.
-        #[arg(long)]
-        include_dev: bool,
-        /// Include build-dependencies when reading crates from a manifest.
-        #[arg(long)]
-        include_build: bool,
-        /// Also include optional dependencies that are not enabled by default features.
-        #[arg(long)]
-        include_optional: bool,
-        /// Ignore cached metadata and refresh remote dependency data.
-        #[arg(long)]
-        refresh: bool,
-        /// Print JSON output for scripting.
-        #[arg(long, conflicts_with = "toml")]
-        json: bool,
-        /// Print copy-pastable TOML dependency entries.
-        #[arg(long, conflicts_with = "json")]
-        toml: bool,
-        /// Add upgrade guidance based on current manifest requirements.
-        #[arg(long, conflicts_with = "toml")]
-        suggest: bool,
+    /// Resolve one dependency reference without modifying project files
+    Resolve {
+        #[command(subcommand)]
+        cmd: DepsResolveCommands,
+    },
+    /// Audit dependency risk, maintenance signals, and workflow Actions
+    Audit {
+        #[command(flatten)]
+        args: DepsAuditArgs,
     },
 }
 
 #[derive(Subcommand)]
-pub enum PinCommands {
+pub enum DepsResolveCommands {
     /// Resolve an npm package dist-tag or version
     Npm {
         /// Package name, optionally with an inline tag/version, e.g. react@latest.
@@ -659,8 +489,11 @@ pub enum PinCommands {
         #[arg(long, value_name = "TAG")]
         tag: Option<String>,
         /// Print JSON output for scripting.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "emit")]
         json: bool,
+        /// Emit only an exact dependency configuration entry.
+        #[arg(long, value_enum)]
+        emit: Option<NpmEmit>,
     },
     /// Resolve a crates.io crate version
     Crate {
@@ -668,8 +501,11 @@ pub enum PinCommands {
         #[arg(value_name = "CRATE")]
         name: String,
         /// Print JSON output for scripting.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "emit")]
         json: bool,
+        /// Emit only an exact dependency configuration entry.
+        #[arg(long, value_enum)]
+        emit: Option<CrateEmit>,
     },
     /// Resolve a GitHub Action ref to a commit SHA
     Action {
@@ -677,9 +513,25 @@ pub enum PinCommands {
         #[arg(value_name = "OWNER/REPO[/PATH]@REF")]
         spec: String,
         /// Print JSON output for scripting.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "emit")]
         json: bool,
+        /// Emit a SHA-pinned uses entry with the original ref as a comment.
+        #[arg(long, value_enum)]
+        emit: Option<ActionEmit>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum NpmEmit {
+    PackageJson,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum CrateEmit {
+    Toml,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ActionEmit {
+    Yaml,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -696,12 +548,6 @@ pub enum CompletionShell {
     Fish,
     Elvish,
     Powershell,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum AiShell {
-    Bash,
-    Zsh,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -1075,34 +921,12 @@ pub enum ConfigKey {
     IdeOrphanTtlMinutes,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
-pub enum DiffRiskFilter {
-    Binary,
-    Ci,
-    Config,
-    Generated,
-    Large,
-    Lockfile,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
-pub enum DiffKindFilter {
-    Code,
-    Test,
-    Docs,
-    Config,
-    Generated,
-    Binary,
-    Other,
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        AiCommands, AiGitCommands, AiShell, CiCommands, Cli, CodexCommands, ColorWhen, Commands,
-        CompletionCommands, CompletionShell, DepsCommands, DiffArgs, DiffCommands, DiffKindFilter,
-        DiffRiskFilter, GhCommands, GitAuthCommands, IdeAgentCommands, IdeCommands, PinCommands,
-        PortCommands, PortSignal, ToolCommands,
+        CiCommands, Cli, CodexCommands, ColorWhen, Commands, CompletionCommands, CompletionShell,
+        DepsCommands, DepsResolveCommands, GhCommands, GitAuthCommands, IdeAgentCommands,
+        IdeCommands, PortCommands, PortSignal, ToolCommands,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -1117,79 +941,8 @@ mod tests {
     }
 
     #[test]
-    fn ai_shell_parses_shell_enum() {
-        let cli = Cli::try_parse_from(["za", "ai", "shell", "bash"]).expect("must parse");
-        match cli.cmd {
-            Commands::Ai {
-                cmd: AiCommands::Shell {
-                    shell: AiShell::Bash,
-                },
-            } => {}
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn ai_doctor_parses_json_flag() {
-        let cli = Cli::try_parse_from(["za", "ai", "doctor", "--json"]).expect("must parse");
-        match cli.cmd {
-            Commands::Ai {
-                cmd: AiCommands::Doctor { json: true },
-            } => {}
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn ai_gain_parses_days_and_json() {
-        let cli = Cli::try_parse_from(["za", "ai", "gain", "--days", "14", "--all", "--json"])
-            .expect("must parse");
-        match cli.cmd {
-            Commands::Ai {
-                cmd:
-                    AiCommands::Gain {
-                        days,
-                        all,
-                        json,
-                        daily: false,
-                        history: false,
-                        graph: false,
-                    },
-            } => {
-                assert_eq!(days, 14);
-                assert!(all);
-                assert!(json);
-            }
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn ai_git_status_parses() {
-        let cli = Cli::try_parse_from(["za", "ai", "git", "status", "--json"]).expect("must parse");
-        match cli.cmd {
-            Commands::Ai {
-                cmd:
-                    AiCommands::Git {
-                        cmd: AiGitCommands::Status { args },
-                    },
-            } => assert!(args.json),
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn ai_git_diff_parses_cached_alias() {
-        let cli = Cli::try_parse_from(["za", "ai", "git", "diff", "--cached"]).expect("must parse");
-        match cli.cmd {
-            Commands::Ai {
-                cmd:
-                    AiCommands::Git {
-                        cmd: AiGitCommands::Diff { args },
-                    },
-            } => assert!(args.staged),
-            _ => panic!("unexpected command"),
-        }
+    fn removed_ai_command_is_rejected() {
+        assert!(Cli::try_parse_from(["za", "ai", "git", "status"]).is_err());
     }
 
     #[test]
@@ -1572,174 +1325,138 @@ mod tests {
     }
 
     #[test]
-    fn deps_parses_verbose_flag() {
-        let cli = Cli::try_parse_from(["za", "deps", "--verbose"]).expect("must parse");
-        match cli.cmd {
-            Commands::Deps { audit, cmd } => {
-                assert!(cmd.is_none());
-                assert!(audit.manifest_path.is_none());
-                assert!(audit.path.is_none());
-                assert!(audit.jobs.is_none());
-                assert!(!audit.include_dev);
-                assert!(!audit.include_build);
-                assert!(!audit.include_optional);
-                assert!(!audit.refresh);
-                assert!(audit.json.is_none());
-                assert!(!audit.fail_on_high);
-                assert!(audit.verbose);
-            }
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn deps_parses_project_path() {
-        let cli = Cli::try_parse_from(["za", "deps", "--path", "/workspace/project"])
-            .expect("must parse");
-        match cli.cmd {
-            Commands::Deps { audit, cmd } => {
-                assert!(cmd.is_none());
-                assert_eq!(audit.path, Some(PathBuf::from("/workspace/project")));
-                assert!(audit.manifest_path.is_none());
-            }
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn deps_refresh_is_explicit_and_token_cli_is_rejected() {
-        let cli = Cli::try_parse_from(["za", "deps", "--refresh"]).expect("must parse");
-        match cli.cmd {
-            Commands::Deps { audit, cmd } => {
-                assert!(cmd.is_none());
-                assert!(audit.refresh);
-            }
-            _ => panic!("unexpected command"),
-        }
-        assert!(Cli::try_parse_from(["za", "deps", "--github-token", "secret"]).is_err());
-    }
-
-    #[test]
-    fn deps_latest_parses_manifest_and_toml_flags() {
-        let cli = Cli::try_parse_from([
-            "za",
-            "deps",
-            "latest",
-            "serde",
-            "--manifest",
-            "Cargo.toml",
-            "--toml",
-        ])
-        .expect("must parse");
-        match cli.cmd {
-            Commands::Deps { cmd, .. } => match cmd {
-                Some(DepsCommands::Latest {
-                    crates,
-                    manifest_path,
-                    path,
-                    jobs,
-                    include_dev,
-                    include_build,
-                    include_optional,
-                    refresh,
-                    json,
-                    toml,
-                    suggest,
-                }) => {
-                    assert_eq!(crates, vec!["serde"]);
-                    assert_eq!(manifest_path, Some(PathBuf::from("Cargo.toml")));
-                    assert!(path.is_none());
-                    assert!(jobs.is_none());
-                    assert!(!include_dev);
-                    assert!(!include_build);
-                    assert!(!include_optional);
-                    assert!(!refresh);
-                    assert!(!json);
-                    assert!(toml);
-                    assert!(!suggest);
-                }
-                _ => panic!("unexpected deps command"),
-            },
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn deps_latest_parses_suggest_flag() {
-        let cli =
-            Cli::try_parse_from(["za", "deps", "latest", "reqx", "--suggest"]).expect("must parse");
-        match cli.cmd {
-            Commands::Deps { cmd, .. } => match cmd {
-                Some(DepsCommands::Latest {
-                    crates,
-                    json,
-                    toml,
-                    suggest,
-                    ..
-                }) => {
-                    assert_eq!(crates, vec!["reqx"]);
-                    assert!(!json);
-                    assert!(!toml);
-                    assert!(suggest);
-                }
-                _ => panic!("unexpected deps command"),
-            },
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn deps_latest_rejects_conflicting_output_modes() {
-        assert!(Cli::try_parse_from(["za", "deps", "latest", "reqx", "--json", "--toml"]).is_err());
+    fn deps_audit_parses_verbose_flag() {
+        let cli = Cli::try_parse_from(["za", "deps", "audit", "--verbose"]).unwrap();
         assert!(
-            Cli::try_parse_from(["za", "deps", "latest", "reqx", "--toml", "--suggest"]).is_err()
+            matches!(cli.cmd, Commands::Deps { cmd: Some(DepsCommands::Audit { args }), .. } if args.verbose)
         );
     }
 
     #[test]
-    fn deps_latest_parses_project_path() {
-        let cli = Cli::try_parse_from(["za", "deps", "latest", "--path", "/workspace/project"])
-            .expect("must parse");
-        match cli.cmd {
-            Commands::Deps { cmd, .. } => match cmd {
-                Some(DepsCommands::Latest {
-                    crates,
-                    manifest_path,
-                    path,
-                    ..
-                }) => {
-                    assert!(crates.is_empty());
-                    assert!(manifest_path.is_none());
-                    assert_eq!(path, Some(PathBuf::from("/workspace/project")));
-                }
-                _ => panic!("unexpected deps command"),
-            },
-            _ => panic!("unexpected command"),
+    fn deps_refresh_is_explicit_and_token_cli_is_rejected() {
+        let cli = Cli::try_parse_from(["za", "deps", "--refresh"]).unwrap();
+        assert!(matches!(cli.cmd, Commands::Deps { args, cmd: None } if args.refresh));
+        assert!(Cli::try_parse_from(["za", "deps", "--github-token", "secret"]).is_err());
+    }
+
+    #[test]
+    fn deps_defaults_to_project_update_overview() {
+        let cli = Cli::try_parse_from(["za", "deps"]).unwrap();
+        assert!(
+            matches!(cli.cmd, Commands::Deps { args, cmd: None } if args == super::DepsArgs::default())
+        );
+    }
+
+    #[test]
+    fn deps_parses_project_and_output_options() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "deps",
+            "--path",
+            "/workspace/project",
+            "--refresh",
+            "--json",
+            "--include-dev",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.cmd, Commands::Deps { args, cmd: None } if args.path == Some(PathBuf::from("/workspace/project")) && args.refresh && args.json && args.include_dev)
+        );
+        assert!(Cli::try_parse_from(["za", "deps", "--emit", "toml"]).is_ok());
+        assert!(Cli::try_parse_from(["za", "deps", "--json", "--emit", "toml"]).is_err());
+        assert!(
+            Cli::try_parse_from(["za", "deps", "--path", ".", "--manifest-path", "Cargo.toml"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn deps_audit_is_explicit() {
+        let cli = Cli::try_parse_from(["za", "deps", "audit", "--fail-on-high"]).unwrap();
+        assert!(
+            matches!(cli.cmd, Commands::Deps { cmd: Some(DepsCommands::Audit { args }), .. } if args.fail_on_high)
+        );
+        assert!(Cli::try_parse_from(["za", "deps", "--fail-on-high"]).is_err());
+    }
+
+    #[test]
+    fn deps_latest_and_positional_crates_are_removed() {
+        for name in ["latest", "serde"] {
+            assert!(Cli::try_parse_from(["za", "deps", name]).is_err());
         }
     }
 
     #[test]
     fn deps_allows_global_color_before_subcommand() {
-        let cli =
-            Cli::try_parse_from(["za", "deps", "--color", "never", "latest"]).expect("must parse");
+        let cli = Cli::try_parse_from(["za", "deps", "--color", "never", "audit"]).unwrap();
         assert_eq!(cli.color, ColorWhen::Never);
         assert!(matches!(
             cli.cmd,
             Commands::Deps {
-                cmd: Some(DepsCommands::Latest { .. }),
+                cmd: Some(DepsCommands::Audit { .. }),
                 ..
             }
         ));
     }
 
     #[test]
-    fn pin_npm_parses_tag_and_json() {
-        let cli =
-            Cli::try_parse_from(["za", "pin", "npm", "@scope/pkg", "--tag", "next", "--json"])
-                .expect("must parse");
+    fn deps_resolve_accepts_only_provider_specific_formats() {
+        for (provider, query, format) in [
+            ("crate", "serde", "toml"),
+            ("npm", "@scope/pkg@next", "package-json"),
+            ("action", "actions/checkout@v4", "yaml"),
+        ] {
+            assert!(
+                Cli::try_parse_from(["za", "deps", "resolve", provider, query, "--emit", format])
+                    .is_ok()
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "za", "deps", "resolve", provider, query, "--emit", format, "--json"
+                ])
+                .is_err()
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "za", "deps", "resolve", provider, query, "--emit", "invalid"
+                ])
+                .is_err()
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["za", "deps", "resolve", "crate", "serde", "--emit", "yaml"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn removed_pin_command_is_rejected() {
+        assert!(Cli::try_parse_from(["za", "pin", "crate", "serde"]).is_err());
+    }
+
+    #[test]
+    fn deps_resolve_npm_parses_tag_and_json() {
+        let cli = Cli::try_parse_from([
+            "za",
+            "deps",
+            "resolve",
+            "npm",
+            "@scope/pkg",
+            "--tag",
+            "next",
+            "--json",
+        ])
+        .expect("must parse");
         match cli.cmd {
-            Commands::Pin {
-                cmd: PinCommands::Npm { package, tag, json },
+            Commands::Deps {
+                cmd:
+                    Some(DepsCommands::Resolve {
+                        cmd:
+                            DepsResolveCommands::Npm {
+                                package, tag, json, ..
+                            },
+                    }),
+                ..
             } => {
                 assert_eq!(package, "@scope/pkg");
                 assert_eq!(tag.as_deref(), Some("next"));
@@ -1750,10 +1467,11 @@ mod tests {
     }
 
     #[test]
-    fn pin_action_rejects_plaintext_token_argument() {
+    fn deps_resolve_action_rejects_plaintext_token_argument() {
         let result = Cli::try_parse_from([
             "za",
-            "pin",
+            "deps",
+            "resolve",
             "action",
             "actions/checkout@v4",
             "--github-token",
@@ -1993,147 +1711,12 @@ mod tests {
     }
 
     #[test]
-    fn diff_parses_review_filters() {
-        let cli = Cli::try_parse_from([
-            "za",
-            "diff",
-            "--tui",
-            "--staged",
-            "--kind",
-            "code",
-            "--path",
-            "src/**",
-            "--exclude-risk",
-            "generated",
-        ])
-        .expect("must parse");
-        match cli.cmd {
-            Commands::Diff { args, cmd: None } => {
-                assert!(args.tui);
-                assert!(!args.json);
-                assert!(!args.files);
-                assert!(!args.name_only);
-                assert!(args.staged);
-                assert!(!args.unstaged);
-                assert!(!args.untracked);
-                assert_eq!(args.kind, vec![DiffKindFilter::Code]);
-                assert_eq!(args.path, vec!["src/**"]);
-                assert_eq!(args.exclude_risk, vec![DiffRiskFilter::Generated]);
-            }
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn diff_rejects_tui_with_json() {
-        assert!(Cli::try_parse_from(["za", "diff", "--tui", "--json"]).is_err());
-    }
-
-    #[test]
-    fn diff_parses_json_review_filters() {
-        let cli = Cli::try_parse_from([
-            "za",
-            "diff",
-            "--json",
-            "--files",
-            "--name-only",
-            "--staged",
-            "--kind",
-            "docs",
-            "--path",
-            "src/**",
-            "--exclude-risk",
-            "generated",
-        ])
-        .expect("must parse");
-        match cli.cmd {
-            Commands::Diff { args, cmd: None } => {
-                assert!(!args.tui);
-                assert!(args.json);
-                assert!(args.files);
-                assert!(args.name_only);
-                assert!(args.staged);
-                assert!(!args.unstaged);
-                assert!(!args.untracked);
-                assert_eq!(args.kind, vec![DiffKindFilter::Docs]);
-                assert_eq!(args.path, vec!["src/**"]);
-                assert_eq!(args.exclude_risk, vec![DiffRiskFilter::Generated]);
-            }
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn diff_parses_multiple_kind_filters() {
-        let cli = Cli::try_parse_from([
-            "za",
-            "diff",
-            "--kind",
-            "code",
-            "--kind",
-            "docs",
-            "--unstaged",
-        ])
-        .expect("must parse");
-        match cli.cmd {
-            Commands::Diff { args, cmd: None } => {
-                assert!(!args.staged);
-                assert!(args.unstaged);
-                assert!(!args.untracked);
-                assert_eq!(args.kind, vec![DiffKindFilter::Code, DiffKindFilter::Docs]);
-            }
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn diff_stats_parses_range_worktree_json_and_kind() {
-        let cli = Cli::try_parse_from([
-            "za",
-            "diff",
-            "stats",
-            "--since",
-            "30d",
-            "--include-worktree",
-            "--json",
-            "--kind",
-            "code",
-        ])
-        .expect("must parse");
-        match cli.cmd {
-            Commands::Diff {
-                cmd:
-                    Some(DiffCommands::Stats {
-                        since,
-                        include_worktree: true,
-                        json: true,
-                        kind,
-                    }),
-                ..
-            } => {
-                assert_eq!(since, "30d");
-                assert_eq!(kind, vec![DiffKindFilter::Code]);
-            }
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn diff_stats_keeps_stats_flags_after_subcommand() {
-        let cli = Cli::try_parse_from(["za", "diff", "stats", "--json"]).expect("must parse");
-        match cli.cmd {
-            Commands::Diff {
-                args,
-                cmd:
-                    Some(DiffCommands::Stats {
-                        json: true,
-                        include_worktree: false,
-                        ..
-                    }),
-            } => {
-                assert_eq!(args, DiffArgs::default());
-            }
-            _ => panic!("unexpected command"),
+    fn removed_gen_and_diff_commands_are_rejected() {
+        for command in ["gen", "diff"] {
+            let error = Cli::try_parse_from(["za", command])
+                .err()
+                .expect("removed command");
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
         }
     }
 

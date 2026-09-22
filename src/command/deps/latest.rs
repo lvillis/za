@@ -15,7 +15,6 @@ pub(crate) struct LatestQuery {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LatestQuerySource {
-    Args,
     Manifest,
 }
 
@@ -80,7 +79,6 @@ pub(super) struct LatestReport {
 
 pub(super) fn run_latest(opts: DepsLatestOptions) -> Result<()> {
     let DepsLatestOptions {
-        crates,
         manifest_path,
         project_path,
         jobs,
@@ -94,7 +92,6 @@ pub(super) fn run_latest(opts: DepsLatestOptions) -> Result<()> {
     } = opts;
 
     let (manifest_path, queries) = collect_latest_queries(
-        crates,
         manifest_path,
         project_path,
         include_dev,
@@ -108,15 +105,6 @@ pub(super) fn run_latest(opts: DepsLatestOptions) -> Result<()> {
 
     let requested_jobs = jobs.unwrap_or_else(default_deps_jobs);
     let worker_count = normalize_jobs(requested_jobs, queries.len());
-    if !json && !toml {
-        println!(
-            "Resolving latest stable versions{} for {} crate(s) with {} workers...",
-            if suggest { " and upgrade guidance" } else { "" },
-            queries.len(),
-            worker_count
-        );
-    }
-
     let api = Arc::new(ApiClient::new(refresh)?);
     let mut records = resolve_latest_records(Arc::clone(&api), queries, worker_count)?;
     records.sort_by(|a, b| a.name.cmp(&b.name));
@@ -133,6 +121,9 @@ pub(super) fn run_latest(opts: DepsLatestOptions) -> Result<()> {
     }
 
     api.flush_cache().context("flush dependency latest cache")?;
+    if summary.failed > 0 {
+        bail!("failed to resolve {} dependencies", summary.failed);
+    }
     Ok(())
 }
 
@@ -142,7 +133,7 @@ pub(super) fn render_empty_latest(
     toml: bool,
 ) -> Result<()> {
     let Some(manifest_path) = manifest_path else {
-        bail!("provide crate names or `--manifest-path <Cargo.toml>` or `--path <DIR>`");
+        bail!("no project manifest; use `--manifest-path <Cargo.toml>` or `--path <DIR>`");
     };
 
     if json {
@@ -174,7 +165,6 @@ fn print_latest_json(
 }
 
 pub(super) fn collect_latest_queries(
-    crates: Vec<String>,
     manifest_path: Option<PathBuf>,
     project_path: Option<PathBuf>,
     include_dev: bool,
@@ -182,7 +172,7 @@ pub(super) fn collect_latest_queries(
     include_optional: bool,
 ) -> Result<(Option<PathBuf>, Vec<LatestQuery>)> {
     let mut queries = BTreeMap::<(String, DependencySource), LatestQuery>::new();
-    let manifest_path = if manifest_path.is_some() || project_path.is_some() {
+    let manifest_path = {
         let manifest_path = resolve_manifest_path(manifest_path, project_path)?;
         let metadata = read_manifest_metadata(&manifest_path)?;
         let specs =
@@ -210,28 +200,7 @@ pub(super) fn collect_latest_queries(
                 });
         }
         Some(manifest_path)
-    } else {
-        None
     };
-
-    for krate in crates {
-        let trimmed = krate.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let key = (
-            normalize_dependency_name(trimmed),
-            DependencySource::CratesIo,
-        );
-        queries.entry(key).or_insert_with(|| LatestQuery {
-            name: trimmed.to_string(),
-            dependency_source: DependencySource::CratesIo,
-            requirement: None,
-            kinds: None,
-            project_rust_version: None,
-            source: LatestQuerySource::Args,
-        });
-    }
 
     Ok((manifest_path, queries.into_values().collect()))
 }
@@ -353,14 +322,6 @@ fn build_latest_suggestion(
     query: &LatestQuery,
     latest_version: &str,
 ) -> (Option<LatestSuggestionKind>, Option<String>, Option<String>) {
-    if matches!(query.source, LatestQuerySource::Args) {
-        return (
-            Some(LatestSuggestionKind::Add),
-            Some(latest_version.to_string()),
-            Some("explicit query; add this version if needed".to_string()),
-        );
-    }
-
     let raw_requirement = query.requirement.as_deref().unwrap_or("-").trim();
     let (plan, suggested_requirement, note) =
         model::build_manifest_update_plan(raw_requirement, latest_version);

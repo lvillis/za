@@ -200,9 +200,6 @@ impl AppServerClient {
         for (key, value) in crate::command::run::normalized_proxy_env_from_system()? {
             command.env(key, value);
         }
-        for (key, value) in crate::command::ai::codex_env_overrides(workspace_root)? {
-            command.env(key, value);
-        }
 
         let mut child = command
             .spawn()

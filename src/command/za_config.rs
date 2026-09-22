@@ -321,7 +321,6 @@ pub struct IdeJetbrainsPolicy {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProxyScope {
-    General,
     Run,
     Tool,
     Update,
@@ -362,7 +361,6 @@ pub fn load_proxy_overrides(scope: ProxyScope) -> Result<ProxyOverrides> {
     let cfg = read_config(&path)?;
     let global = normalize_proxy_config(&cfg.proxy);
     let scoped = match scope {
-        ProxyScope::General => ProxyOverrides::default(),
         ProxyScope::Run => normalize_proxy_config(&cfg.run),
         ProxyScope::Tool => normalize_proxy_config(&cfg.tool),
         ProxyScope::Update => normalize_proxy_config(&cfg.update),

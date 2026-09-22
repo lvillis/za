@@ -14,98 +14,29 @@ fn main() -> Result<()> {
         cli::ColorWhen::Never => command::style::ColorMode::Never,
     });
     match args.cmd {
-        cli::Commands::Ai { cmd } => exit_with(command::ai::run(cmd)?),
         cli::Commands::Completion { cmd } => exit_with(command::completion::run(cmd)?),
-        cli::Commands::Diff { args, cmd } => {
-            let exit_code = match cmd {
-                Some(cli::DiffCommands::Stats {
-                    since,
-                    include_worktree,
-                    json,
-                    kind,
-                }) => {
-                    if args != cli::DiffArgs::default() {
-                        return Err(anyhow!(
-                            "`za diff stats` does not accept workspace diff flags before the subcommand; pass stats flags after `stats`"
-                        ));
-                    }
-                    command::diff::run_stats(command::diff::DiffStatsRunOptions {
-                        since,
-                        include_worktree,
-                        json,
-                        kinds: kind
-                            .into_iter()
-                            .map(command::diff::DiffFileKind::from)
-                            .collect(),
-                    })?
-                }
-                None => command::diff::run(command::diff::DiffRunOptions {
-                    tui: args.tui,
-                    json: args.json,
-                    files: args.files,
-                    name_only: args.name_only,
-                    path_patterns: args.path,
-                    scopes: [
-                        (args.staged, command::diff::DiffScope::Staged),
-                        (args.unstaged, command::diff::DiffScope::Unstaged),
-                        (args.untracked, command::diff::DiffScope::Untracked),
-                    ]
-                    .into_iter()
-                    .filter_map(|(enabled, scope)| enabled.then_some(scope))
-                    .collect(),
-                    kinds: args
-                        .kind
-                        .into_iter()
-                        .map(command::diff::DiffFileKind::from)
-                        .collect(),
-                    exclude_risks: args
-                        .exclude_risk
-                        .into_iter()
-                        .map(command::diff::DiffRiskKind::from)
-                        .collect(),
-                })?,
-            };
-            exit_with(exit_code)
-        }
-        cli::Commands::Gen {
-            max_lines,
-            output,
-            include_binary,
-            repo,
-            r#ref,
-        } => command::r#gen::run(max_lines, output, include_binary, repo, r#ref),
-        cli::Commands::Deps { audit, cmd } => match cmd {
-            None => run_deps_audit(audit),
-            Some(cli::DepsCommands::Latest {
-                crates,
-                manifest_path,
-                path,
-                jobs,
-                include_dev,
-                include_build,
-                include_optional,
-                refresh,
-                json,
-                toml,
-                suggest,
-            }) => {
-                reject_parent_deps_audit_args(&audit)?;
-                command::deps::run_latest(command::deps::DepsLatestOptions {
-                    crates,
-                    manifest_path,
-                    project_path: path,
-                    jobs,
-                    include_dev,
-                    include_build,
-                    include_optional,
-                    refresh,
-                    json,
-                    toml,
-                    suggest,
-                })
+        cli::Commands::Deps { args, cmd } => match cmd {
+            None => command::deps::run_latest(command::deps::DepsLatestOptions {
+                manifest_path: args.manifest_path,
+                project_path: args.path,
+                jobs: args.jobs,
+                include_dev: args.include_dev,
+                include_build: args.include_build,
+                include_optional: args.include_optional,
+                refresh: args.refresh,
+                json: args.json,
+                toml: args.emit.is_some(),
+                suggest: true,
+            }),
+            Some(cli::DepsCommands::Resolve { cmd }) => {
+                reject_parent_deps_args(&args)?;
+                command::deps::resolve::run(cmd)
+            }
+            Some(cli::DepsCommands::Audit { args: audit }) => {
+                reject_parent_deps_args(&args)?;
+                run_deps_audit(audit)
             }
         },
-        cli::Commands::Pin { cmd } => exit_with(command::pin::run(cmd)?),
         cli::Commands::Port { cmd } => exit_with(command::port::run(cmd)?),
         cli::Commands::Tool { user, global, cmd } => exit_with(command::tool::run(
             cmd,
@@ -150,10 +81,10 @@ fn run_deps_audit(audit: cli::DepsAuditArgs) -> Result<()> {
     })
 }
 
-fn reject_parent_deps_audit_args(audit: &cli::DepsAuditArgs) -> Result<()> {
-    if audit != &cli::DepsAuditArgs::default() {
+fn reject_parent_deps_args(args: &cli::DepsArgs) -> Result<()> {
+    if args != &cli::DepsArgs::default() {
         return Err(anyhow!(
-            "`za deps <subcommand>` does not accept audit options before the subcommand; pass subcommand options after `latest`"
+            "`za deps <subcommand>` does not accept update options before the subcommand; pass options after the relevant subcommand"
         ));
     }
     Ok(())

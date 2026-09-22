@@ -828,7 +828,7 @@ fn render_latest_lines_show_summary_and_failure_note() {
             dependency_source: DependencySource::CratesIo,
             requirement: None,
             kinds: None,
-            source: LatestQuerySource::Args,
+            source: LatestQuerySource::Manifest,
             status: LatestStatus::Failed,
             latest_version: None,
             project_rust_version: None,
@@ -865,7 +865,7 @@ fn render_empty_latest_rejects_missing_manifest_source() {
     let err = render_empty_latest(None, false, false).unwrap_err();
     assert!(
         err.to_string()
-            .contains("provide crate names or `--manifest-path <Cargo.toml>` or `--path <DIR>`")
+            .contains("no project manifest; use `--manifest-path <Cargo.toml>` or `--path <DIR>`")
     );
 }
 
@@ -877,7 +877,7 @@ fn render_latest_toml_comments_failed_entries() {
             dependency_source: DependencySource::CratesIo,
             requirement: None,
             kinds: None,
-            source: LatestQuerySource::Args,
+            source: LatestQuerySource::Manifest,
             status: LatestStatus::Resolved,
             latest_version: Some("1.0.228".to_string()),
             project_rust_version: None,
@@ -892,7 +892,7 @@ fn render_latest_toml_comments_failed_entries() {
             dependency_source: DependencySource::CratesIo,
             requirement: None,
             kinds: None,
-            source: LatestQuerySource::Args,
+            source: LatestQuerySource::Manifest,
             status: LatestStatus::Failed,
             latest_version: None,
             project_rust_version: None,
@@ -1144,4 +1144,34 @@ fn temp_root(label: &str) -> std::path::PathBuf {
     ));
     fs::create_dir_all(&root).expect("create temp root");
     root
+}
+
+#[test]
+fn project_update_overview_is_brief_when_requirements_are_current() {
+    let record = LatestRecord {
+        name: "serde".into(),
+        dependency_source: DependencySource::CratesIo,
+        requirement: Some("1.0.229".into()),
+        kinds: Some("normal".into()),
+        source: LatestQuerySource::Manifest,
+        status: LatestStatus::Resolved,
+        latest_version: Some("1.0.229".into()),
+        project_rust_version: None,
+        msrv_compatible: None,
+        suggestion_kind: Some(LatestSuggestionKind::Keep),
+        suggested_requirement: None,
+        note: None,
+        suggestion_note: None,
+    };
+    let summary = LatestSummary {
+        total: 1,
+        resolved: 1,
+        review: 0,
+        failed: 0,
+    };
+    let lines = render_latest_lines(Some(Path::new("Cargo.toml")), &summary, &[record], true);
+    assert_eq!(
+        lines,
+        vec!["No dependency requirement updates needed (1 crate checked)."]
+    );
 }

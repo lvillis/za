@@ -4,6 +4,7 @@ mod api;
 mod latest;
 mod model;
 mod render;
+pub mod resolve;
 
 use crate::command::{render as text_render, style as tty_style, write_file_atomically, za_config};
 use anyhow::{Context, Result, anyhow, bail};
@@ -61,7 +62,6 @@ pub struct DepsRunOptions {
 }
 
 pub struct DepsLatestOptions {
-    pub crates: Vec<String>,
     pub manifest_path: Option<PathBuf>,
     pub project_path: Option<PathBuf>,
     pub jobs: Option<usize>,
@@ -318,7 +318,15 @@ fn resolve_manifest_path(
     let path = match (manifest_path, project_path) {
         (Some(path), None) => path,
         (None, Some(path)) => manifest_from_project_path(path),
-        (None, None) => PathBuf::from("Cargo.toml"),
+        (None, None) => env::current_dir()?
+            .ancestors()
+            .map(|dir| dir.join("Cargo.toml"))
+            .find(|path| path.is_file())
+            .ok_or_else(|| {
+                anyhow!(
+                    "no Cargo.toml found in this directory or its parents; use --path <PROJECT>"
+                )
+            })?,
         (Some(_), Some(_)) => bail!("use either `--manifest-path` or `--path`, not both"),
     };
     canonical_manifest_path(path)
@@ -1179,24 +1187,13 @@ fn parse_workflow_uses_line(line: &str) -> Option<WorkflowActionSpec> {
         return None;
     }
 
-    let (action, ref_name) = value.rsplit_once('@')?;
-    if action.is_empty() || ref_name.is_empty() {
-        return None;
-    }
-    let mut parts = action.split('/');
-    let owner = valid_action_segment(parts.next()?)?;
-    let repo = valid_action_segment(parts.next()?)?;
-    let rest = parts.collect::<Vec<_>>();
-    if rest.iter().any(|part| valid_action_segment(part).is_none()) {
-        return None;
-    }
-
+    let spec = resolve::ActionSpec::parse(&value).ok()?;
     Some(WorkflowActionSpec {
-        action: action.to_string(),
-        owner: owner.to_string(),
-        repo: repo.to_string(),
-        path: (!rest.is_empty()).then(|| rest.join("/")),
-        ref_name: ref_name.to_string(),
+        action: spec.action_without_ref(),
+        owner: spec.owner,
+        repo: spec.repo,
+        path: spec.path,
+        ref_name: spec.ref_name,
         version_hint,
         locations: Vec::new(),
     })

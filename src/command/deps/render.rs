@@ -942,6 +942,18 @@ pub(super) fn render_latest_lines(
     records: &[LatestRecord],
     suggest: bool,
 ) -> Vec<String> {
+    if !records.is_empty()
+        && records.iter().all(|record| {
+            record.status == LatestStatus::Resolved
+                && record.suggestion_kind == Some(LatestSuggestionKind::Keep)
+        })
+    {
+        return vec![format!(
+            "No dependency requirement updates needed ({} {} checked).",
+            records.len(),
+            text_render::pluralize(records.len(), "crate", "crates")
+        )];
+    }
     let verdict = if summary.failed > 0 || summary.review > 0 {
         tty_style::warning(format!("{:<5}", "WARN"))
     } else {
@@ -950,7 +962,7 @@ pub(super) fn render_latest_lines(
     let mut lines = vec![format!(
         "{} {}  {} {}  {}",
         verdict,
-        tty_style::header("latest"),
+        tty_style::header("deps"),
         tty_style::header(summary.total.to_string()),
         tty_style::dim("crates"),
         render_latest_summary(summary)
@@ -1124,7 +1136,6 @@ fn render_latest_note(record: &LatestRecord, suggest: bool) -> String {
     }
     if parts.is_empty() {
         match record.source {
-            LatestQuerySource::Args => "explicit query".to_string(),
             LatestQuerySource::Manifest => "manifest".to_string(),
         }
     } else {

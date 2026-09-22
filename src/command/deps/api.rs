@@ -495,12 +495,38 @@ impl ApiClient {
     }
 
     fn fetch_github_repo(&self, owner: &str, repo: &str) -> Result<GitHubRepoResponse> {
+        self.fetch_github_json(&format!("/repos/{owner}/{repo}"))
+    }
+
+    pub(super) fn resolve_github_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+    ) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Commit {
+            sha: String,
+        }
+        let commit: Commit = self.fetch_github_json(&format!(
+            "/repos/{}/{}/commits/{}",
+            percent_encode_path_segment(owner),
+            percent_encode_path_segment(repo),
+            percent_encode_path_segment(reference)
+        ))?;
+        if !is_full_commit_sha(&commit.sha) {
+            bail!("GitHub returned invalid commit SHA `{}`", commit.sha);
+        }
+        Ok(commit.sha)
+    }
+
+    fn fetch_github_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         if self.github_api_blocked.load(Ordering::Relaxed) {
             bail!("skipped after GitHub API 403 (set GITHUB_TOKEN for stable quota)");
         }
 
         self.retry_with_backoff("request GitHub API", || {
-            let mut req = self.github_http.get(format!("/repos/{owner}/{repo}"));
+            let mut req = self.github_http.get(path.to_string());
             req = req
                 .try_header("user-agent", HTTP_USER_AGENT)
                 .map_err(|err| AttemptError::Fatal(anyhow!("set user-agent header: {err}")))?;
@@ -548,7 +574,7 @@ impl ApiClient {
             }
 
             response
-                .json::<GitHubRepoResponse>()
+                .json::<T>()
                 .map_err(|err| AttemptError::Fatal(anyhow!("parse GitHub JSON: {err}")))
         })
     }
@@ -560,60 +586,9 @@ impl ApiClient {
 
         let mut tags = Vec::new();
         for page in 1..=WORKFLOW_ACTION_REF_MAX_PAGES {
-            let page_tags = self.retry_with_backoff("request GitHub tags API", || {
-                let mut req = self.github_http.get(format!(
-                    "/repos/{owner}/{repo}/tags?per_page={WORKFLOW_ACTION_REF_MAX_TAGS}&page={page}"
-                ));
-                req = req
-                    .try_header("user-agent", HTTP_USER_AGENT)
-                    .map_err(|err| AttemptError::Fatal(anyhow!("set user-agent header: {err}")))?;
-                req = req
-                    .try_header("accept", "application/vnd.github+json")
-                    .map_err(|err| {
-                        AttemptError::Fatal(anyhow!("set accept header for GitHub request: {err}"))
-                    })?;
-                if let Some(token) = self.github_token.as_deref() {
-                    req = req
-                        .try_header("authorization", &format!("Bearer {token}"))
-                        .map_err(|err| {
-                            AttemptError::Fatal(anyhow!(
-                                "set authorization header for GitHub request: {err}"
-                            ))
-                        })?;
-                }
-
-                let response = req.send_response().map_err(|err| {
-                    AttemptError::Retryable(anyhow!("request GitHub tags API failed: {err}"))
-                })?;
-                let status = response.status();
-                if !status.is_success() {
-                    let body = text_render::truncate_end(&response.text_lossy(), 200);
-                    if status.as_u16() == 403 {
-                        self.github_api_blocked.store(true, Ordering::Relaxed);
-                        return Err(AttemptError::Fatal(anyhow!(
-                            "status {} (rate-limited or forbidden); body {}",
-                            status,
-                            body
-                        )));
-                    }
-                    if is_retryable_status(status.as_u16()) {
-                        return Err(AttemptError::Retryable(anyhow!(
-                            "status {} body {}",
-                            status,
-                            body
-                        )));
-                    }
-                    return Err(AttemptError::Fatal(anyhow!(
-                        "status {} body {}",
-                        status,
-                        body
-                    )));
-                }
-
-                response
-                    .json::<Vec<GitHubTagResponse>>()
-                    .map_err(|err| AttemptError::Fatal(anyhow!("parse GitHub tags JSON: {err}")))
-            })?;
+            let page_tags: Vec<GitHubTagResponse> = self.fetch_github_json(&format!(
+                "/repos/{owner}/{repo}/tags?per_page={WORKFLOW_ACTION_REF_MAX_TAGS}&page={page}"
+            ))?;
             let page_len = page_tags.len();
             tags.extend(page_tags.into_iter().map(|tag| GitHubTagSnapshot {
                 name: tag.name,
@@ -777,6 +752,12 @@ fn build_http_client(base_url: &str) -> Result<Client> {
 }
 
 fn resolve_github_token() -> Result<Option<String>> {
+    if let Ok(token) = env::var("ZA_GITHUB_TOKEN") {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
     if let Ok(token) = env::var("GITHUB_TOKEN") {
         let trimmed = token.trim();
         if !trimmed.is_empty() {
@@ -826,3 +807,19 @@ fn deps_cache_path() -> Option<PathBuf> {
             .join(DEPS_CACHE_FILE_NAME),
     )
 }
+
+pub(super) fn percent_encode_path_segment(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
