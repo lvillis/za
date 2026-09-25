@@ -2193,7 +2193,7 @@ dependencies = [
 
 [[package]]
 name = "za"
-version = "0.1.100"
+version = "0.1.101"
 dependencies = [
  "anyhow",
  "clap",

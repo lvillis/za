@@ -1,8 +1,17 @@
+## [0.1.101] - 2026-09-25
+
+### 🐛 Bug Fixes
+
+- *(tool)* Handle large release metadata and repository redirects
 ## [0.1.100] - 2026-09-22
 
 ### 🚀 Features
 
 - [**breaking**] Remove ai, gen, and diff commands
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.100
 ## [0.1.99] - 2026-09-21
 
 ### 🚀 Features
