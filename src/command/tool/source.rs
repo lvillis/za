@@ -30,6 +30,9 @@ const HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS: usize = 3;
 const HTTP_TRANSIENT_RETRY_BASE_DELAY_MS: u64 = 200;
 const GITHUB_RELEASE_SCAN_PER_PAGE: usize = 30;
 const GITHUB_RELEASE_SCAN_MAX_PAGES: usize = 10;
+// Release lists include every asset and release note, even when only tags are needed.
+// Asset-heavy projects can exceed reqx's default 8 MiB response limit.
+const GITHUB_RELEASE_METADATA_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 static ACTIVE_TEMP_DIRS: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -1019,6 +1022,15 @@ fn fetch_github_json<T: DeserializeOwned>(
     let client = build_http_client(GITHUB_API_BASE, "za-tool-manager", false, proxy_scope)
         .context("build GitHub API client")?;
     let github_token = resolve_github_token()?;
+    fetch_github_json_with_client(&client, project_label, path, github_token.as_deref())
+}
+
+fn fetch_github_json_with_client<T: DeserializeOwned>(
+    client: &Client,
+    project_label: &str,
+    path: &str,
+    github_token: Option<&str>,
+) -> Result<T> {
     let interactive = io::stderr().is_terminal();
 
     retry_transient_http_operation(
@@ -1026,14 +1038,17 @@ fn fetch_github_json<T: DeserializeOwned>(
         "source",
         &format!("{project_label} release metadata"),
         || {
-            let mut req = client.get(path);
+            let mut req = client
+                .get(path)
+                .max_response_body_bytes(GITHUB_RELEASE_METADATA_MAX_BYTES)
+                .redirect_policy(reqx::advanced::RedirectPolicy::follow());
             req = req
                 .try_header("user-agent", HTTP_USER_AGENT)
                 .context("set GitHub user-agent")?;
             req = req
                 .try_header("accept", "application/vnd.github+json")
                 .context("set GitHub accept header")?;
-            if let Some(token) = github_token.as_deref() {
+            if let Some(token) = github_token {
                 req = req
                     .try_header("authorization", &format!("Bearer {token}"))
                     .context("set GitHub authorization header")?;
@@ -2187,6 +2202,81 @@ mod tests {
         thread,
         time::Duration,
     };
+
+    #[test]
+    fn github_release_metadata_accepts_responses_larger_than_eight_mib() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let payload = serde_json::json!([{
+            "tag_name": "rust-v1.2.3",
+            "draft": false,
+            "prerelease": false,
+            "assets": [],
+            "body": "x".repeat(9 * 1024 * 1024)
+        }])
+        .to_string();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&mut stream);
+            write_http_response(
+                &mut stream,
+                200,
+                &[],
+                payload.as_bytes(),
+                Some(payload.len()),
+            );
+        });
+        let client = reqx::blocking::Client::builder(&base)
+            .request_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let releases: Vec<GithubRelease> = super::fetch_github_json_with_client(
+            &client,
+            "codex",
+            "/releases?per_page=30&page=1",
+            None,
+        )
+        .expect("large release metadata must be accepted");
+        assert_eq!(releases[0].tag_name, "rust-v1.2.3");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn github_release_metadata_follows_repository_moves() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let location = format!("{base}/repositories/743011356/releases/latest");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert!(request.starts_with("GET /repos/old/repo/releases/latest "));
+            write_http_response(&mut stream, 301, &[("Location", location)], b"", Some(0));
+            drop(stream);
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            assert!(request.starts_with("GET /repositories/743011356/releases/latest "));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-token")
+            );
+            let payload = br#"{"tag_name":"v1.2.3","draft":false,"prerelease":false,"assets":[]}"#;
+            write_http_response(&mut stream, 200, &[], payload, Some(payload.len()));
+        });
+        let client = reqx::blocking::Client::builder(&base)
+            .request_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let release: GithubRelease = super::fetch_github_json_with_client(
+            &client,
+            "tcping",
+            "/repos/old/repo/releases/latest",
+            Some("test-token"),
+        )
+        .expect("repository redirect must be followed");
+        assert_eq!(release.tag_name, "v1.2.3");
+        server.join().unwrap();
+    }
 
     #[test]
     fn prerelease_channel_matches_first_identifier_case_insensitively() {
