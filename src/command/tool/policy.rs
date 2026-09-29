@@ -19,6 +19,9 @@ const RIPGREP_GITHUB_TAG_PREFIX: &str = "";
 const FD_GITHUB_OWNER: &str = "sharkdp";
 const FD_GITHUB_REPO: &str = "fd";
 const FD_GITHUB_TAG_PREFIX: &str = "v";
+const QUAYSIDE_GITHUB_OWNER: &str = "oksyd";
+const QUAYSIDE_GITHUB_REPO: &str = "quayside";
+const QUAYSIDE_GITHUB_TAG_PREFIX: &str = "";
 const TCPING_GITHUB_OWNER: &str = "lvillis";
 const TCPING_GITHUB_REPO: &str = "tcping-rs";
 const TCPING_GITHUB_TAG_PREFIX: &str = "";
@@ -145,7 +148,7 @@ impl ToolPolicy {
     }
 }
 
-const TOOL_POLICIES: [ToolPolicy; 25] = [
+const TOOL_POLICIES: [ToolPolicy; 26] = [
     ToolPolicy {
         canonical_name: "agent-browser",
         aliases: &[],
@@ -254,6 +257,22 @@ const TOOL_POLICIES: [ToolPolicy; 25] = [
             repo: FD_GITHUB_REPO,
             tag_prefix: FD_GITHUB_TAG_PREFIX,
             expected_asset_name: Some(fd_expected_asset_name),
+            verification: GithubReleaseVerification::RequiredSha256Digest,
+            track: GithubReleaseTrack::VersionedTags,
+        }),
+    },
+    ToolPolicy {
+        canonical_name: "quayside",
+        aliases: &[],
+        source_label: "GitHub Release (SHA-256 verified)",
+        layout: ToolLayout::Binary,
+        package: None,
+        github_release: Some(GithubReleasePolicy {
+            project_label: "quayside",
+            owner: QUAYSIDE_GITHUB_OWNER,
+            repo: QUAYSIDE_GITHUB_REPO,
+            tag_prefix: QUAYSIDE_GITHUB_TAG_PREFIX,
+            expected_asset_name: Some(quayside_expected_asset_name),
             verification: GithubReleaseVerification::RequiredSha256Digest,
             track: GithubReleaseTrack::VersionedTags,
         }),
@@ -645,6 +664,20 @@ fn ripgrep_expected_asset_name(version: &str) -> Result<String> {
 
 fn fd_expected_asset_name(version: &str) -> Result<String> {
     Ok(format!("fd-v{version}-{}.tar.gz", fd_target_triple()?))
+}
+
+fn quayside_expected_asset_name(version: &str) -> Result<String> {
+    let target = quayside_target(env::consts::OS, env::consts::ARCH)?;
+    Ok(format!("quayside-{version}-{target}.tar.gz"))
+}
+
+pub(super) fn quayside_target(os: &str, arch: &str) -> Result<&'static str> {
+    match (os, arch) {
+        ("linux", "x86_64") => Ok("linux-x86_64-musl"),
+        ("linux", "aarch64") => Ok("linux-aarch64-musl"),
+        ("macos", "aarch64") => Ok("darwin-aarch64"),
+        _ => bail!("unsupported platform for quayside release asset: {arch}-{os}"),
+    }
 }
 
 fn tcping_expected_asset_name(version: &str) -> Result<String> {

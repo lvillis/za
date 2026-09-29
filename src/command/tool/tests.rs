@@ -901,6 +901,7 @@ fn canonical_tool_name_resolves_aliases() {
 fn supported_tool_names_csv_contains_all_aliases() {
     let csv = supported_tool_names_csv();
     assert!(csv.contains("agent-browser"));
+    assert!(csv.contains("quayside"));
     assert!(csv.contains("za"));
     assert!(csv.contains("codex"));
     assert!(csv.contains("codex-cli"));
@@ -1868,4 +1869,46 @@ fn cleanup_legacy_current_dir_artifacts_removes_backup_and_temp_files() {
     assert!(!home.self_update_backup_dir().exists());
 
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn quayside_policy_matches_verified_release_archive() {
+    let tool = ToolSpec::parse("quayside@0.1.9").unwrap();
+    let policy = find_tool_policy(&tool.name).unwrap();
+    assert_eq!(policy.layout, ToolLayout::Binary);
+    assert!(policy.package.is_none());
+    let release = policy.github_release.unwrap();
+    assert_eq!(
+        (release.owner, release.repo, release.tag_prefix),
+        ("oksyd", "quayside", "")
+    );
+    assert_eq!(release.track, GithubReleaseTrack::VersionedTags);
+    assert_eq!(
+        release.verification,
+        GithubReleaseVerification::RequiredSha256Digest
+    );
+    let asset = release.expected_asset_name.unwrap()(tool.version.as_deref().unwrap());
+    match super::policy::quayside_target(std::env::consts::OS, std::env::consts::ARCH) {
+        Ok(target) => assert_eq!(asset.unwrap(), format!("quayside-0.1.9-{target}.tar.gz")),
+        Err(_) => assert!(asset.is_err()),
+    }
+}
+
+#[test]
+fn quayside_targets_match_published_platforms() {
+    for (os, arch, expected) in [
+        ("linux", "x86_64", "linux-x86_64-musl"),
+        ("linux", "aarch64", "linux-aarch64-musl"),
+        ("macos", "aarch64", "darwin-aarch64"),
+    ] {
+        assert_eq!(super::policy::quayside_target(os, arch).unwrap(), expected);
+    }
+    for (os, arch) in [
+        ("macos", "x86_64"),
+        ("windows", "x86_64"),
+        ("linux", "arm"),
+        ("freebsd", "x86_64"),
+    ] {
+        assert!(super::policy::quayside_target(os, arch).is_err());
+    }
 }

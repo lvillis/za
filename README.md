@@ -74,3 +74,14 @@ za tool update agent-browser
 ```
 
 Use `za tool install agent-browser@0.38.1` to pin a version. Supported platforms are Linux (x64/ARM64, GNU or musl), macOS (x64/ARM64), and Windows (x64).
+
+## quayside
+
+Install from [quayside releases](https://github.com/oksyd/quayside/releases) with SHA-256 verification:
+
+```bash
+za tool install quayside
+za tool update quayside
+```
+
+Use `za tool install quayside@0.1.9` to select a specific version. Supported platforms are Linux (x64/ARM64, static musl) and macOS (ARM64).
