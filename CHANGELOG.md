@@ -1,8 +1,17 @@
+## [0.1.103] - 2026-09-29
+
+### 🚀 Features
+
+- *(tool)* Add quayside
 ## [0.1.102] - 2026-09-29
 
 ### 🐛 Bug Fixes
 
 - *(tool)* Keep retries within per-tool progress rows
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.102
 ## [0.1.101] - 2026-09-25
 
 ### 🐛 Bug Fixes
