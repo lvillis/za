@@ -989,18 +989,95 @@ fn latest_cache_key(canonical_name: &str, mode: LatestResolutionMode) -> String 
     }
 }
 
+struct LatestProgressUi {
+    _multi: MultiProgress,
+    header: ProgressBar,
+    rows: HashMap<&'static str, ProgressBar>,
+    completed: Mutex<usize>,
+}
+
+impl LatestProgressUi {
+    fn new(policies: &[ToolPolicy]) -> Option<Arc<Self>> {
+        if policies.is_empty() || !io::stderr().is_terminal() {
+            return None;
+        }
+        Some(Arc::new(Self::with_target(
+            policies,
+            ProgressDrawTarget::stderr_with_hz(10),
+        )))
+    }
+
+    fn with_target(policies: &[ToolPolicy], target: ProgressDrawTarget) -> Self {
+        let multi = MultiProgress::with_draw_target(target);
+        let header = multi.add(ProgressBar::new(policies.len() as u64));
+        header.set_style(
+            ProgressStyle::with_template("[+] Checking tools {pos}/{len}")
+                .expect("header template"),
+        );
+        let mut rows = HashMap::new();
+        for policy in policies {
+            let row = multi.add(ProgressBar::new_spinner());
+            row.set_style(
+                ProgressStyle::with_template(" {spinner} {prefix:<16} {wide_msg}")
+                    .expect("row template")
+                    .tick_strings(&["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]),
+            );
+            row.set_prefix(policy.canonical_name);
+            row.set_message("waiting");
+            rows.insert(policy.canonical_name, row);
+        }
+        Self {
+            _multi: multi,
+            header,
+            rows,
+            completed: Mutex::new(0),
+        }
+    }
+
+    fn start(&self, name: &str) {
+        if let Some(row) = self.rows.get(name) {
+            row.set_message("checking");
+            row.enable_steady_tick(Duration::from_millis(80));
+        }
+    }
+
+    fn retry_reporter(&self, name: &str) -> Option<source::RetryReporter> {
+        let row = self.rows.get(name)?.clone();
+        Some(Arc::new(move |message| row.set_message(message)))
+    }
+
+    fn finish(&self, name: &str, result: &LatestCheck) {
+        if let Some(row) = self.rows.get(name) {
+            let (symbol, message) = match result {
+                LatestCheck::Latest(version) => ("✔", format!("latest {version}")),
+                LatestCheck::Unsupported => ("-", "unsupported".to_string()),
+                LatestCheck::Error(_) => ("✘", "check failed".to_string()),
+            };
+            row.set_style(
+                ProgressStyle::with_template(&format!(" {symbol} {{prefix:<16}} {{wide_msg}}"))
+                    .expect("finished row template"),
+            );
+            row.finish_with_message(message);
+        }
+        if let Ok(mut completed) = self.completed.lock() {
+            *completed += 1;
+            self.header.set_position(*completed as u64);
+        }
+    }
+
+    fn finish_all(&self) {
+        self.header.finish();
+    }
+}
+
 fn fetch_latest_checks_parallel(
     policies: Vec<ToolPolicy>,
     mode: LatestResolutionMode,
 ) -> HashMap<&'static str, LatestCheck> {
     let worker_count = normalize_tool_update_jobs(default_tool_update_jobs(), policies.len());
+    let progress = LatestProgressUi::new(&policies);
     let queue = Arc::new(Mutex::new(VecDeque::from(policies)));
     let out: Arc<Mutex<HashMap<&'static str, LatestCheck>>> = Arc::new(Mutex::new(HashMap::new()));
-    let progress = new_tool_progress_bar(
-        "update",
-        queue.lock().map(|guard| guard.len()).unwrap_or(0),
-        "checking upstream versions",
-    );
 
     thread::scope(|scope| {
         for _ in 0..worker_count {
@@ -1016,10 +1093,17 @@ fn fetch_latest_checks_parallel(
                     let Some(policy) = task else {
                         break;
                     };
-                    let latest = resolve_latest_for_policy(policy, mode);
-                    if let Some(progress) = progress.as_ref() {
-                        progress.set_message(latest_check_progress_message(policy, &latest));
-                        progress.inc(1);
+                    if let Some(ui) = &progress {
+                        ui.start(policy.canonical_name);
+                    }
+                    let reporter = progress
+                        .as_ref()
+                        .and_then(|ui| ui.retry_reporter(policy.canonical_name));
+                    let latest = source::with_retry_reporter(reporter, || {
+                        resolve_latest_for_policy(policy, mode)
+                    });
+                    if let Some(ui) = &progress {
+                        ui.finish(policy.canonical_name, &latest);
                     }
                     if let Ok(mut guard) = out.lock() {
                         guard.insert(policy.canonical_name, latest);
@@ -1032,7 +1116,7 @@ fn fetch_latest_checks_parallel(
     });
 
     if let Some(progress) = progress {
-        progress.finish_and_clear();
+        progress.finish_all();
     }
 
     out.lock()
@@ -1085,17 +1169,33 @@ fn tool_update_cache_path() -> Option<PathBuf> {
     })
 }
 
-pub(super) fn latest_check_progress_message(policy: ToolPolicy, latest: &LatestCheck) -> String {
-    match latest {
-        LatestCheck::Latest(version) => format!("{} {}", policy.canonical_name, version),
-        LatestCheck::Unsupported => format!("{} n/a", policy.canonical_name),
-        LatestCheck::Error(_) => format!("{} failed", policy.canonical_name),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_rows_keep_retries_and_results_separate() {
+        let policies = [
+            find_tool_policy("codex").unwrap(),
+            find_tool_policy("fd").unwrap(),
+        ];
+        let ui = LatestProgressUi::with_target(&policies, ProgressDrawTarget::hidden());
+        ui.start("codex");
+        ui.start("fd");
+        ui.retry_reporter("codex").unwrap()("retry 2/3 · request timed out".into());
+        assert_eq!(ui.rows["codex"].message(), "retry 2/3 · request timed out");
+        assert_eq!(ui.rows["fd"].message(), "checking");
+        ui.finish("fd", &LatestCheck::Latest("10.5.0".into()));
+        assert_eq!(ui.header.position(), 1);
+        assert_eq!(ui.rows["fd"].message(), "latest 10.5.0");
+        assert!(ui.rows["fd"].is_finished());
+        assert!(!ui.rows["codex"].is_finished());
+        ui.finish("codex", &LatestCheck::Error("timeout".into()));
+        ui.finish_all();
+        assert_eq!(ui.header.position(), 2);
+        assert!(ui.header.is_finished());
+        assert_eq!(ui.rows["codex"].message(), "check failed");
+    }
 
     #[test]
     fn render_installed_table_expands_active_column_for_long_versions() {

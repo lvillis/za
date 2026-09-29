@@ -845,6 +845,40 @@ pub(super) fn split_no_proxy_rules(value: &str) -> Vec<String> {
     shared_split_no_proxy_rules(value)
 }
 
+pub(super) type RetryReporter = Arc<dyn Fn(String) + Send + Sync>;
+
+thread_local! {
+    // Each tool worker owns its progress row. Scope the reporter to one task
+    // so nested retries cannot print over another worker's terminal output.
+    static RETRY_REPORTER: std::cell::RefCell<Option<RetryReporter>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn with_retry_reporter<T>(
+    reporter: Option<RetryReporter>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct RestoreReporter(Option<RetryReporter>);
+    impl Drop for RestoreReporter {
+        fn drop(&mut self) {
+            RETRY_REPORTER.with(|slot| {
+                slot.replace(self.0.take());
+            });
+        }
+    }
+    let _restore = RestoreReporter(RETRY_REPORTER.with(|slot| slot.replace(reporter)));
+    operation()
+}
+
+fn report_retry(message: String) -> bool {
+    let reporter = RETRY_REPORTER.with(|slot| slot.borrow().clone());
+    if let Some(reporter) = reporter {
+        reporter(message);
+        true
+    } else {
+        false
+    }
+}
+
 fn retry_transient_http_operation<T, F>(
     interactive: bool,
     stage: &str,
@@ -862,19 +896,26 @@ where
                 if attempt >= HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS || !is_retryable_http_error(&err) {
                     return Err(err);
                 }
-                if interactive && stage == "download" {
-                    finish_download_tty_line();
-                }
-                print_download_stage(
-                    interactive,
-                    stage,
-                    format!(
-                        "retry {}/{} for {subject} after {}",
-                        attempt + 1,
-                        HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS,
-                        summarize_retryable_error(&err)
-                    ),
+                let reason = summarize_retryable_error(&err);
+                let retry_status = format!(
+                    "retry {}/{} · {reason}",
+                    attempt + 1,
+                    HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS
                 );
+                if !report_retry(retry_status) {
+                    if interactive && stage == "download" {
+                        finish_download_tty_line();
+                    }
+                    print_download_stage(
+                        interactive,
+                        stage,
+                        format!(
+                            "retry {}/{} for {subject} after {reason}",
+                            attempt + 1,
+                            HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS
+                        ),
+                    );
+                }
                 thread::sleep(transient_http_retry_backoff(attempt));
             }
         }
@@ -2475,6 +2516,50 @@ mod tests {
                 DownloadRange { start: 7, end: 9 },
             ]
         );
+    }
+
+    #[test]
+    fn retry_reporter_captures_retries_and_restores_after_unwind() {
+        let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&messages);
+        let reporter: super::RetryReporter = Arc::new(move |message| {
+            captured.lock().unwrap().push(message);
+        });
+        super::with_retry_reporter(Some(reporter), || {
+            // A worker's reporter must not leak into another worker.
+            assert!(
+                !thread::spawn(|| super::report_retry("other worker".into()))
+                    .join()
+                    .unwrap()
+            );
+            let result = std::panic::catch_unwind(|| {
+                super::with_retry_reporter(None, || {
+                    assert!(!super::report_retry("disabled".into()));
+                    panic!("simulate task failure");
+                });
+            });
+            assert!(result.is_err());
+            let mut attempts = 0;
+            let value = retry_transient_http_operation(false, "source", "metadata", || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(anyhow::Error::new(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "simulated timeout",
+                    )))
+                } else {
+                    Ok(42)
+                }
+            })
+            .unwrap();
+            assert_eq!(value, 42);
+        });
+        assert!(!super::report_retry("outside scope".into()));
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].starts_with("retry 2/3"));
+        assert!(messages[1].starts_with("retry 3/3"));
+        assert!(messages.iter().all(|message| message.contains("timed out")));
     }
 
     #[test]

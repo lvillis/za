@@ -12,13 +12,13 @@ use super::{
     ToolUpdateChannel, automatic_update_is_downgrade, canonical_tool_name,
     classify_tool_executable_scope, cleanup_legacy_current_dir_artifacts,
     collect_managed_tool_names, command_candidates, compact_install_plan,
-    extract_version_from_text, find_tool_policy, latest_check_progress_message,
-    latest_resolution_mode_for_batch, list_update_status, load_sync_specs_from_manifest,
-    normalize_requested_tool_names, normalize_version, prune_non_active_versions,
-    render_batch_progress_header, render_batch_progress_line, render_batch_summary,
-    resolve_update_channel_request, should_parallel_materialize_batch, source,
-    split_supported_managed_tool_names, starship_bash_init_block, supported_tool_names_csv,
-    tool_update_cache_entry_is_fresh, unsupported_tool_message, upsert_managed_block,
+    extract_version_from_text, find_tool_policy, latest_resolution_mode_for_batch,
+    list_update_status, load_sync_specs_from_manifest, normalize_requested_tool_names,
+    normalize_version, prune_non_active_versions, render_batch_progress_header,
+    render_batch_progress_line, render_batch_summary, resolve_update_channel_request,
+    should_parallel_materialize_batch, source, split_supported_managed_tool_names,
+    starship_bash_init_block, supported_tool_names_csv, tool_update_cache_entry_is_fresh,
+    unsupported_tool_message, upsert_managed_block,
 };
 use std::{
     fs,
@@ -487,23 +487,6 @@ fn tool_update_cache_freshness_rejects_stale_and_future_entries() {
         now - TOOL_UPDATE_CACHE_TTL_SECS - 1,
         now
     ));
-}
-
-#[test]
-fn latest_check_progress_message_summarizes_result() {
-    let policy = find_tool_policy("codex").expect("policy");
-    assert_eq!(
-        latest_check_progress_message(policy, &LatestCheck::Latest("0.114.0".to_string())),
-        "codex 0.114.0"
-    );
-    assert_eq!(
-        latest_check_progress_message(policy, &LatestCheck::Unsupported),
-        "codex n/a"
-    );
-    assert_eq!(
-        latest_check_progress_message(policy, &LatestCheck::Error("boom".to_string())),
-        "codex failed"
-    );
 }
 
 #[test]

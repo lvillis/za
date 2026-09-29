@@ -445,12 +445,17 @@ fn materialize_tool_batch_parallel(
                             .set_tool_status(&task.plan.tool.name, BatchProgressStatus::Preparing);
                     }
                     let tool_name = task.plan.tool.name.clone();
-                    let materialized = materialize_install_plan(
-                        &home,
-                        &task.plan,
-                        task.materialize_options,
-                        progress_sink.clone(),
-                    );
+                    let reporter = progress_ui
+                        .as_ref()
+                        .and_then(|ui| ui.retry_reporter(&tool_name));
+                    let materialized = source::with_retry_reporter(reporter, || {
+                        materialize_install_plan(
+                            &home,
+                            &task.plan,
+                            task.materialize_options,
+                            progress_sink.clone(),
+                        )
+                    });
                     let result = match materialized {
                         Ok(()) => {
                             if let Some(progress) = progress_ui.as_ref() {
@@ -543,6 +548,14 @@ impl BatchProgressUi {
                 .add(new_batch_tool_progress_bar(tool_name, status))
         });
         progress.set_message(render_batch_progress_line(tool_name, status));
+    }
+
+    fn retry_reporter(&self, tool_name: &str) -> Option<source::RetryReporter> {
+        let row = self.lines.lock().ok()?.get(tool_name)?.clone();
+        let tool_name = tool_name.to_string();
+        Some(Arc::new(move |message| {
+            row.set_message(format!("{tool_name} {message}"));
+        }))
     }
 
     fn record_download(&self, event: source::DownloadProgress) {

@@ -38,9 +38,7 @@ use self::listing::{
     resolve_latest_checks_for_names_with_mode, show_catalog, show_tool,
 };
 #[cfg(test)]
-use self::listing::{
-    latest_check_progress_message, list_update_status, tool_update_cache_entry_is_fresh,
-};
+use self::listing::{list_update_status, tool_update_cache_entry_is_fresh};
 use self::policy::{
     GithubReleasePolicy, PackagePolicy, ToolLayout, ToolPolicy,
     canonical_tool_name as canonical_tool_name_impl, find_tool_policy, supported_tool_names_csv,
@@ -204,31 +202,6 @@ fn style_backticked_segments(message: &str) -> String {
     }
     out.push_str(rest);
     out
-}
-
-fn new_tool_progress_bar(
-    stage: &str,
-    total: usize,
-    message: impl Into<String>,
-) -> Option<ProgressBar> {
-    if total == 0 || !io::stderr().is_terminal() {
-        return None;
-    }
-
-    let progress = ProgressBar::new(total as u64);
-    progress.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
-    progress.set_style(
-        ProgressStyle::with_template(
-            "{spinner} {prefix} [{bar:18.cyan/blue}] {pos}/{len} {wide_msg}",
-        )
-        .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .progress_chars("=> ")
-        .tick_strings(&["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]),
-    );
-    progress.enable_steady_tick(Duration::from_millis(80));
-    progress.set_prefix(format!("{} {stage}", tool_stage_icon(stage)));
-    progress.set_message(message.into());
-    Some(progress)
 }
 
 fn install_source_failure_guidance(err: &anyhow::Error) -> Option<&'static str> {
