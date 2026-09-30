@@ -34,8 +34,8 @@ use std::{
 
 use self::doctor::run_doctor;
 use self::listing::{
-    LatestCheck, LatestResolutionMode, UnmanagedBinary, list_installed, list_outdated,
-    resolve_latest_checks_for_names_with_mode, show_catalog, show_tool,
+    LatestCachePolicy, LatestCheck, LatestResolutionMode, UnmanagedBinary, list_installed,
+    list_outdated, resolve_latest_checks_for_names_with_mode, show_catalog, show_tool,
 };
 #[cfg(test)]
 use self::listing::{list_update_status, tool_update_cache_entry_is_fresh};

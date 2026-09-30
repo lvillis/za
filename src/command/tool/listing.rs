@@ -14,6 +14,12 @@ pub(super) enum LatestResolutionMode {
     Fast,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LatestCachePolicy {
+    PreferCached,
+    Refresh,
+}
+
 pub(super) fn list_update_status(installed_version: &str, latest: &LatestCheck) -> String {
     match latest {
         LatestCheck::Latest(remote)
@@ -905,22 +911,52 @@ fn print_unmanaged_binaries_text(unmanaged: &[UnmanagedBinary]) {
 }
 
 pub(super) fn resolve_latest_checks_for_names(names: &[String]) -> Result<LatestLookup> {
-    resolve_latest_checks_for_names_with_mode(names, LatestResolutionMode::Exact)
+    resolve_latest_checks_for_names_with_mode(
+        names,
+        LatestResolutionMode::Exact,
+        LatestCachePolicy::PreferCached,
+    )
 }
 
 pub(super) fn resolve_latest_checks_for_names_with_mode(
     names: &[String],
     mode: LatestResolutionMode,
+    cache_policy: LatestCachePolicy,
 ) -> Result<LatestLookup> {
-    let mut latest_by_name: HashMap<String, LatestCheck> = HashMap::new();
-    let mut policy_tasks = Vec::new();
-    let mut policy_seen: HashMap<&'static str, ()> = HashMap::new();
-
     let mut cache = ToolUpdateCacheState::load();
     let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let lookup = resolve_latest_checks(
+        names,
+        mode,
+        cache_policy,
+        &mut cache,
+        now_unix_secs,
+        fetch_latest_checks_parallel,
+    );
+    if let Err(err) = cache.save_if_dirty()
+        && !is_permission_denied_error(&err)
+    {
+        eprintln!(
+            "warning: tool update cache was not saved; continuing without cached update status: {err}"
+        );
+    }
+    Ok(lookup)
+}
+
+fn resolve_latest_checks(
+    names: &[String],
+    mode: LatestResolutionMode,
+    cache_policy: LatestCachePolicy,
+    cache: &mut ToolUpdateCacheState,
+    now_unix_secs: u64,
+    fetch: impl FnOnce(Vec<ToolPolicy>, LatestResolutionMode) -> HashMap<&'static str, LatestCheck>,
+) -> LatestLookup {
+    let mut latest_by_name: HashMap<String, LatestCheck> = HashMap::new();
+    let mut policy_tasks = Vec::new();
+    let mut policy_seen: HashMap<&'static str, ()> = HashMap::new();
 
     for name in names {
         let Some(policy) = find_tool_policy(name) else {
@@ -932,7 +968,9 @@ pub(super) fn resolve_latest_checks_for_names_with_mode(
         }
         policy_seen.insert(policy.canonical_name, ());
         let cache_key = latest_cache_key(policy.canonical_name, mode);
-        if let Some(latest) = cache.get_latest_if_fresh(&cache_key, now_unix_secs) {
+        if cache_policy == LatestCachePolicy::PreferCached
+            && let Some(latest) = cache.get_latest_if_fresh(&cache_key, now_unix_secs)
+        {
             latest_by_name.insert(
                 policy.canonical_name.to_string(),
                 LatestCheck::Latest(latest),
@@ -943,7 +981,7 @@ pub(super) fn resolve_latest_checks_for_names_with_mode(
     }
 
     if !policy_tasks.is_empty() {
-        let fetched = fetch_latest_checks_parallel(policy_tasks, mode);
+        let fetched = fetch(policy_tasks, mode);
         for (canonical_name, latest_check) in fetched {
             if let LatestCheck::Latest(version) = &latest_check {
                 cache.put_latest(
@@ -954,14 +992,6 @@ pub(super) fn resolve_latest_checks_for_names_with_mode(
             }
             latest_by_name.insert(canonical_name.to_string(), latest_check);
         }
-    }
-
-    if let Err(err) = cache.save_if_dirty()
-        && !is_permission_denied_error(&err)
-    {
-        eprintln!(
-            "warning: tool update cache was not saved; continuing without cached update status: {err}"
-        );
     }
 
     let mut by_name = HashMap::new();
@@ -977,9 +1007,9 @@ pub(super) fn resolve_latest_checks_for_names_with_mode(
         by_name.insert(name.clone(), latest);
     }
 
-    Ok(LatestLookup {
+    LatestLookup {
         latest_by_name: by_name,
-    })
+    }
 }
 
 fn latest_cache_key(canonical_name: &str, mode: LatestResolutionMode) -> String {
@@ -1172,6 +1202,67 @@ fn tool_update_cache_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_queries_upstream_even_when_cached_version_is_fresh() {
+        for mode in [LatestResolutionMode::Exact, LatestResolutionMode::Fast] {
+            let mut cache = ToolUpdateCacheState {
+                path: None,
+                data: ToolUpdateCacheFile {
+                    schema_version: TOOL_UPDATE_CACHE_SCHEMA_VERSION,
+                    latest_versions: HashMap::new(),
+                },
+                dirty: false,
+            };
+            let key = latest_cache_key("quayside", mode);
+            cache.put_latest(&key, "0.1.8".into(), 100);
+            let names = vec!["quayside".into()];
+            let cached = resolve_latest_checks(
+                &names,
+                mode,
+                LatestCachePolicy::PreferCached,
+                &mut cache,
+                101,
+                |_, _| panic!("listing should reuse fresh cache"),
+            );
+            assert!(
+                matches!(&cached.latest_by_name["quayside"], LatestCheck::Latest(v) if v == "0.1.8")
+            );
+
+            let refreshed = resolve_latest_checks(
+                &names,
+                mode,
+                LatestCachePolicy::Refresh,
+                &mut cache,
+                101,
+                |policies, actual_mode| {
+                    assert_eq!(actual_mode, mode);
+                    assert_eq!(policies.len(), 1);
+                    assert_eq!(policies[0].canonical_name, "quayside");
+                    HashMap::from([("quayside", LatestCheck::Latest("0.1.9".into()))])
+                },
+            );
+            assert!(
+                matches!(&refreshed.latest_by_name["quayside"], LatestCheck::Latest(v) if v == "0.1.9")
+            );
+            assert_eq!(
+                cache.get_latest_if_fresh(&key, 102).as_deref(),
+                Some("0.1.9")
+            );
+
+            let failed = resolve_latest_checks(
+                &names,
+                mode,
+                LatestCachePolicy::Refresh,
+                &mut cache,
+                102,
+                |_, _| HashMap::from([("quayside", LatestCheck::Error("timeout".into()))]),
+            );
+            assert!(
+                matches!(&failed.latest_by_name["quayside"], LatestCheck::Error(e) if e == "timeout")
+            );
+        }
+    }
 
     #[test]
     fn metadata_rows_keep_retries_and_results_separate() {

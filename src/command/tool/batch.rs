@@ -750,6 +750,7 @@ fn resolve_batch_latest_lookup(
     let lookup = resolve_latest_checks_for_names_with_mode(
         &unresolved_names,
         latest_resolution_mode_for_batch(specs, update_channel),
+        LatestCachePolicy::Refresh,
     )?;
     Ok(Some(lookup.latest_by_name))
 }
