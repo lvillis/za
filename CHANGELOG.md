@@ -1,8 +1,14 @@
+## [0.1.106] - 2026-11-17
+
+### ⚙️ Miscellaneous Tasks
+
+- *(ci)* Update
 ## [0.1.105] - 2026-11-17
 
 ### ⚙️ Miscellaneous Tasks
 
 - Update
+- Release za version 0.1.105
 ## [0.1.104] - 2026-09-30
 
 ### 🐛 Bug Fixes
