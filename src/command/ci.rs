@@ -298,7 +298,7 @@ impl GitHubClient {
         }
 
         let response = req
-            .send_response()
+            .send()
             .with_context(|| format!("request GitHub API `{path}`"))?;
         let status = response.status();
         if !status.is_success() {
@@ -345,7 +345,7 @@ impl GitHubClient {
         }
 
         let response = req
-            .send_response()
+            .send()
             .with_context(|| format!("request GitHub API `{path}`"))?;
         let status = response.status();
         if !status.is_success() {

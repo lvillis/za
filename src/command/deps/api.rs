@@ -444,7 +444,7 @@ impl ApiClient {
             req = req
                 .try_header("user-agent", HTTP_USER_AGENT)
                 .map_err(|err| AttemptError::Fatal(anyhow!("set user-agent header: {err}")))?;
-            let response = req.send_response().map_err(|err| {
+            let response = req.send().map_err(|err| {
                 AttemptError::Retryable(anyhow!("request crates.io API failed: {err}"))
             })?;
             let status = response.status();
@@ -545,7 +545,7 @@ impl ApiClient {
                     })?;
             }
 
-            let response = req.send_response().map_err(|err| {
+            let response = req.send().map_err(|err| {
                 AttemptError::Retryable(anyhow!("request GitHub API failed: {err}"))
             })?;
             let status = response.status();

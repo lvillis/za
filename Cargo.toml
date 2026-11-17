@@ -37,7 +37,7 @@ serde_json = { version = "1.0.154", default-features = false, features = ["std"]
 toml = { version = "1.2.1", default-features = false, features = ["parse", "serde", "display"] }
 graviola = { version = "0.4.5", default-features = false }
 
-reqx = { version = "0.2.7", default-features = false, features = ["blocking-tls-rustls-ring"] }
+reqx = { version = "0.2.16", default-features = false, features = ["blocking-tls-rustls-ring"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring"] }
 
 flate2 = { version = "1.1.11", default-features = false, features = ["rust_backend"] }

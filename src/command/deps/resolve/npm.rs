@@ -9,7 +9,7 @@ pub(super) fn resolve_npm(query: &NpmPackageQuery) -> Result<NpmResolution> {
         .context("set npm registry user-agent")?;
 
     let response = req
-        .send_response()
+        .send()
         .with_context(|| format!("request npm registry `{path}`"))?;
     let status = response.status();
     if !status.is_success() {

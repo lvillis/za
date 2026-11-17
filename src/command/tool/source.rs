@@ -1095,7 +1095,7 @@ fn fetch_github_json_with_client<T: DeserializeOwned>(
                     .context("set GitHub authorization header")?;
             }
 
-            let response = req.send_response().with_context(|| {
+            let response = req.send().with_context(|| {
                 format!("query {project_label} release metadata ({PROXY_HINT})")
             })?;
             let status = response.status();
@@ -1363,11 +1363,11 @@ fn retry_single_stream_after_parallel_failure(
     )
 }
 
-fn build_download_request<'a>(
-    client: &'a Client,
+fn build_download_request(
+    client: &Client,
     path_and_query: &str,
     range: Option<DownloadRange>,
-) -> Result<reqx::blocking::RequestBuilder<'a>> {
+) -> Result<reqx::blocking::RequestBuilder> {
     let mut req = client
         .get(path_and_query.to_string())
         .auto_accept_encoding(false);
@@ -1385,7 +1385,7 @@ fn build_download_request<'a>(
 fn probe_parallel_download_support(client: &Client, path_and_query: &str) -> Option<DownloadProbe> {
     let range = DownloadRange { start: 0, end: 0 };
     let req = build_download_request(client, path_and_query, Some(range)).ok()?;
-    let resp = req.send_response_stream().ok()?;
+    let resp = req.send_stream().ok()?;
     let status = resp.status();
     if status != 206 {
         return Some(DownloadProbe {
@@ -1479,7 +1479,7 @@ fn download_to_path_single_once(
 ) -> Result<()> {
     let req = build_download_request(client, path_and_query, None)?;
     let mut resp = req
-        .send_response_stream()
+        .send_stream()
         .with_context(|| format!("download from `{url}` ({PROXY_HINT})"))?;
     let status = resp.status();
     if !status.is_success() {
@@ -1753,7 +1753,7 @@ fn download_range_part(
         .map_err(ParallelDownloadError::Failed)?;
     let req = build_download_request(&client, path_and_query, Some(range))
         .map_err(ParallelDownloadError::Failed)?;
-    let mut resp = req.send_response_stream().map_err(|err| {
+    let mut resp = req.send_stream().map_err(|err| {
         ParallelDownloadError::Failed(anyhow!(err).context(format!(
             "download byte range {}-{} from `{}` ({PROXY_HINT})",
             range.start, range.end, path_and_query
@@ -2291,11 +2291,21 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_http_request(&mut stream);
             assert!(request.starts_with("GET /repos/old/repo/releases/latest "));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains(&format!("user-agent: {}", super::HTTP_USER_AGENT))
+            );
             write_http_response(&mut stream, 301, &[("Location", location)], b"", Some(0));
             drop(stream);
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_http_request(&mut stream);
             assert!(request.starts_with("GET /repositories/743011356/releases/latest "));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains(&format!("user-agent: {}", super::HTTP_USER_AGENT))
+            );
             assert!(
                 request
                     .to_ascii_lowercase()

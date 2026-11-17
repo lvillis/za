@@ -30,7 +30,7 @@ pub fn build_client(
     let mut builder = Client::builder(base_url)
         .profile(profile)
         .request_timeout(timeout)
-        .total_timeout(timeout)
+        .total_timeout(Some(timeout))
         .retry_policy(RetryPolicy::disabled())
         .client_name(client_name);
     if follow_redirects {
@@ -81,9 +81,7 @@ pub(crate) fn apply_proxy(
     if let Some(no_proxy) = no_proxy {
         let rules = split_no_proxy_rules(&no_proxy);
         if !rules.is_empty() {
-            builder = builder
-                .try_no_proxy(rules)
-                .context("invalid NO_PROXY rules")?;
+            builder = builder.no_proxy(rules).context("invalid NO_PROXY rules")?;
         }
     }
     Ok(builder)
