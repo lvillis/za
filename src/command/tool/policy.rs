@@ -22,7 +22,7 @@ const FD_GITHUB_TAG_PREFIX: &str = "v";
 const QUAYSIDE_GITHUB_OWNER: &str = "oksyd";
 const QUAYSIDE_GITHUB_REPO: &str = "quayside";
 const QUAYSIDE_GITHUB_TAG_PREFIX: &str = "";
-const TCPING_GITHUB_OWNER: &str = "lvillis";
+const TCPING_GITHUB_OWNER: &str = "oksyd";
 const TCPING_GITHUB_REPO: &str = "tcping-rs";
 const TCPING_GITHUB_TAG_PREFIX: &str = "";
 const MOTDYN_GITHUB_OWNER: &str = "lvillis";
@@ -680,11 +680,8 @@ pub(super) fn quayside_target(os: &str, arch: &str) -> Result<&'static str> {
     }
 }
 
-fn tcping_expected_asset_name(version: &str) -> Result<String> {
-    Ok(format!(
-        "tcping-{version}-{}.tar.gz",
-        tcping_target_triple()?
-    ))
+fn tcping_expected_asset_name(_version: &str) -> Result<String> {
+    Ok(format!("tcping-{}.tar.gz", tcping_target_triple()?))
 }
 
 fn motdyn_expected_asset_name(version: &str) -> Result<String> {

@@ -1912,3 +1912,22 @@ fn quayside_targets_match_published_platforms() {
         assert!(super::policy::quayside_target(os, arch).is_err());
     }
 }
+
+#[test]
+fn tcping_release_asset_name_does_not_include_version() {
+    let release = find_tool_policy("tcping").unwrap().github_release.unwrap();
+    assert_eq!((release.owner, release.repo), ("oksyd", "tcping-rs"));
+    let resolve = release.expected_asset_name.unwrap();
+    let target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "x86_64-unknown-linux-musl",
+        ("linux", "aarch64") => "aarch64-unknown-linux-musl",
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        _ => {
+            assert!(resolve("1.3.4").is_err());
+            return;
+        }
+    };
+    for version in ["1.3.4", "2.0.0"] {
+        assert_eq!(resolve(version).unwrap(), format!("tcping-{target}.tar.gz"));
+    }
+}
