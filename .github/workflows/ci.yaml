@@ -25,22 +25,27 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.3
+        uses: actions/checkout@v7.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        shell: bash
+        run: |
+          rust_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])')
+          export RUSTUP_TOOLCHAIN="$rust_version"
+          echo "RUSTUP_TOOLCHAIN=$rust_version" >> "$GITHUB_ENV"
+          rustup toolchain install "$rust_version" --profile minimal --component rustfmt --component clippy --no-self-update
+          rustc --version
+          cargo --version
 
       - name: Cache cargo artifacts
-        uses: actions/cache@v5.0.5
+        uses: actions/cache@v6.1.0
         continue-on-error: true
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
           restore-keys: |
             cargo-${{ runner.os }}-
 

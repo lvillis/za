@@ -106,7 +106,7 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             use-cross: true
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
             use-cross: false
           - os: windows-latest
@@ -115,7 +115,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 1
           ref: refs/tags/${{ needs.preflight.outputs.tag }}
@@ -129,19 +129,26 @@ jobs:
           echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+        shell: bash
+        env:
+          RUST_TARGET: ${{ matrix.target }}
+        run: |
+          rust_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])')
+          export RUSTUP_TOOLCHAIN="$rust_version"
+          echo "RUSTUP_TOOLCHAIN=$rust_version" >> "$GITHUB_ENV"
+          rustup toolchain install "$rust_version" --profile minimal --target "$RUST_TARGET" --no-self-update
+          rustc --version
+          cargo --version
 
       - name: Cache cargo artifacts
-        uses: actions/cache@v5.0.5
+        uses: actions/cache@v6.1.0
         continue-on-error: true
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
+          key: cargo-release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
           restore-keys: |
             cargo-release-${{ runner.os }}-${{ matrix.target }}-
             cargo-release-${{ runner.os }}-
@@ -173,7 +180,7 @@ jobs:
           if [ "${{ matrix.use-cross }}" = "true" ]; then
             cross build --release --locked --target ${{ matrix.target }}
           else
-            rustup run stable cargo build --release --locked --target ${{ matrix.target }}
+            cargo build --release --locked --target ${{ matrix.target }}
           fi
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             echo "BIN_NAME=${{ env.PROJECT }}.exe" >> "$GITHUB_ENV"
@@ -217,7 +224,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ matrix.target }}
           path: ${{ env.UPLOAD_PATHS }}
@@ -228,7 +235,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
           ref: refs/tags/${{ needs.preflight.outputs.tag }}
@@ -242,7 +249,7 @@ jobs:
           echo "PROJECT_VERSION=${VERSION}" >> "$GITHUB_ENV"
 
       - name: Download artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v8.0.2
         with:
           path: dist
 
@@ -251,14 +258,23 @@ jobs:
         run: |
           find dist -maxdepth 2 -type f -print0 | sort -z | xargs -0 sha256sum > dist/SHA256SUMS
 
+      - name: Install git-cliff
+        shell: bash
+        run: |
+          dir="$RUNNER_TEMP/git-cliff"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 --retry-delay 2 \
+            https://github.com/orhun/git-cliff/releases/download/v2.14.2/git-cliff-2.14.2-x86_64-unknown-linux-musl.tar.gz \
+            -o "$dir/git-cliff.tar.gz"
+          echo "fa21e2fc70046fcfd0e43e5e4613873ab799aff3d9dc8559c00d31b270e417d0  $dir/git-cliff.tar.gz" | sha256sum --check
+          tar -xzf "$dir/git-cliff.tar.gz" -C "$dir" --strip-components=1
+          echo "$dir" >> "$GITHUB_PATH"
+
       - name: Generate changelog
-        uses: orhun/git-cliff-action@v4
-        id: cliff
-        with:
-          config: cliff.toml
-          args: --latest --tag ${{ steps.version.outputs.VERSION }} --strip header
+        shell: bash
         env:
-          OUTPUT: RELEASE_NOTES.md
+          RELEASE_TAG: ${{ steps.version.outputs.VERSION }}
+        run: git-cliff --latest --tag "$RELEASE_TAG" --strip header --output RELEASE_NOTES.md
 
       - name: Compose release notes
         shell: bash
