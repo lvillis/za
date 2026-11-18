@@ -199,13 +199,10 @@ fn run_tool_batch_inner(input: ToolBatchRun<'_>) -> Result<()> {
         let resolved_spec = match resolve_batch_tool_spec(requested, latest_lookup.as_ref()) {
             Ok(spec) => spec,
             Err(err) => {
+                ensure_not_interrupted()?;
                 summary.failed += 1;
                 failed_tools.push(requested.name.clone());
-                let message = if compact_mode {
-                    summarize_tool_update_error(&err.to_string())
-                } else {
-                    err.to_string()
-                };
+                let message = format_batch_error(&err, compact_mode);
                 print_tool_stage("fail", format!("`{}` {message}", requested.name));
                 if total == 1 {
                     return Err(err);
@@ -229,6 +226,7 @@ fn run_tool_batch_inner(input: ToolBatchRun<'_>) -> Result<()> {
                     current,
                     target
                 );
+                ensure_not_interrupted()?;
                 summary.failed += 1;
                 failed_tools.push(requested.name.clone());
                 print_tool_stage("fail", format!("`{}` {err}", requested.name));
@@ -280,13 +278,10 @@ fn run_tool_batch_inner(input: ToolBatchRun<'_>) -> Result<()> {
                     });
                 }
                 Err(err) => {
+                    ensure_not_interrupted()?;
                     summary.failed += 1;
                     failed_tools.push(requested.name.clone());
-                    let message = if compact_mode {
-                        summarize_tool_update_error(&err.to_string())
-                    } else {
-                        err.to_string()
-                    };
+                    let message = format_batch_error(&err, compact_mode);
                     print_tool_stage("fail", format!("`{}` {message}", requested.name));
                 }
             }
@@ -298,13 +293,10 @@ fn run_tool_batch_inner(input: ToolBatchRun<'_>) -> Result<()> {
                 summary = summary.record(result.outcome);
             }
             Err(err) => {
+                ensure_not_interrupted()?;
                 summary.failed += 1;
                 failed_tools.push(requested.name.clone());
-                let message = if compact_mode {
-                    summarize_tool_update_error(&err.to_string())
-                } else {
-                    err.to_string()
-                };
+                let message = format_batch_error(&err, compact_mode);
                 print_tool_stage("fail", format!("`{}` {message}", requested.name));
                 if total == 1 {
                     return Err(err);
@@ -315,14 +307,11 @@ fn run_tool_batch_inner(input: ToolBatchRun<'_>) -> Result<()> {
 
     if parallel_materialize && !materialize_tasks.is_empty() {
         for result in materialize_tool_batch_parallel(home, kind, materialize_tasks) {
+            ensure_not_interrupted()?;
             if let Some(err) = result.error {
                 summary.failed += 1;
                 failed_tools.push(result.requested_name.clone());
-                let message = if compact_mode {
-                    summarize_tool_update_error(&err.to_string())
-                } else {
-                    err.to_string()
-                };
+                let message = format_batch_error(&err, compact_mode);
                 print_tool_stage("fail", format!("`{}` {message}", result.requested_name));
                 continue;
             }
@@ -342,21 +331,24 @@ fn run_tool_batch_inner(input: ToolBatchRun<'_>) -> Result<()> {
             match activate_install_plan(home, &plan, result.activate_options) {
                 Ok(()) => summary = summary.record(plan.planned_outcome),
                 Err(err) => {
+                    ensure_not_interrupted()?;
                     summary.failed += 1;
                     failed_tools.push(result.requested_name.clone());
-                    let message = if compact_mode {
-                        summarize_tool_update_error(&err.to_string())
-                    } else {
-                        err.to_string()
-                    };
+                    let message = format_batch_error(&err, compact_mode);
                     print_tool_stage("fail", format!("`{}` {message}", result.requested_name));
                 }
             }
         }
     }
 
+    ensure_not_interrupted()?;
     if batch_mode {
-        print_tool_stage("done", render_batch_summary(kind, summary, dry_run));
+        let stage = if summary.failed > 0 {
+            "summary"
+        } else {
+            "done"
+        };
+        print_tool_stage(stage, render_batch_summary(kind, summary, dry_run));
     }
 
     if failed_tools.is_empty() {
@@ -432,7 +424,7 @@ fn materialize_tool_batch_parallel(
             let progress_ui = progress_ui.clone();
             let progress_sink = progress_sink.clone();
             scope.spawn(move || {
-                loop {
+                while !is_interrupt_requested() {
                     let task = match queue.lock() {
                         Ok(mut guard) => guard.pop_front(),
                         Err(_) => None,
@@ -456,6 +448,9 @@ fn materialize_tool_batch_parallel(
                             progress_sink.clone(),
                         )
                     });
+                    if is_interrupt_requested() {
+                        break;
+                    }
                     let result = match materialized {
                         Ok(()) => {
                             if let Some(progress) = progress_ui.as_ref() {
@@ -929,8 +924,12 @@ fn tool_summary_token(count: usize, label: &str, tone: &str) -> String {
     }
 }
 
-fn summarize_tool_update_error(err: &str) -> String {
-    text_render::truncate_end(err, 160)
+fn format_batch_error(err: &anyhow::Error, compact: bool) -> String {
+    let chain = format!("{err:#}");
+    if compact && chain.chars().count() > 160 {
+        return text_render::truncate_end(&err.root_cause().to_string(), 160);
+    }
+    chain
 }
 
 pub(super) fn normalize_requested_tool_names(names: &[String]) -> Result<Vec<String>> {

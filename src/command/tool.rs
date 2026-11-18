@@ -4,6 +4,7 @@ mod batch;
 mod doctor;
 mod integrations;
 mod listing;
+mod network;
 mod policy;
 mod source;
 mod state;
@@ -26,7 +27,7 @@ use std::{
     process::Command,
     sync::{
         Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -89,15 +90,17 @@ static VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bv?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z\.-]+)?)\b")
         .expect("version regex compiles")
 });
-static INTERRUPT_REQUESTED: LazyLock<Arc<AtomicBool>> =
-    LazyLock::new(|| Arc::new(AtomicBool::new(false)));
+const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+static INTERRUPT_SIGNAL: LazyLock<Arc<AtomicUsize>> =
+    LazyLock::new(|| Arc::new(AtomicUsize::new(0)));
 static SIGNAL_HANDLER_REGISTRATION: LazyLock<Result<(), String>> = LazyLock::new(|| {
-    signal_flag::register(SIGINT, Arc::clone(&INTERRUPT_REQUESTED))
+    signal_flag::register_usize(SIGINT, Arc::clone(&INTERRUPT_SIGNAL), SIGINT as usize)
         .map_err(|err| format!("register SIGINT handler: {err}"))?;
     #[cfg(unix)]
-    signal_flag::register(
+    signal_flag::register_usize(
         signal_hook::consts::signal::SIGTERM,
-        Arc::clone(&INTERRUPT_REQUESTED),
+        Arc::clone(&INTERRUPT_SIGNAL),
+        signal_hook::consts::signal::SIGTERM as usize,
     )
     .map_err(|err| format!("register SIGTERM handler: {err}"))?;
     Ok(())
@@ -107,7 +110,6 @@ fn prepare_interruptible_tool_operation() -> Result<()> {
     if let Err(err) = &*SIGNAL_HANDLER_REGISTRATION {
         bail!("failed to initialize interrupt handlers: {err}");
     }
-    INTERRUPT_REQUESTED.store(false, Ordering::SeqCst);
     let removed = source::cleanup_stale_temp_dirs();
     if removed > 0 {
         eprintln!("🧹 Cleaned {removed} stale temp dir(s) from previous interrupted runs");
@@ -144,6 +146,7 @@ fn tool_stage_icon(stage: &str) -> &'static str {
         "prune" => "🧹",
         "next" => "ℹ️",
         "done" => "✅",
+        "summary" => "⚠️",
         "fail" => "❌",
         _ => "•",
     }
@@ -153,7 +156,7 @@ fn style_tool_stage_token(stage: &str, value: &str) -> String {
     match stage {
         "done" | "activate" => tty_style::success(value),
         "update" | "install" | "sync" => tty_style::active(value),
-        "repair" => tty_style::warning(value),
+        "repair" | "summary" => tty_style::warning(value),
         "fail" => tty_style::error(value),
         _ => tty_style::dim(value),
     }
@@ -228,7 +231,7 @@ fn install_source_failure_guidance(err: &anyhow::Error) -> Option<&'static str> 
 }
 
 pub(super) fn is_interrupt_requested() -> bool {
-    INTERRUPT_REQUESTED.load(Ordering::SeqCst)
+    INTERRUPT_SIGNAL.load(Ordering::SeqCst) != 0
 }
 
 pub(super) fn ensure_not_interrupted() -> Result<()> {
@@ -395,9 +398,22 @@ fn run_ls_command(
     list_installed(home, json)
 }
 
-pub fn run(cmd: ToolCommands, scope_request: ToolScopeRequest) -> Result<i32> {
+fn interruptible_command(action: impl FnOnce() -> Result<i32>) -> Result<i32> {
     prepare_interruptible_tool_operation()?;
+    let result = action();
+    let signal = INTERRUPT_SIGNAL.load(Ordering::SeqCst);
+    if signal != 0 {
+        eprintln!("Interrupted");
+        return Ok(128 + signal as i32);
+    }
+    result
+}
 
+pub fn run(cmd: ToolCommands, scope_request: ToolScopeRequest) -> Result<i32> {
+    interruptible_command(|| run_tool_command(cmd, scope_request))
+}
+
+fn run_tool_command(cmd: ToolCommands, scope_request: ToolScopeRequest) -> Result<i32> {
     let home = ToolHome::detect(scope_request)?;
     cleanup_legacy_current_dir_artifacts(&home)?;
 
@@ -1151,8 +1167,17 @@ impl ToolLock {
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("open lock file {}", lock_path.display()))?;
-        file.lock()
-            .with_context(|| format!("acquire lock {}", lock_path.display()))?;
+        loop {
+            ensure_not_interrupted()?;
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) => thread::sleep(INTERRUPT_POLL_INTERVAL),
+                Err(fs::TryLockError::Error(err)) => {
+                    return Err(err)
+                        .with_context(|| format!("acquire lock {}", lock_path.display()));
+                }
+            }
+        }
         Ok(Self { _file: file })
     }
 }

@@ -26,6 +26,9 @@ const DOWNLOAD_READ_CHUNK_SIZE: usize = 64 * 1024;
 const PARALLEL_DOWNLOAD_MIN_BYTES: u64 = 2 * 1024 * 1024;
 const PARALLEL_DOWNLOAD_MIN_PART_BYTES: u64 = 1024 * 1024;
 const PARALLEL_DOWNLOAD_MAX_PARTS: usize = 4;
+// Each range request has its own timeout. Bound the bytes covered by that deadline.
+const RANGE_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
+const SINGLE_STREAM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS: usize = 3;
 const HTTP_TRANSIENT_RETRY_BASE_DELAY_MS: u64 = 200;
 const GITHUB_RELEASE_SCAN_PER_PAGE: usize = 30;
@@ -893,6 +896,7 @@ where
         match operation() {
             Ok(value) => return Ok(value),
             Err(err) => {
+                ensure_not_interrupted()?;
                 if attempt >= HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS || !is_retryable_http_error(&err) {
                     return Err(err);
                 }
@@ -916,11 +920,20 @@ where
                         ),
                     );
                 }
-                thread::sleep(transient_http_retry_backoff(attempt));
+                wait_before_http_retry(attempt)?;
             }
         }
     }
     unreachable!("retry loop must return on success or terminal failure")
+}
+
+fn wait_before_http_retry(attempt: usize) -> Result<()> {
+    let until = Instant::now() + transient_http_retry_backoff(attempt);
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        ensure_not_interrupted()?;
+        thread::sleep(left.min(INTERRUPT_POLL_INTERVAL));
+    }
+    Ok(())
 }
 
 fn transient_http_retry_backoff(attempt: usize) -> Duration {
@@ -1095,7 +1108,7 @@ fn fetch_github_json_with_client<T: DeserializeOwned>(
                     .context("set GitHub authorization header")?;
             }
 
-            let response = req.send().with_context(|| {
+            let response = network::wait_for(move || req.send()).with_context(|| {
                 format!("query {project_label} release metadata ({PROXY_HINT})")
             })?;
             let status = response.status();
@@ -1258,23 +1271,7 @@ fn download_from_url(
                         feedback,
                     )?;
                 }
-                Err(ParallelDownloadError::Failed(err)) => {
-                    retry_single_stream_after_parallel_failure(
-                        interactive,
-                        format!(
-                            "parallel transfer interrupted for `{asset_name}` after {}; falling back to single stream",
-                            summarize_retryable_error(&err)
-                        ),
-                        SingleStreamDownload {
-                            client: &client,
-                            path_and_query: &url_parts.path_and_query,
-                            url,
-                            asset_path: &asset_path,
-                            total_bytes,
-                        },
-                        feedback,
-                    )?;
-                }
+                Err(ParallelDownloadError::Failed(err)) => return Err(err),
             }
         } else {
             if feedback.is_detailed() {
@@ -1347,7 +1344,7 @@ fn retry_single_stream_after_parallel_failure(
     if interactive {
         finish_download_tty_line();
     }
-    if feedback.shows_progress() {
+    if !report_retry(reason.clone()) && feedback.shows_progress() {
         print_download_stage(interactive, "download", reason);
     }
     if feedback.is_detailed() {
@@ -1385,7 +1382,7 @@ fn build_download_request(
 fn probe_parallel_download_support(client: &Client, path_and_query: &str) -> Option<DownloadProbe> {
     let range = DownloadRange { start: 0, end: 0 };
     let req = build_download_request(client, path_and_query, Some(range)).ok()?;
-    let resp = req.send_stream().ok()?;
+    let resp = network::wait_for(move || req.send_stream()).ok()?;
     let status = resp.status();
     if status != 206 {
         return Some(DownloadProbe {
@@ -1477,14 +1474,14 @@ fn download_to_path_single_once(
     known_total_bytes: Option<u64>,
     feedback: DownloadFeedback<'_>,
 ) -> Result<()> {
-    let req = build_download_request(client, path_and_query, None)?;
-    let mut resp = req
-        .send_stream()
+    let req = build_download_request(client, path_and_query, None)?
+        .request_timeout(SINGLE_STREAM_TIMEOUT)
+        .total_timeout(Some(SINGLE_STREAM_TIMEOUT));
+    let resp = network::wait_for(move || req.send_stream())
         .with_context(|| format!("download from `{url}` ({PROXY_HINT})"))?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp
-            .into_text_lossy_limited(16 * 1024)
+        let body = network::wait_for(move || resp.into_text_lossy_limited(16 * 1024))
             .unwrap_or_else(|_| "<body unavailable>".to_string());
         bail!(
             "download from `{url}` failed: status {} body {}",
@@ -1501,7 +1498,6 @@ fn download_to_path_single_once(
 
     let mut out = File::create(asset_path)
         .with_context(|| format!("create downloaded file {}", asset_path.display()))?;
-    let mut chunk = [0_u8; DOWNLOAD_READ_CHUNK_SIZE];
     let mut downloaded = 0_u64;
     let start = Instant::now();
     let mut last_report = Instant::now();
@@ -1524,17 +1520,14 @@ fn download_to_path_single_once(
         );
         let _ = io::stderr().flush();
     }
-    loop {
-        ensure_not_interrupted()?;
-        let read = resp
-            .read_chunk(&mut chunk)
-            .with_context(|| format!("read bytes from `{url}`"))?;
-        if read == 0 {
-            break;
-        }
-        out.write_all(&chunk[..read])
+    let chunks = network::chunks(resp, DOWNLOAD_READ_CHUNK_SIZE);
+    while let Some(bytes) = chunks
+        .next_chunk()
+        .with_context(|| format!("read bytes from `{url}`"))?
+    {
+        out.write_all(&bytes)
             .with_context(|| format!("write downloaded file {}", asset_path.display()))?;
-        downloaded = downloaded.saturating_add(read as u64);
+        downloaded = downloaded.saturating_add(bytes.len() as u64);
         if track_progress {
             report_download_progress(
                 &mut last_report,
@@ -1632,7 +1625,11 @@ fn download_to_path_parallel(
                     range,
                     &part_path,
                     proxy_scope,
-                    progress,
+                    RangeTransfer {
+                        progress: &progress,
+                        stop: &reporter_stop,
+                        total_bytes: plan.total_bytes,
+                    },
                 );
                 if result.is_err() {
                     reporter_stop.store(true, Ordering::SeqCst);
@@ -1643,26 +1640,20 @@ fn download_to_path_parallel(
         .collect::<Vec<_>>();
 
     let mut ordered_parts = vec![PathBuf::new(); part_paths.len()];
+    let mut failure = None;
     for handle in handles {
         match handle.join() {
             Ok(Ok((index, part_path))) => ordered_parts[index] = part_path,
             Ok(Err(err)) => {
-                reporter_stop.store(true, Ordering::SeqCst);
-                if let Some(reporter) = reporter.take() {
-                    let _ = reporter.join();
-                }
-                cleanup_parallel_part_files(&part_paths);
-                return Err(err);
+                failure.get_or_insert(err);
             }
             Err(_) => {
                 reporter_stop.store(true, Ordering::SeqCst);
-                if let Some(reporter) = reporter.take() {
-                    let _ = reporter.join();
-                }
-                cleanup_parallel_part_files(&part_paths);
-                return Err(ParallelDownloadError::Failed(anyhow!(
-                    "parallel download worker panicked for `{url}`"
-                )));
+                failure.get_or_insert_with(|| {
+                    ParallelDownloadError::Failed(anyhow!(
+                        "parallel download worker panicked for `{url}`"
+                    ))
+                });
             }
         }
     }
@@ -1670,6 +1661,10 @@ fn download_to_path_parallel(
     reporter_stop.store(true, Ordering::SeqCst);
     if let Some(reporter) = reporter.take() {
         let _ = reporter.join();
+    }
+    if let Some(err) = failure {
+        cleanup_parallel_part_files(&part_paths);
+        return Err(err);
     }
     if track_progress {
         let mut last_report = Instant::now();
@@ -1740,60 +1735,109 @@ fn spawn_parallel_download_reporter(
     })
 }
 
+struct RangeTransfer<'a> {
+    progress: &'a AtomicU64,
+    stop: &'a AtomicBool,
+    total_bytes: u64,
+}
+
 fn download_range_part(
     base_url: &str,
     path_and_query: &str,
     range: DownloadRange,
     part_path: &Path,
     proxy_scope: za_config::ProxyScope,
-    progress: Arc<AtomicU64>,
+    transfer: RangeTransfer<'_>,
 ) -> Result<(), ParallelDownloadError> {
-    ensure_not_interrupted().map_err(ParallelDownloadError::Failed)?;
     let client = build_http_client(base_url, "za-tool-manager", true, proxy_scope)
         .map_err(ParallelDownloadError::Failed)?;
-    let req = build_download_request(&client, path_and_query, Some(range))
-        .map_err(ParallelDownloadError::Failed)?;
-    let mut resp = req.send_stream().map_err(|err| {
-        ParallelDownloadError::Failed(anyhow!(err).context(format!(
-            "download byte range {}-{} from `{}` ({PROXY_HINT})",
-            range.start, range.end, path_and_query
-        )))
-    })?;
-    if resp.status() != 206 {
-        return Err(ParallelDownloadError::Unsupported);
-    }
-
     let mut out = File::create(part_path)
         .with_context(|| format!("create partial file {}", part_path.display()))
         .map_err(ParallelDownloadError::Failed)?;
-    let mut chunk = [0_u8; DOWNLOAD_READ_CHUNK_SIZE];
-    let mut written = 0_u64;
-    let expected = range.end.saturating_sub(range.start).saturating_add(1);
-    loop {
-        ensure_not_interrupted().map_err(ParallelDownloadError::Failed)?;
-        let read = resp
-            .read_chunk(&mut chunk)
-            .with_context(|| {
-                format!(
-                    "read partial bytes {}-{} from `{}`",
-                    range.start, range.end, path_and_query
-                )
-            })
-            .map_err(ParallelDownloadError::Failed)?;
-        if read == 0 {
-            break;
+    let mut next = range.start;
+    while next <= range.end && !transfer.stop.load(Ordering::Relaxed) {
+        let end = next.saturating_add(RANGE_REQUEST_BYTES - 1).min(range.end);
+        for attempt in 1..=HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS {
+            ensure_not_interrupted().map_err(ParallelDownloadError::Failed)?;
+            if transfer.stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            match read_range_to_file(&client, path_and_query, &mut next, end, &mut out, &transfer) {
+                Err(ParallelDownloadError::Failed(err))
+                    if next <= end
+                        && attempt < HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS
+                        && is_retryable_http_error(&err) =>
+                {
+                    wait_before_http_retry(attempt).map_err(ParallelDownloadError::Failed)?;
+                }
+                result => {
+                    result?;
+                    break;
+                }
+            }
         }
-        out.write_all(&chunk[..read])
-            .with_context(|| format!("write partial file {}", part_path.display()))
-            .map_err(ParallelDownloadError::Failed)?;
-        written = written.saturating_add(read as u64);
-        progress.fetch_add(read as u64, Ordering::Relaxed);
     }
     out.flush()
-        .with_context(|| format!("flush partial file {}", part_path.display()))
+        .context("flush downloaded range")
+        .map_err(ParallelDownloadError::Failed)
+}
+
+fn read_range_to_file(
+    client: &Client,
+    path: &str,
+    next: &mut u64,
+    end: u64,
+    out: &mut File,
+    transfer: &RangeTransfer<'_>,
+) -> Result<(), ParallelDownloadError> {
+    let range = DownloadRange { start: *next, end };
+    let req =
+        build_download_request(client, path, Some(range)).map_err(ParallelDownloadError::Failed)?;
+    let resp = network::wait_for(move || req.send_stream())
+        .with_context(|| format!("fetch bytes {}-{end} from {path}", range.start))
         .map_err(ParallelDownloadError::Failed)?;
-    if written != expected {
+    if resp.status() == 200 || resp.status() == 416 {
         return Err(ParallelDownloadError::Unsupported);
+    }
+    if resp.status() != 206 {
+        return Err(ParallelDownloadError::Failed(anyhow!(
+            "range request to {path} returned HTTP {}",
+            resp.status()
+        )));
+    }
+    let expected = format!("bytes {}-{end}/{}", range.start, transfer.total_bytes);
+    if resp
+        .headers()
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        != Some(expected.as_str())
+    {
+        return Err(ParallelDownloadError::Unsupported);
+    }
+    let chunks = network::chunks(resp, DOWNLOAD_READ_CHUNK_SIZE);
+    while *next <= end && !transfer.stop.load(Ordering::Relaxed) {
+        let bytes = chunks
+            .next_chunk()
+            .with_context(|| format!("read bytes {}-{end} from {path}", *next))
+            .map_err(ParallelDownloadError::Failed)?
+            .ok_or_else(|| {
+                ParallelDownloadError::Failed(
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("range ended before byte {end}"),
+                    )
+                    .into(),
+                )
+            })?;
+        let n = bytes.len();
+        if n as u64 > end - *next + 1 {
+            return Err(ParallelDownloadError::Unsupported);
+        }
+        out.write_all(&bytes)
+            .context("write downloaded range")
+            .map_err(ParallelDownloadError::Failed)?;
+        *next += n as u64;
+        transfer.progress.fetch_add(n as u64, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -2639,33 +2683,77 @@ mod tests {
     }
 
     #[test]
-    fn download_from_url_falls_back_to_single_stream_after_parallel_read_failure() {
-        let payload = Arc::new(vec![b'z'; 2_400_000]);
+    fn download_from_url_resumes_interrupted_range() {
+        check_range_download(false);
+    }
+
+    #[test]
+    fn download_from_url_falls_back_when_server_ignores_range_after_probe() {
+        check_range_download(true);
+    }
+
+    fn check_range_download(ignore_range: bool) {
+        let size = if ignore_range {
+            2_400_000
+        } else {
+            super::RANGE_REQUEST_BYTES as usize * 4 + 16
+        };
+        let payload = Arc::new((0..size).map(|n| (n % 251) as u8).collect::<Vec<_>>());
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test listener");
         listener
             .set_nonblocking(true)
             .expect("configure nonblocking listener");
         let addr = listener.local_addr().expect("listener addr");
         let stop = Arc::new(AtomicBool::new(false));
-        let failed_once = Arc::new(AtomicBool::new(false));
         let server_payload = Arc::clone(&payload);
         let server_stop = Arc::clone(&stop);
-        let server_failed_once = Arc::clone(&failed_once);
 
         let server = thread::spawn(move || {
+            let mut interrupted = None;
+            let mut resumed = false;
+            let mut full_requests = 0;
             while !server_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((stream, _)) => handle_test_download_request(
-                        stream,
-                        Arc::clone(&server_payload),
-                        Arc::clone(&server_failed_once),
-                    ),
+                    Ok((mut stream, _)) => {
+                        let request = read_http_request(&mut stream);
+                        let Some((start, end)) = parse_http_range_header(&request) else {
+                            assert!(ignore_range);
+                            full_requests += 1;
+                            write_http_response(&mut stream, 200, &[], &server_payload, Some(size));
+                            continue;
+                        };
+                        if ignore_range && start != end {
+                            write_http_response(&mut stream, 200, &[], b"", Some(0));
+                            continue;
+                        }
+                        let body = &server_payload[start as usize..=end as usize];
+                        assert!(body.len() <= super::RANGE_REQUEST_BYTES as usize);
+                        let mut bytes = body;
+                        if start != end && interrupted.is_none() {
+                            bytes = &body[..body.len() / 2];
+                            interrupted = Some((start + bytes.len() as u64, end));
+                        } else if let Some((offset, failed_end)) = interrupted
+                            && end == failed_end
+                        {
+                            assert_eq!(start, offset);
+                            resumed = true;
+                        }
+                        write_http_response(
+                            &mut stream,
+                            206,
+                            &[("Content-Range", format!("bytes {start}-{end}/{size}"))],
+                            bytes,
+                            Some(body.len()),
+                        );
+                    }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
                     }
                     Err(_) => break,
                 }
             }
+            assert_eq!(full_requests, usize::from(ignore_range));
+            assert_eq!(resumed, !ignore_range);
         });
 
         let url = format!("http://127.0.0.1:{}/artifact.tar.gz", addr.port());
@@ -2676,9 +2764,9 @@ mod tests {
             DownloadExtractionMode::KeepArchive,
             DownloadFeedback::new(DownloadDisplay::Detailed, None),
         )
-        .expect("download succeeds after single-stream fallback");
+        .expect("download succeeds");
         let downloaded = std::fs::read(&pull.path).expect("read downloaded asset");
-        assert_eq!(downloaded, *payload);
+        assert!(downloaded == *payload);
 
         drop(pull);
         stop.store(true, Ordering::SeqCst);
@@ -2720,65 +2808,6 @@ mod tests {
                 payload.as_slice(),
                 Some(payload.len()),
             );
-        }
-    }
-
-    fn handle_test_download_request(
-        mut stream: TcpStream,
-        payload: Arc<Vec<u8>>,
-        failed_once: Arc<AtomicBool>,
-    ) {
-        let request = read_http_request(&mut stream);
-        let range = parse_http_range_header(&request);
-        match range {
-            Some((0, 0)) => {
-                write_http_response(
-                    &mut stream,
-                    206,
-                    &[("Content-Range", format!("bytes 0-0/{}", payload.len()))],
-                    &payload[..1],
-                    Some(1),
-                );
-            }
-            Some((start, end)) => {
-                let start = start as usize;
-                let end = end as usize;
-                let body = &payload[start..=end];
-                if !failed_once.swap(true, Ordering::SeqCst) {
-                    let truncated_len = body.len() / 2;
-                    write_http_response(
-                        &mut stream,
-                        206,
-                        &[(
-                            "Content-Range",
-                            format!("bytes {start}-{end}/{}", payload.len()),
-                        )],
-                        &body[..truncated_len],
-                        Some(body.len()),
-                    );
-                    let _ = stream.shutdown(Shutdown::Both);
-                } else {
-                    write_http_response(
-                        &mut stream,
-                        206,
-                        &[(
-                            "Content-Range",
-                            format!("bytes {start}-{end}/{}", payload.len()),
-                        )],
-                        body,
-                        Some(body.len()),
-                    );
-                }
-            }
-            None => {
-                write_http_response(
-                    &mut stream,
-                    200,
-                    &[],
-                    payload.as_slice(),
-                    Some(payload.len()),
-                );
-            }
         }
     }
 

@@ -936,6 +936,7 @@ pub(super) fn resolve_latest_checks_for_names_with_mode(
         now_unix_secs,
         fetch_latest_checks_parallel,
     );
+    ensure_not_interrupted()?;
     if let Err(err) = cache.save_if_dirty()
         && !is_permission_denied_error(&err)
     {
@@ -1020,10 +1021,10 @@ fn latest_cache_key(canonical_name: &str, mode: LatestResolutionMode) -> String 
 }
 
 struct LatestProgressUi {
-    _multi: MultiProgress,
+    multi: MultiProgress,
     header: ProgressBar,
     rows: HashMap<&'static str, ProgressBar>,
-    completed: Mutex<usize>,
+    remaining: Mutex<Vec<&'static str>>,
 }
 
 impl LatestProgressUi {
@@ -1041,7 +1042,7 @@ impl LatestProgressUi {
         let multi = MultiProgress::with_draw_target(target);
         let header = multi.add(ProgressBar::new(policies.len() as u64));
         header.set_style(
-            ProgressStyle::with_template("[+] Checking tools {pos}/{len}")
+            ProgressStyle::with_template("[+] Checking tools {pos}/{len} [{elapsed}] {wide_msg}")
                 .expect("header template"),
         );
         let mut rows = HashMap::new();
@@ -1056,11 +1057,17 @@ impl LatestProgressUi {
             row.set_message("waiting");
             rows.insert(policy.canonical_name, row);
         }
+        let remaining: Vec<_> = policies
+            .iter()
+            .map(|policy| policy.canonical_name)
+            .collect();
+        header.set_message(remaining_tools_message(&remaining));
+        header.enable_steady_tick(Duration::from_secs(1));
         Self {
-            _multi: multi,
+            multi,
             header,
             rows,
-            completed: Mutex::new(0),
+            remaining: Mutex::new(remaining),
         }
     }
 
@@ -1089,14 +1096,33 @@ impl LatestProgressUi {
             );
             row.finish_with_message(message);
         }
-        if let Ok(mut completed) = self.completed.lock() {
-            *completed += 1;
-            self.header.set_position(*completed as u64);
+        if let Ok(mut remaining) = self.remaining.lock() {
+            remaining.retain(|&tool| tool != name);
+            self.header.set_message(remaining_tools_message(&remaining));
+            self.header
+                .set_position((self.rows.len() - remaining.len()) as u64);
         }
     }
 
     fn finish_all(&self) {
-        self.header.finish();
+        self.header.disable_steady_tick();
+        if is_interrupt_requested() {
+            for row in self.rows.values() {
+                row.disable_steady_tick();
+            }
+            let _ = self.multi.clear();
+            self.multi.set_draw_target(ProgressDrawTarget::hidden());
+        } else {
+            self.header.finish();
+        }
+    }
+}
+
+fn remaining_tools_message(remaining: &[&str]) -> String {
+    if (1..=3).contains(&remaining.len()) {
+        format!("waiting for {}", remaining.join(", "))
+    } else {
+        String::new()
     }
 }
 
@@ -1115,7 +1141,7 @@ fn fetch_latest_checks_parallel(
             let out = Arc::clone(&out);
             let progress = progress.clone();
             scope.spawn(move || {
-                loop {
+                while !is_interrupt_requested() {
                     let task = match queue.lock() {
                         Ok(mut guard) => guard.pop_front(),
                         Err(_) => None,
@@ -1132,6 +1158,9 @@ fn fetch_latest_checks_parallel(
                     let latest = source::with_retry_reporter(reporter, || {
                         resolve_latest_for_policy(policy, mode)
                     });
+                    if is_interrupt_requested() {
+                        break;
+                    }
                     if let Some(ui) = &progress {
                         ui.finish(policy.canonical_name, &latest);
                     }
@@ -1278,6 +1307,7 @@ mod tests {
         assert_eq!(ui.rows["fd"].message(), "checking");
         ui.finish("fd", &LatestCheck::Latest("10.5.0".into()));
         assert_eq!(ui.header.position(), 1);
+        assert_eq!(ui.header.message(), "waiting for codex");
         assert_eq!(ui.rows["fd"].message(), "latest 10.5.0");
         assert!(ui.rows["fd"].is_finished());
         assert!(!ui.rows["codex"].is_finished());
@@ -1285,6 +1315,7 @@ mod tests {
         ui.finish_all();
         assert_eq!(ui.header.position(), 2);
         assert!(ui.header.is_finished());
+        assert!(ui.header.message().is_empty());
         assert_eq!(ui.rows["codex"].message(), "check failed");
     }
 
