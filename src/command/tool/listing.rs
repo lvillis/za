@@ -358,13 +358,13 @@ pub(super) fn list_outdated(
 
     if fail_on_check_errors && !report.check_failures.is_empty() {
         eprintln!(
-            "`za tool outdated` policy failed: {} update check(s) failed",
+            "`za tool ls --outdated` policy failed: {} update check(s) failed",
             report.check_failures.len()
         );
         return Ok(TOOL_EXIT_UPDATE_CHECK_FAILED);
     }
     if fail_on_updates && report.has_updates {
-        eprintln!("`za tool outdated` policy failed: updates are available");
+        eprintln!("`za tool ls --outdated` policy failed: updates are available");
         return Ok(TOOL_EXIT_UPDATES_AVAILABLE);
     }
     Ok(0)
@@ -863,7 +863,7 @@ fn print_outdated_json(report: &OutdatedReport) -> Result<()> {
         has_updates: report.has_updates,
         has_check_failures: !report.check_failures.is_empty(),
     };
-    print_json(&json, "serialize tool outdated JSON")?;
+    print_json(&json, "serialize outdated tool list")?;
     Ok(())
 }
 

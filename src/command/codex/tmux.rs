@@ -1,4 +1,6 @@
 use super::*;
+use std::process::Stdio;
+use tokei::LanguageType;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -23,8 +25,7 @@ const TMUX_CODEX_STATUS_WIDTH: usize = 72;
 const TMUX_CODEX_PRIMARY_WINDOW_NAME: &str = "work";
 const TMUX_CODEX_SERVER_BOOTSTRAP_PREFIX: &str = "codex-server-bootstrap";
 const TMUX_CODEX_SERVER_BOOTSTRAP_COMMAND: &str = "sleep 60";
-const TMUX_CODEX_STATUS_HELPER_SCRIPT: &str = r#"#!/bin/sh
-root=$1
+const TMUX_CODEX_STATUS_HELPER_SCRIPT: &str = r#"root=$1
 cache=$2
 ttl=${3:-60}
 
@@ -33,39 +34,12 @@ count_diff() {
     awk 'BEGIN { a = 0; d = 0 } $1 ~ /^[0-9]+$/ { a += $1 } $2 ~ /^[0-9]+$/ { d += $2 } END { printf "+%d -%d", a, d }'
 }
 
-count_lines() {
-  git -C "$root" ls-files -co --exclude-standard -z -- "$@" 2>/dev/null |
-    xargs -0 -r wc -l 2>/dev/null |
-    awk '$1 ~ /^[0-9]+$/ && $2 != "total" { s += $1 } END { print s + 0 }'
-}
-
-count_tokei_loc() {
-  command -v tokei >/dev/null 2>&1 || return 1
-  command -v jq >/dev/null 2>&1 || return 1
-  tokei --output json "$root" 2>/dev/null | jq -r '
-    . as $data
-    | def code($name): ($data[$name].code // 0);
-      [
-        code("Total"),
-        code("Rust"),
-        (
-          [
-            "Astro",
-            "CSS",
-            "HTML",
-            "JSX",
-            "JavaScript",
-            "LESS",
-            "Sass",
-            "Svelte",
-            "SVG",
-            "TSX",
-            "TypeScript",
-            "Vue"
-          ] | map(code(.)) | add
-        )
-      ] | @tsv
-  ' 2>/dev/null
+compute_loc() {
+  counts=$(cd "$root" && "$za" codex __tmux-loc 2>/dev/null) || return 1
+  set -- $counts
+  [ "$#" -eq 3 ] || return 1
+  all=$1 rust=$2 web=$3
+  write_loc_cache || true
 }
 
 cargo_metadata_value() {
@@ -163,7 +137,8 @@ compact_count() {
 
 read_cached_loc() {
   [ -n "$cache" ] && [ -r "$cache" ] || return 1
-  IFS=' ' read -r cached_at all rust web < "$cache" || return 1
+  IFS=' ' read -r source cached_at all rust web < "$cache" || return 1
+  [ "$source" = tokei ] || return 1
   case "$cached_at" in ''|*[!0-9]*) return 1 ;; esac
   case "$all" in ''|*[!0-9]*) return 1 ;; esac
   case "$rust" in ''|*[!0-9]*) return 1 ;; esac
@@ -180,35 +155,8 @@ write_loc_cache() {
   [ "$dir" != "$cache" ] || return 0
   mkdir -p "$dir" 2>/dev/null || return 0
   tmp="$cache.$$"
-  printf '%s %s %s %s\n' "$now" "$all" "$rust" "$web" > "$tmp" 2>/dev/null &&
+  printf 'tokei %s %s %s %s\n' "$now" "$all" "$rust" "$web" > "$tmp" 2>/dev/null &&
     mv -f "$tmp" "$cache" 2>/dev/null
-}
-
-compute_fallback_loc() {
-  all=$(count_lines \
-    '*.rs' '*.c' '*.h' '*.hpp' '*.cpp' '*.cc' '*.cxx' \
-    '*.go' '*.py' '*.java' '*.kt' '*.kts' '*.swift' '*.scala' \
-    '*.rb' '*.php' '*.ex' '*.exs' '*.erl' '*.hrl' \
-    '*.js' '*.jsx' '*.ts' '*.tsx' '*.mjs' '*.cjs' '*.mts' '*.cts' \
-    '*.vue' '*.svelte' '*.astro' '*.css' '*.scss' '*.sass' '*.less' '*.html' \
-    '*.sh' '*.bash' '*.zsh' '*.fish' '*.sql' '*.proto')
-  rust=$(count_lines '*.rs')
-  web=$(count_lines \
-    '*.js' '*.jsx' '*.ts' '*.tsx' '*.mjs' '*.cjs' '*.mts' '*.cts' \
-    '*.vue' '*.svelte' '*.astro' '*.css' '*.scss' '*.sass' '*.less' '*.html' \
-    '*.svg')
-}
-
-compute_loc() {
-  if loc=$(count_tokei_loc); then
-    set -- $loc
-    all=${1:-0}
-    rust=${2:-0}
-    web=${3:-0}
-  else
-    compute_fallback_loc
-  fi
-  write_loc_cache
 }
 
 now=$(date +%s 2>/dev/null || printf '0')
@@ -217,17 +165,91 @@ case "$ttl" in ''|*[!0-9]*) ttl=60 ;; esac
 metadata=$(build_rust_metadata)
 diff=$(count_diff)
 
-if ! read_cached_loc; then
-  compute_loc
+printf '%s[diff %s]' "$metadata" "$diff"
+if read_cached_loc || compute_loc; then
+  printf '  loc %s | rust %s | web %s' "$(compact_count "$all")" "$(compact_count "$rust")" "$(compact_count "$web")"
 fi
-
-printf '%s[diff %s]  loc %s | rust %s | web %s\n' "$metadata" "$diff" "$(compact_count "$all")" "$(compact_count "$rust")" "$(compact_count "$web")"
+printf '\n'
 "#;
 
 #[derive(Clone, Debug)]
 struct TmuxCodexStatusHelper {
     script_path: PathBuf,
     cache_path: PathBuf,
+}
+
+pub(super) fn print_tmux_loc() -> Result<i32> {
+    let [all, rust, web] = match system_tokei_counts() {
+        Some(counts) => counts,
+        None => {
+            let mut languages = tokei::Languages::new();
+            languages.get_statistics(&["."], &[], &tokei::Config::from_config_files());
+            let total = languages.total();
+            if total.inaccurate {
+                bail!("incomplete workspace code line count");
+            }
+            tmux_loc_counts(total.code, |kind| {
+                languages.get(&kind).map_or(0, |lang| lang.code)
+            })
+            .context("invalid workspace code line counts")?
+        }
+    };
+    println!("{all} {rust} {web}");
+    Ok(0)
+}
+
+fn system_tokei_counts() -> Option<[usize; 3]> {
+    #[derive(Deserialize)]
+    struct LanguageSummary {
+        code: usize,
+        #[serde(default)]
+        inaccurate: bool,
+    }
+
+    let mut child = Command::new("tokei")
+        .args(["--output", "json", "."])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Only retain language totals, even when the report contains thousands of files.
+    let report = serde_json::from_reader::<_, BTreeMap<String, LanguageSummary>>(BufReader::new(
+        child.stdout.take().expect("piped tokei stdout"),
+    ));
+    if !child.wait().ok()?.success() {
+        return None;
+    }
+    let report = report.ok()?;
+    let total = report.get("Total")?;
+    if report.values().any(|language| language.inaccurate) {
+        return None;
+    }
+    tmux_loc_counts(total.code, |kind| {
+        report.get(kind.name()).map_or(0, |lang| lang.code)
+    })
+}
+
+fn tmux_loc_counts(total: usize, code: impl Fn(LanguageType) -> usize) -> Option<[usize; 3]> {
+    let rust = code(LanguageType::Rust);
+    let web = [
+        LanguageType::Astro,
+        LanguageType::Css,
+        LanguageType::Html,
+        LanguageType::Jsx,
+        LanguageType::JavaScript,
+        LanguageType::Less,
+        LanguageType::Sass,
+        LanguageType::Svelte,
+        LanguageType::Svg,
+        LanguageType::Tsx,
+        LanguageType::TypeScript,
+        LanguageType::Vue,
+    ]
+    .into_iter()
+    .map(code)
+    .try_fold(0usize, usize::checked_add)?;
+    (rust.checked_add(web)? <= total).then_some([total, rust, web])
 }
 
 pub(super) fn ensure_tmux_available() -> Result<()> {
@@ -861,14 +883,24 @@ fn write_tmux_codex_status_helper(helper: &TmuxCodexStatusHelper) -> Result<()> 
             parent.display()
         )
     })?;
-    write_file_atomically(&helper.script_path, TMUX_CODEX_STATUS_HELPER_SCRIPT).with_context(
-        || {
-            format!(
-                "write Codex tmux status helper {}",
-                helper.script_path.display()
-            )
-        },
-    )?;
+    let executable = env::current_exe().context("resolve za executable for the tmux status bar")?;
+    // Prefer the active installation symlink so long-lived sessions follow za upgrades.
+    let installed = env::var_os("PATH").and_then(|path| {
+        env::split_paths(&path).map(|dir| dir.join("za")).find(|p| {
+            p.is_absolute() && fs::canonicalize(p).is_ok_and(|target| target == executable)
+        })
+    });
+    let za = installed.as_deref().unwrap_or(&executable);
+    let script = format!(
+        "#!/bin/sh\nza={}\n{TMUX_CODEX_STATUS_HELPER_SCRIPT}",
+        shell_escape(&za.to_string_lossy())
+    );
+    write_file_atomically(&helper.script_path, script).with_context(|| {
+        format!(
+            "write Codex tmux status helper {}",
+            helper.script_path.display()
+        )
+    })?;
     #[cfg(unix)]
     {
         let mut permissions = fs::metadata(&helper.script_path)

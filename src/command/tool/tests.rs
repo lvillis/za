@@ -295,12 +295,11 @@ fn parse_tool_spec_supports_optional_version() {
 #[test]
 fn update_alpha_channel_accepts_codex_alias_only() {
     assert_eq!(
-        resolve_update_channel_request(false, &["codex".to_string()], None, true)
-            .expect("codex alpha"),
+        resolve_update_channel_request(&["codex".to_string()], None, true).expect("codex alpha"),
         ToolUpdateChannel::CodexAlpha
     );
     assert_eq!(
-        resolve_update_channel_request(false, &["codex-cli".to_string()], None, true)
+        resolve_update_channel_request(&["codex-cli".to_string()], None, true)
             .expect("codex alias alpha"),
         ToolUpdateChannel::CodexAlpha
     );
@@ -308,15 +307,13 @@ fn update_alpha_channel_accepts_codex_alias_only() {
 
 #[test]
 fn update_alpha_channel_rejects_ambiguous_or_non_codex_requests() {
-    assert!(resolve_update_channel_request(true, &[], None, true).is_err());
+    assert!(resolve_update_channel_request(&[], None, true).is_err());
+    assert!(resolve_update_channel_request(&["codex".to_string()], Some("0.1.0"), true).is_err());
     assert!(
-        resolve_update_channel_request(false, &["codex".to_string()], Some("0.1.0"), true).is_err()
-    );
-    assert!(
-        resolve_update_channel_request(false, &["codex".to_string(), "rg".to_string()], None, true)
+        resolve_update_channel_request(&["codex".to_string(), "rg".to_string()], None, true)
             .is_err()
     );
-    assert!(resolve_update_channel_request(false, &["rg".to_string()], None, true).is_err());
+    assert!(resolve_update_channel_request(&["rg".to_string()], None, true).is_err());
 }
 
 #[test]

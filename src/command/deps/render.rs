@@ -923,7 +923,7 @@ pub(super) fn write_json_report(
     actions: &[ActionAuditRecord],
 ) -> Result<()> {
     let report = AuditReport {
-        generated_at: format_rfc3339_seconds(SystemTime::now()).to_string(),
+        generated_at: format!("{:.0}", jiff::Timestamp::now()),
         manifest_path: manifest_path.display().to_string(),
         summary: summary.clone(),
         dependencies: records.to_vec(),

@@ -857,7 +857,7 @@ fn custom_tool_output_failed(payload: &serde_json::Value) -> bool {
 
 fn parse_session_timestamp_unix(value: Option<&str>, fallback_unix: u64) -> u64 {
     value
-        .and_then(|value| humantime::parse_rfc3339_weak(value).ok())
+        .and_then(crate::command::parse_timestamp)
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs())
         .unwrap_or(fallback_unix)

@@ -60,6 +60,7 @@ const MANAGED_TRACKER_MATCH_WINDOW_SECS: u64 = 600;
 
 pub fn run(cmd: Option<CodexCommands>, passthrough_args: &[String]) -> Result<i32> {
     match cmd {
+        Some(CodexCommands::TmuxLoc) => print_tmux_loc(),
         Some(CodexCommands::Up { args }) => run_up(&args),
         Some(CodexCommands::Attach { takeover }) => run_attach(takeover),
         Some(CodexCommands::Exec { args }) => run_exec(&args),
@@ -980,26 +981,14 @@ mod tests {
     }
 
     #[test]
-    fn tmux_codex_status_helper_tracks_diff_and_loc_without_za_binary() {
+    fn tmux_codex_status_helper_tracks_diff_and_workspace_metadata() {
         let script = tmux_codex_status_helper_script();
         assert!(script.contains("diff --numstat HEAD -- ."));
-        assert!(script.contains("tokei --output json"));
-        assert!(script.contains("jq -r"));
         assert!(!script.contains("python3"));
-        assert!(script.contains("ls-files -co --exclude-standard"));
         assert!(script.contains("cargo_metadata_value"));
         assert!(script.contains("workspace.package"));
         assert!(script.contains("out=\"$pkg_version\""));
         assert!(script.contains("msrv $msrv"));
-        assert!(script.contains("*.rs"));
-        assert!(script.contains("*.ts"));
-        assert!(script.contains("*.tsx"));
-        assert!(script.contains("[diff %s]  loc %s | rust %s | web %s"));
-        assert!(script.contains(" rust "));
-        assert!(!script.contains("| rs "));
-        assert!(script.contains(" web "));
-        assert!(!script.contains("| fe "));
-        assert!(!script.contains(" za "));
         assert!(!script.contains("cargo run"));
     }
 

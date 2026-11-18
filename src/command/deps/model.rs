@@ -443,7 +443,7 @@ fn requirement_series(requirement: &VersionReq) -> Option<(u64, Option<u64>)> {
 }
 
 pub(super) fn age_days_from_now(rfc3339: &str) -> Option<u64> {
-    let ts = humantime::parse_rfc3339_weak(rfc3339).ok()?;
+    let ts = crate::command::parse_timestamp(rfc3339)?;
     match SystemTime::now().duration_since(ts) {
         Ok(duration) => Some(duration.as_secs() / 86_400),
         Err(_) => Some(0),

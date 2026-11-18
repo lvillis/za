@@ -17,6 +17,7 @@ pub mod tool;
 pub mod za_config;
 
 use anyhow::{Context, Result, anyhow};
+use jiff::{Timestamp, fmt::temporal::Pieces, tz::Offset};
 use serde::Serialize;
 use std::{
     ffi::OsString,
@@ -28,6 +29,36 @@ use std::{
 
 /// ---------- constants ----------
 pub const JSON_SCHEMA_VERSION: u8 = 1;
+
+/// Parse release and session timestamps, assuming UTC when the offset is omitted.
+fn parse_timestamp(value: &str) -> Option<SystemTime> {
+    if value.as_bytes().get(16) != Some(&b':') {
+        return None;
+    }
+    let (seconds, suffix) = value.split_at_checked(19)?;
+    let normalized;
+    let input = if let Some(fraction) = suffix.strip_prefix('.')
+        && let digits = fraction.bytes().take_while(u8::is_ascii_digit).count()
+        && digits > 9
+    {
+        // Preserve nanosecond truncation for higher-precision inputs.
+        normalized = format!("{seconds}.{}{}", &fraction[..9], &fraction[digits..]);
+        &normalized
+    } else {
+        value
+    };
+    let pieces = Pieces::parse(input).ok()?;
+    if pieces.time_zone_annotation().is_some() {
+        return None;
+    }
+    let datetime = pieces.date().to_datetime(pieces.time()?);
+    let offset = pieces.to_numeric_offset().unwrap_or(Offset::UTC);
+    let timestamp = offset.to_timestamp(datetime).ok()?;
+    if timestamp < Timestamp::UNIX_EPOCH {
+        return None;
+    }
+    SystemTime::try_from(timestamp).ok()
+}
 
 #[derive(Serialize)]
 struct JsonEnvelope<'a, T> {
@@ -169,6 +200,31 @@ fn replace_file(src: &Path, dst: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamps_resolve_to_the_same_utc_instant() {
+        let expected = SystemTime::UNIX_EPOCH + std::time::Duration::new(1, 123_456_789);
+        for input in [
+            "1970-01-01T00:00:01.123456789Z",
+            "1970-01-01 00:00:01.123456789",
+            "1970-01-01T00:00:01.123456789+00:00",
+            "1970-01-01T08:00:01.123456789987+08:00",
+        ] {
+            assert_eq!(parse_timestamp(input), Some(expected), "{input}");
+        }
+        assert_eq!(
+            parse_timestamp("1970-01-01 00:00:00"),
+            Some(SystemTime::UNIX_EPOCH)
+        );
+        for input in [
+            "invalid",
+            "2026-02-30T00:00:00Z",
+            "1970-01-01",
+            "1969-12-31T23:59:59Z",
+        ] {
+            assert_eq!(parse_timestamp(input), None, "{input}");
+        }
+    }
 
     fn unique_temp_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()

@@ -147,9 +147,6 @@ pub enum ToolCommands {
     },
     /// Update tools to the newest available version
     Update {
-        /// Update all za-managed tools in this scope.
-        #[arg(long)]
-        all: bool,
         /// Tool names. Omit to update all za-managed tools in this scope.
         tools: Vec<String>,
         /// Pin the update target to a specific version. Requires exactly one tool.
@@ -197,40 +194,6 @@ pub enum ToolCommands {
         /// Remove only one version instead of all managed versions.
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
-    },
-    /// Print the active managed executable path for one tool
-    #[command(hide = true)]
-    Which {
-        /// Tool name, e.g. `codex`
-        tool: String,
-    },
-    /// List built-in supported tools and source policies
-    #[command(hide = true)]
-    Catalog {
-        /// Print JSON output for scripting.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Check installed tools for newer upstream versions
-    #[command(hide = true)]
-    Outdated {
-        /// Tool names. Omit to check all za-managed tools in this scope.
-        tools: Vec<String>,
-        /// Print JSON output for scripting.
-        #[arg(long)]
-        json: bool,
-        /// Return non-zero when updates are available.
-        #[arg(long)]
-        fail_on_updates: bool,
-        /// Return non-zero when update checks fail.
-        #[arg(long)]
-        fail_on_check_errors: bool,
-    },
-    /// Adopt an existing unmanaged binary already present in this scope
-    #[command(hide = true)]
-    Adopt {
-        /// Tool name, e.g. `codex`
-        tool: String,
     },
 }
 
@@ -684,6 +647,9 @@ pub enum IdeReconcileStrategy {
 /// `za codex` sub-commands
 #[derive(Subcommand)]
 pub enum CodexCommands {
+    /// Print code line counts for the managed tmux status bar.
+    #[command(name = "__tmux-loc", hide = true)]
+    TmuxLoc,
     /// Create or attach the current workspace Codex tmux session
     Up {
         /// Arguments passed through to `codex`
@@ -1032,7 +998,6 @@ mod tests {
                 assert!(matches!(
                     cmd,
                     ToolCommands::Update {
-                        all: false,
                         tools,
                         version: None,
                         alpha: false,
@@ -1056,7 +1021,6 @@ mod tests {
                 assert!(matches!(
                     cmd,
                     ToolCommands::Update {
-                        all: false,
                         tools,
                         version: None,
                         alpha: false,
@@ -1213,7 +1177,6 @@ mod tests {
                 assert!(matches!(
                     cmd,
                     ToolCommands::Update {
-                        all: false,
                         tools,
                         version: None,
                         alpha: false,
@@ -1235,7 +1198,6 @@ mod tests {
                 assert!(matches!(
                     cmd,
                     ToolCommands::Update {
-                        all: false,
                         tools,
                         version: None,
                         alpha: true,
@@ -1249,8 +1211,8 @@ mod tests {
     }
 
     #[test]
-    fn tool_update_parses_all_flag() {
-        let cli = Cli::try_parse_from(["za", "tool", "update", "--all"]).expect("must parse");
+    fn tool_update_defaults_to_all_managed_tools() {
+        let cli = Cli::try_parse_from(["za", "tool", "update"]).expect("must parse");
         match cli.cmd {
             Commands::Tool { user, global, cmd } => {
                 assert!(!user);
@@ -1258,7 +1220,6 @@ mod tests {
                 assert!(matches!(
                     cmd,
                     ToolCommands::Update {
-                        all: true,
                         tools,
                         version: None,
                         alpha: false,
@@ -1273,8 +1234,7 @@ mod tests {
 
     #[test]
     fn tool_update_parses_verbose_flag() {
-        let cli = Cli::try_parse_from(["za", "tool", "update", "--all", "--verbose"])
-            .expect("must parse");
+        let cli = Cli::try_parse_from(["za", "tool", "update", "--verbose"]).expect("must parse");
         match cli.cmd {
             Commands::Tool { user, global, cmd } => {
                 assert!(!user);
@@ -1282,7 +1242,6 @@ mod tests {
                 assert!(matches!(
                     cmd,
                     ToolCommands::Update {
-                        all: true,
                         tools,
                         version: None,
                         alpha: false,

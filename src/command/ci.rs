@@ -12,7 +12,6 @@ use crate::{
     },
 };
 use anyhow::{Context, Result, anyhow, bail};
-use humantime::parse_rfc3339_weak;
 use reqx::{advanced::ClientProfile, blocking::Client};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{

@@ -597,8 +597,7 @@ pub(crate) fn has_mixed_events(runs: &[WorkflowRunReport]) -> bool {
 }
 
 pub(crate) fn age_label(rfc3339: Option<&str>) -> Option<String> {
-    let value = rfc3339?;
-    let ts = parse_rfc3339_weak(value).ok()?;
+    let ts = crate::command::parse_timestamp(rfc3339?)?;
     let elapsed = match SystemTime::now().duration_since(ts) {
         Ok(duration) => duration,
         Err(_) => Duration::from_secs(0),

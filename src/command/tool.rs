@@ -476,7 +476,6 @@ fn run_tool_command(cmd: ToolCommands, scope_request: ToolScopeRequest) -> Resul
             }
         }
         ToolCommands::Update {
-            all,
             tools,
             version,
             alpha,
@@ -484,14 +483,13 @@ fn run_tool_command(cmd: ToolCommands, scope_request: ToolScopeRequest) -> Resul
             verbose,
         } => {
             if dry_run {
-                update_tools(&home, all, &tools, version.as_deref(), alpha, true, verbose)?;
+                update_tools(&home, &tools, version.as_deref(), alpha, true, verbose)?;
                 Ok(0)
             } else {
                 let home_for_action = home.clone();
                 run_mutating_tool_command(&home, move || {
                     update_tools(
                         &home_for_action,
-                        all,
                         &tools,
                         version.as_deref(),
                         alpha,
@@ -523,31 +521,6 @@ fn run_tool_command(cmd: ToolCommands, scope_request: ToolScopeRequest) -> Resul
                 uninstall(
                     &home_for_action,
                     ToolSpec::from_args(&tool, version.as_deref())?,
-                )
-            })
-        }
-        ToolCommands::Which { tool } => {
-            print_active_managed_path(&home, &tool)?;
-            Ok(0)
-        }
-        ToolCommands::Catalog { json } => show_catalog(json),
-        ToolCommands::Outdated {
-            tools,
-            json,
-            fail_on_updates,
-            fail_on_check_errors,
-        } => list_outdated(&home, &tools, json, fail_on_updates, fail_on_check_errors),
-        ToolCommands::Adopt { tool } => {
-            let home_for_action = home.clone();
-            run_mutating_tool_command(&home, move || {
-                install_tools(
-                    &home_for_action,
-                    std::slice::from_ref(&tool),
-                    None,
-                    true,
-                    ToolAction::Install,
-                    false,
-                    false,
                 )
             })
         }

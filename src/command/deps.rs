@@ -8,7 +8,6 @@ pub mod resolve;
 
 use crate::command::{render as text_render, style as tty_style, write_file_atomically, za_config};
 use anyhow::{Context, Result, anyhow, bail};
-use humantime::format_rfc3339_seconds;
 use indicatif::{ProgressBar, ProgressStyle};
 use semver::Version;
 use serde::{Deserialize, Serialize};

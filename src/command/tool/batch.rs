@@ -72,26 +72,18 @@ pub(super) fn install_tools(
 
 pub(super) fn update_tools(
     home: &ToolHome,
-    all: bool,
     tools: &[String],
     version: Option<&str>,
     alpha: bool,
     dry_run: bool,
     verbose: bool,
 ) -> Result<()> {
-    if all && !tools.is_empty() {
-        bail!("`za tool update --all` does not accept tool names");
-    }
-    if all && version.is_some() {
-        bail!("`za tool update --all` does not accept `--version`");
-    }
     if version.is_some() && tools.len() != 1 {
         bail!("`za tool update --version` requires exactly one tool name");
     }
-    let channel = resolve_update_channel_request(all, tools, version, alpha)?;
+    let channel = resolve_update_channel_request(tools, version, alpha)?;
 
-    let auto_update = all || tools.is_empty();
-    let (requested_names, skipped_unknown_tools) = if auto_update {
+    let (requested_names, skipped_unknown_tools) = if tools.is_empty() {
         split_supported_managed_tool_names(collect_managed_tool_names(home)?)
     } else {
         (normalize_requested_tool_names(tools)?, Vec::new())
@@ -697,16 +689,12 @@ fn materialize_worker_count(task_count: usize) -> usize {
 }
 
 pub(super) fn resolve_update_channel_request(
-    all: bool,
     tools: &[String],
     version: Option<&str>,
     alpha: bool,
 ) -> Result<ToolUpdateChannel> {
     if !alpha {
         return Ok(ToolUpdateChannel::Stable);
-    }
-    if all {
-        bail!("`za tool update --alpha` does not accept `--all`");
     }
     if version.is_some() {
         bail!("`za tool update --alpha` does not accept `--version`");

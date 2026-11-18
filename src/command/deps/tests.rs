@@ -440,6 +440,13 @@ fn empty_audit_writes_requested_json_report() {
     let output = fs::read_to_string(&report).expect("read report");
     let json: serde_json::Value = serde_json::from_str(&output).expect("parse report");
     assert_eq!(json["schema_version"], 1);
+    let generated_at = json["data"]["generated_at"]
+        .as_str()
+        .expect("report timestamp");
+    let timestamp = generated_at
+        .parse::<jiff::Timestamp>()
+        .expect("valid timestamp");
+    assert_eq!(generated_at, format!("{timestamp:.0}"));
     assert_eq!(json["data"]["dependencies"], serde_json::json!([]));
     assert_eq!(json["data"]["actions"], serde_json::Value::Null);
 
