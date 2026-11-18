@@ -1,3 +1,17 @@
+## [0.1.108] - 2026-11-18
+
+### 🚀 Features
+
+- *(tool)* Show remaining checks and flag partial update failures
+
+### 🐛 Bug Fixes
+
+- *(codex)* Prefer system tokei for tmux LOC with a built-in fallback
+## [0.1.107] - 2026-11-17
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.107
 ## [0.1.106] - 2026-11-17
 
 ### ⚙️ Miscellaneous Tasks
