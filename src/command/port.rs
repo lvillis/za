@@ -412,6 +412,8 @@ fn run_stop(port: u16, signal: PortSignal, dry_run: bool, options: PortLsOptions
 }
 
 fn run_wait(port: u16, timeout_secs: u64, interval_ms: u64, options: PortLsOptions) -> Result<i32> {
+    #[cfg(unix)]
+    let _terminal = super::terminal::ProgressTerminal::acquire(std::io::stdout())?;
     let started = Instant::now();
     let interval = Duration::from_millis(interval_ms.max(100));
     println!(
@@ -452,6 +454,8 @@ fn run_follow(
     interval_ms: u64,
     options: PortLsOptions,
 ) -> Result<i32> {
+    #[cfg(unix)]
+    let _terminal = super::terminal::ProgressTerminal::acquire(std::io::stdout())?;
     let started = Instant::now();
     let interval = Duration::from_millis(interval_ms.max(100));
     let mut last_digest = None::<String>;

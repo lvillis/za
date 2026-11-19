@@ -104,6 +104,8 @@ pub(super) fn run_latest(opts: DepsLatestOptions) -> Result<()> {
     }
 
     let requested_jobs = jobs.unwrap_or_else(default_deps_jobs);
+    #[cfg(unix)]
+    let _terminal = super::deps_progress_terminal()?;
     let worker_count = normalize_jobs(requested_jobs, queries.len());
     let api = Arc::new(ApiClient::new(refresh)?);
     let mut records = resolve_latest_records(Arc::clone(&api), queries, worker_count)?;

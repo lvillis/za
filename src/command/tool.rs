@@ -398,8 +398,17 @@ fn run_ls_command(
     list_installed(home, json)
 }
 
-fn interruptible_command(action: impl FnOnce() -> Result<i32>) -> Result<i32> {
+fn interruptible_command(
+    _shows_progress: bool,
+    action: impl FnOnce() -> Result<i32>,
+) -> Result<i32> {
     prepare_interruptible_tool_operation()?;
+    #[cfg(unix)]
+    let _terminal = if _shows_progress {
+        super::terminal::ProgressTerminal::for_tool_progress()?
+    } else {
+        None
+    };
     let result = action();
     let signal = INTERRUPT_SIGNAL.load(Ordering::SeqCst);
     if signal != 0 {
@@ -410,7 +419,14 @@ fn interruptible_command(action: impl FnOnce() -> Result<i32>) -> Result<i32> {
 }
 
 pub fn run(cmd: ToolCommands, scope_request: ToolScopeRequest) -> Result<i32> {
-    interruptible_command(|| run_tool_command(cmd, scope_request))
+    let shows_progress = matches!(
+        cmd,
+        ToolCommands::Install { .. }
+            | ToolCommands::Update { .. }
+            | ToolCommands::Sync { .. }
+            | ToolCommands::Ls { outdated: true, .. }
+    );
+    interruptible_command(shows_progress, || run_tool_command(cmd, scope_request))
 }
 
 fn run_tool_command(cmd: ToolCommands, scope_request: ToolScopeRequest) -> Result<i32> {
@@ -532,8 +548,14 @@ pub fn update_self(
     check: bool,
     version: Option<String>,
 ) -> Result<i32> {
-    prepare_interruptible_tool_operation()?;
+    interruptible_command(true, || run_self_update(scope_request, check, version))
+}
 
+fn run_self_update(
+    scope_request: ToolScopeRequest,
+    check: bool,
+    version: Option<String>,
+) -> Result<i32> {
     let home = ToolHome::detect_for_self_update(scope_request)?;
     cleanup_legacy_current_dir_artifacts(&home)?;
 

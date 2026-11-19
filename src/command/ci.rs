@@ -486,6 +486,8 @@ fn run_status(json: bool) -> Result<i32> {
 }
 
 fn run_watch(timeout_secs: Option<u64>, json: bool) -> Result<i32> {
+    #[cfg(unix)]
+    let _terminal = super::terminal::ProgressTerminal::acquire(std::io::stdout())?;
     let client = GitHubClient::new(CiCacheMode::Bypass)?;
     let cwd = env::current_dir()?;
     let started = Instant::now();

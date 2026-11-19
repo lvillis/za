@@ -114,6 +114,8 @@ pub fn run(opts: DepsRunOptions) -> Result<()> {
     }
 
     let requested_jobs = jobs.unwrap_or_else(default_deps_jobs);
+    #[cfg(unix)]
+    let _terminal = deps_progress_terminal()?;
     let workload_count = inventory.specs.len() + action_specs.len();
     let worker_count = normalize_jobs(requested_jobs, workload_count);
     println!(
@@ -293,6 +295,15 @@ fn build_progress(total: u64) -> Option<ProgressBar> {
         .progress_chars("#>-");
     bar.set_style(style);
     Some(bar)
+}
+
+#[cfg(unix)]
+fn deps_progress_terminal() -> std::io::Result<Option<super::terminal::ProgressTerminal>> {
+    if std::io::stdout().is_terminal() {
+        super::terminal::ProgressTerminal::acquire(std::io::stderr())
+    } else {
+        Ok(None)
+    }
 }
 
 fn has_error(first_error: &Mutex<Option<anyhow::Error>>) -> bool {

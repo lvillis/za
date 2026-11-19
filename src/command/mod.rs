@@ -13,6 +13,8 @@ pub mod process;
 pub mod render;
 pub mod run;
 pub mod style;
+#[cfg(unix)]
+mod terminal;
 pub mod tool;
 pub mod za_config;
 
