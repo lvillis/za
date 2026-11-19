@@ -1299,7 +1299,11 @@ mod tests {
             find_tool_policy("codex").unwrap(),
             find_tool_policy("fd").unwrap(),
         ];
-        let ui = LatestProgressUi::with_target(&policies, ProgressDrawTarget::hidden());
+        let term = indicatif::InMemoryTerm::new(8, 45);
+        let ui = LatestProgressUi::with_target(
+            &policies,
+            ProgressDrawTarget::term_like(Box::new(term.clone())),
+        );
         ui.start("codex");
         ui.start("fd");
         ui.retry_reporter("codex").unwrap()("retry 2/3 · request timed out".into());
@@ -1317,6 +1321,12 @@ mod tests {
         assert!(ui.header.is_finished());
         assert!(ui.header.message().is_empty());
         assert_eq!(ui.rows["codex"].message(), "check failed");
+        let screen = term.contents();
+        assert_eq!(screen.lines().count(), 3, "{screen}");
+        assert_eq!(screen.matches("Checking tools").count(), 1);
+        assert_eq!(screen.matches("codex").count(), 1);
+        assert_eq!(screen.matches("fd").count(), 1);
+        assert!(!screen.contains("retry"));
     }
 
     #[test]

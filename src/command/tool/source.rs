@@ -90,12 +90,15 @@ impl<'a> DownloadFeedback<'a> {
         self.shows_progress() || self.reporter.is_some()
     }
 
-    fn tty_line(self) -> bool {
+    fn interactive(self) -> bool {
         self.shows_progress() && io::stderr().is_terminal()
     }
 
-    fn interactive(self) -> bool {
-        self.tty_line()
+    fn progress_bar(self, total_bytes: Option<u64>) -> Option<ProgressBar> {
+        if !self.interactive() {
+            return None;
+        }
+        new_download_progress_bar(ProgressDrawTarget::stderr(), total_bytes)
     }
 
     fn reporter(self) -> Option<&'a DownloadProgressReporter> {
@@ -907,9 +910,6 @@ where
                     HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS
                 );
                 if !report_retry(retry_status) {
-                    if interactive && stage == "download" {
-                        finish_download_tty_line();
-                    }
                     print_download_stage(
                         interactive,
                         stage,
@@ -1341,9 +1341,6 @@ fn retry_single_stream_after_parallel_failure(
     request: SingleStreamDownload<'_>,
     feedback: DownloadFeedback<'_>,
 ) -> Result<()> {
-    if interactive {
-        finish_download_tty_line();
-    }
     if !report_retry(reason.clone()) && feedback.shows_progress() {
         print_download_stage(interactive, "download", reason);
     }
@@ -1503,7 +1500,7 @@ fn download_to_path_single_once(
     let mut last_report = Instant::now();
     let print_progress = feedback.shows_progress();
     let track_progress = feedback.tracks_progress();
-    let use_tty_line = feedback.tty_line();
+    let progress_bar = feedback.progress_bar(total_bytes);
     if track_progress {
         emit_download_progress(
             feedback.reporter(),
@@ -1512,13 +1509,6 @@ fn download_to_path_single_once(
             start.elapsed(),
             false,
         );
-    }
-    if print_progress && use_tty_line {
-        eprint!(
-            "\r\x1b[2K{}",
-            render_download_progress_line(downloaded, total_bytes, start.elapsed(), true)
-        );
-        let _ = io::stderr().flush();
     }
     let chunks = network::chunks(resp, DOWNLOAD_READ_CHUNK_SIZE);
     while let Some(bytes) = chunks
@@ -1536,26 +1526,12 @@ fn download_to_path_single_once(
                     total_bytes,
                     elapsed: start.elapsed(),
                     finished: false,
-                    tty_line: use_tty_line,
+                    progress_bar: progress_bar.as_ref(),
                     print_line: print_progress,
                     progress_reporter: feedback.reporter(),
                 },
             );
         }
-    }
-    if track_progress {
-        report_download_progress(
-            &mut last_report,
-            DownloadProgressReport {
-                downloaded,
-                total_bytes,
-                elapsed: start.elapsed(),
-                finished: true,
-                tty_line: use_tty_line,
-                print_line: print_progress,
-                progress_reporter: feedback.reporter(),
-            },
-        );
     }
     if let Some(total_bytes) = total_bytes
         && downloaded != total_bytes
@@ -1568,6 +1544,20 @@ fn download_to_path_single_once(
     }
     out.flush()
         .with_context(|| format!("flush downloaded file {}", asset_path.display()))?;
+    if track_progress {
+        report_download_progress(
+            &mut last_report,
+            DownloadProgressReport {
+                downloaded,
+                total_bytes,
+                elapsed: start.elapsed(),
+                finished: true,
+                progress_bar: progress_bar.as_ref(),
+                print_line: print_progress,
+                progress_reporter: feedback.reporter(),
+            },
+        );
+    }
     Ok(())
 }
 
@@ -1596,7 +1586,7 @@ fn download_to_path_parallel(
     let total_bytes = Some(plan.total_bytes);
     let print_progress = feedback.shows_progress();
     let track_progress = feedback.tracks_progress();
-    let use_tty_line = feedback.tty_line();
+    let progress_bar = feedback.progress_bar(total_bytes);
 
     let mut reporter = track_progress.then(|| {
         spawn_parallel_download_reporter(
@@ -1604,7 +1594,7 @@ fn download_to_path_parallel(
             Arc::clone(&reporter_stop),
             total_bytes,
             start,
-            use_tty_line,
+            progress_bar.clone(),
             print_progress,
             feedback.reporter().cloned(),
         )
@@ -1666,6 +1656,8 @@ fn download_to_path_parallel(
         cleanup_parallel_part_files(&part_paths);
         return Err(err);
     }
+    merge_parallel_part_files(&ordered_parts, asset_path).map_err(ParallelDownloadError::Failed)?;
+    cleanup_parallel_part_files(&part_paths);
     if track_progress {
         let mut last_report = Instant::now();
         report_download_progress(
@@ -1675,15 +1667,13 @@ fn download_to_path_parallel(
                 total_bytes,
                 elapsed: start.elapsed(),
                 finished: true,
-                tty_line: use_tty_line,
+                progress_bar: progress_bar.as_ref(),
                 print_line: print_progress,
                 progress_reporter: feedback.reporter(),
             },
         );
     }
 
-    merge_parallel_part_files(&ordered_parts, asset_path).map_err(ParallelDownloadError::Failed)?;
-    cleanup_parallel_part_files(&part_paths);
     Ok(())
 }
 
@@ -1692,24 +1682,12 @@ fn spawn_parallel_download_reporter(
     stop: Arc<AtomicBool>,
     total_bytes: Option<u64>,
     start: Instant,
-    tty_line: bool,
+    progress_bar: Option<ProgressBar>,
     print_line: bool,
     progress_reporter: Option<DownloadProgressReporter>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut last_report = Instant::now();
-        if tty_line {
-            eprint!(
-                "\r\x1b[2K{}",
-                render_download_progress_line(
-                    progress.load(Ordering::SeqCst),
-                    total_bytes,
-                    start.elapsed(),
-                    true
-                )
-            );
-            let _ = io::stderr().flush();
-        }
         emit_download_progress(
             progress_reporter.as_ref(),
             progress.load(Ordering::SeqCst),
@@ -1725,7 +1703,7 @@ fn spawn_parallel_download_reporter(
                     total_bytes,
                     elapsed: start.elapsed(),
                     finished: false,
-                    tty_line,
+                    progress_bar: progress_bar.as_ref(),
                     print_line,
                     progress_reporter: progress_reporter.as_ref(),
                 },
@@ -1969,6 +1947,19 @@ fn download_stage_icon(stage: &str) -> &'static str {
     }
 }
 
+fn new_download_progress_bar(
+    target: ProgressDrawTarget,
+    total_bytes: Option<u64>,
+) -> Option<ProgressBar> {
+    let bar = ProgressBar::with_draw_target(None, target);
+    if bar.is_hidden() {
+        return None;
+    }
+    bar.set_style(ProgressStyle::with_template("{wide_msg}").expect("download template"));
+    bar.set_message(render_download_progress(0, total_bytes, Duration::ZERO));
+    Some(bar)
+}
+
 pub(super) fn render_download_progress(
     downloaded: u64,
     total_bytes: Option<u64>,
@@ -2009,26 +2000,12 @@ pub(super) fn render_download_progress_brief(
     }
 }
 
-fn render_download_progress_line(
-    downloaded: u64,
-    total_bytes: Option<u64>,
-    elapsed: Duration,
-    interactive: bool,
-) -> String {
-    let line = render_download_progress(downloaded, total_bytes, elapsed);
-    if interactive {
-        format!("{} {line}", download_stage_icon("download"))
-    } else {
-        line
-    }
-}
-
 struct DownloadProgressReport<'a> {
     downloaded: u64,
     total_bytes: Option<u64>,
     elapsed: Duration,
     finished: bool,
-    tty_line: bool,
+    progress_bar: Option<&'a ProgressBar>,
     print_line: bool,
     progress_reporter: Option<&'a DownloadProgressReporter>,
 }
@@ -2049,28 +2026,17 @@ fn report_download_progress(last_report: &mut Instant, report: DownloadProgressR
         *last_report = now;
         return;
     }
-    let line = render_download_progress_line(
-        report.downloaded,
-        report.total_bytes,
-        report.elapsed,
-        report.tty_line,
-    );
-    if report.tty_line {
+    let line = render_download_progress(report.downloaded, report.total_bytes, report.elapsed);
+    if let Some(bar) = report.progress_bar {
         if report.finished {
-            eprint!("\r\x1b[2K{line}\n");
+            bar.finish_with_message(line);
         } else {
-            eprint!("\r\x1b[2K{line}");
-            let _ = io::stderr().flush();
+            bar.set_message(line);
         }
     } else {
         eprintln!("{line}");
     }
     *last_report = now;
-}
-
-fn finish_download_tty_line() {
-    eprint!("\r\x1b[2K");
-    let _ = io::stderr().flush();
 }
 
 fn verify_sha256_file(path: &Path, expected_hex: &str) -> Result<()> {
@@ -2633,6 +2599,38 @@ mod tests {
 
         assert_eq!(value, 42);
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn narrow_download_progress_clears_abandoned_attempts_and_replaces_the_final_line() {
+        let term = indicatif::InMemoryTerm::new(8, 35);
+        let start = || {
+            super::new_download_progress_bar(
+                indicatif::ProgressDrawTarget::term_like(Box::new(term.clone())),
+                Some(524_288),
+            )
+            .unwrap()
+        };
+        let first = start();
+        assert_eq!(term.contents().lines().count(), 1);
+        drop(first);
+        assert!(term.contents().trim().is_empty());
+        let retry = start();
+        super::report_download_progress(
+            &mut std::time::Instant::now(),
+            super::DownloadProgressReport {
+                downloaded: 524_288,
+                total_bytes: Some(524_288),
+                elapsed: Duration::from_secs(2),
+                finished: true,
+                progress_bar: Some(&retry),
+                print_line: true,
+                progress_reporter: None,
+            },
+        );
+        let screen = term.contents();
+        assert_eq!(screen.lines().count(), 1, "{screen}");
+        assert!(screen.starts_with("download: 512.0 KiB"));
     }
 
     #[test]

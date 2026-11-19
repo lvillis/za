@@ -512,28 +512,34 @@ impl BatchProgressUi {
             return None;
         }
 
-        let total = tasks.len();
-        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(10));
-        let header = multi.add(new_batch_header_progress_bar(kind, 0, total));
+        Some(Arc::new(Self::with_target(
+            kind,
+            tasks.len(),
+            ProgressDrawTarget::stderr_with_hz(10),
+        )))
+    }
 
-        Some(Arc::new(Self {
+    fn with_target(kind: ToolBatchKind, total: usize, target: ProgressDrawTarget) -> Self {
+        let multi = MultiProgress::with_draw_target(target);
+        let header = new_batch_header_progress_bar(&multi, kind, total);
+
+        Self {
             kind,
             total,
             completed: Mutex::new(0),
             multi,
             header,
             lines: Mutex::new(HashMap::new()),
-        }))
+        }
     }
 
     fn set_tool_status(&self, tool_name: &str, status: BatchProgressStatus) {
         let Ok(mut lines) = self.lines.lock() else {
             return;
         };
-        let progress = lines.entry(tool_name.to_string()).or_insert_with(|| {
-            self.multi
-                .add(new_batch_tool_progress_bar(tool_name, status))
-        });
+        let progress = lines
+            .entry(tool_name.to_string())
+            .or_insert_with(|| new_batch_tool_progress_bar(&self.multi));
         progress.set_message(render_batch_progress_line(tool_name, status));
     }
 
@@ -614,28 +620,27 @@ enum BatchProgressTerminalStatus {
 }
 
 fn new_batch_header_progress_bar(
+    multi: &MultiProgress,
     kind: ToolBatchKind,
-    completed: usize,
     total: usize,
 ) -> ProgressBar {
-    let progress = ProgressBar::new_spinner();
+    let progress = multi.add(ProgressBar::new_spinner());
     progress.set_style(
         ProgressStyle::with_template("{wide_msg}")
             .unwrap_or_else(|_| ProgressStyle::default_spinner()),
     );
-    progress.set_message(render_batch_progress_header(kind, completed, total));
+    progress.set_message(render_batch_progress_header(kind, 0, total));
     progress
 }
 
-fn new_batch_tool_progress_bar(tool_name: &str, status: BatchProgressStatus) -> ProgressBar {
-    let progress = ProgressBar::new_spinner();
+fn new_batch_tool_progress_bar(multi: &MultiProgress) -> ProgressBar {
+    let progress = multi.add(ProgressBar::new_spinner());
     progress.set_style(
         ProgressStyle::with_template("{spinner} {wide_msg}")
             .unwrap_or_else(|_| ProgressStyle::default_spinner())
             .tick_strings(&["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]),
     );
     progress.enable_steady_tick(Duration::from_millis(80));
-    progress.set_message(render_batch_progress_line(tool_name, status));
     progress
 }
 
@@ -993,4 +998,34 @@ pub(crate) fn load_sync_specs_from_manifest(file: &Path) -> Result<Vec<String>> 
     }
 
     Ok(specs)
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn batch_progress_reuses_each_row_and_clears_the_panel() {
+        let term = indicatif::InMemoryTerm::new(8, 42);
+        let ui = BatchProgressUi::with_target(
+            ToolBatchKind::Update,
+            2,
+            ProgressDrawTarget::term_like(Box::new(term.clone())),
+        );
+        for tool in ["codex", "fd"] {
+            ui.set_tool_status(tool, BatchProgressStatus::Preparing);
+        }
+        ui.retry_reporter("codex").unwrap()("retry 2/3".into());
+        let screen = term.contents();
+        assert_eq!(screen.lines().count(), 3, "{screen}");
+        assert!(screen.contains("[+] Updating 0/2"));
+        assert_eq!(screen.matches("codex").count(), 1);
+        assert!(screen.contains("retry 2/3"));
+        assert_eq!(screen.matches("fd").count(), 1);
+        ui.finish_tool("codex", BatchProgressTerminalStatus::Ready);
+        ui.finish_tool("fd", BatchProgressTerminalStatus::Failed);
+        assert!(term.contents().contains("[+] Updating 2/2"));
+        ui.clear();
+        assert!(term.contents().trim().is_empty());
+    }
 }
