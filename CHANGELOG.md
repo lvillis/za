@@ -1,3 +1,8 @@
+## [0.1.109] - 2026-11-19
+
+### 🐛 Bug Fixes
+
+- *(tool)* Prevent duplicate progress lines during updates and retries
 ## [0.1.108] - 2026-11-18
 
 ### 🚀 Features
@@ -7,6 +12,10 @@
 ### 🐛 Bug Fixes
 
 - *(codex)* Prefer system tokei for tmux LOC with a built-in fallback
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.108
 ## [0.1.107] - 2026-11-17
 
 ### ⚙️ Miscellaneous Tasks
