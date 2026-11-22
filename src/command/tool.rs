@@ -112,7 +112,7 @@ fn prepare_interruptible_tool_operation() -> Result<()> {
     }
     let removed = source::cleanup_stale_temp_dirs();
     if removed > 0 {
-        eprintln!("🧹 Cleaned {removed} stale temp dir(s) from previous interrupted runs");
+        eprintln!("Cleaned {removed} stale temp dir(s) from previous interrupted runs");
     }
     Ok(())
 }
@@ -120,35 +120,12 @@ fn prepare_interruptible_tool_operation() -> Result<()> {
 fn print_tool_stage(stage: &str, message: impl AsRef<str>) {
     let stage_label = format!("{stage:<8}");
     let styled_stage = style_tool_stage_token(stage, &stage_label);
-    if io::stdout().is_terminal() {
-        let prefix = format!("{} {}", tool_stage_icon(stage), styled_stage);
-        println!("{prefix} {}", style_tool_message(message.as_ref()));
-    } else {
-        println!("{styled_stage} {}", style_tool_message(message.as_ref()));
-    }
+    println!("{styled_stage} {}", style_tool_message(message.as_ref()));
 }
 
 fn print_tool_stage_if(enabled: bool, stage: &str, message: impl AsRef<str>) {
     if enabled {
         print_tool_stage(stage, message);
-    }
-}
-
-fn tool_stage_icon(stage: &str) -> &'static str {
-    match stage {
-        "resolve" => "🔎",
-        "update" => "⬆️",
-        "sync" => "🔄",
-        "repair" => "🔧",
-        "source" => "📦",
-        "install" => "📥",
-        "activate" => "✅",
-        "prune" => "🧹",
-        "next" => "ℹ️",
-        "done" => "✅",
-        "summary" => "⚠️",
-        "fail" => "❌",
-        _ => "•",
     }
 }
 
@@ -641,9 +618,9 @@ fn check_self_update(requested_version: &Option<String>) -> Result<i32> {
     }
 
     if current == target {
-        println!("✅ za is up-to-date");
+        println!("za is up-to-date");
     } else {
-        println!("⬆️  Update available: {current} -> {target}");
+        println!("Update available: {current} -> {target}");
     }
     Ok(0)
 }
@@ -715,10 +692,7 @@ fn rollback_self_update(
         };
         if home.install_path(&previous_tool).exists() {
             activate_tool(home, &previous_tool)?;
-            println!(
-                "↩️  Rolled back to managed version {}",
-                previous_tool.image()
-            );
+            println!("Rolled back to managed version {}", previous_tool.image());
             return Ok(());
         }
     }
@@ -726,7 +700,7 @@ fn rollback_self_update(
     if let Some(backup) = backup_path {
         copy_executable(backup, &home.bin_path("za"))?;
         remove_file_if_exists(&home.current_file("za"))?;
-        println!("↩️  Rolled back to previous unmanaged za binary");
+        println!("Rolled back to previous unmanaged za binary");
         return Ok(());
     }
 

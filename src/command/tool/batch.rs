@@ -185,7 +185,7 @@ fn run_tool_batch_inner(input: ToolBatchRun<'_>) -> Result<()> {
     for (idx, requested) in specs.iter().enumerate() {
         ensure_not_interrupted()?;
         if batch_mode && !compact_mode {
-            println!("➡️  [{}/{}] {}", idx + 1, total, requested.name);
+            println!("[{}/{}] {}", idx + 1, total, requested.name);
         }
 
         let resolved_spec = match resolve_batch_tool_spec(requested, latest_lookup.as_ref()) {

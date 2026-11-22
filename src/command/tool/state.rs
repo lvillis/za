@@ -636,7 +636,7 @@ pub(crate) fn cleanup_legacy_current_dir_artifacts(home: &ToolHome) -> Result<()
     removed += cleanup_legacy_files_in_dir(&home.self_update_backup_dir())?;
 
     if removed > 0 {
-        eprintln!("🧹 Cleaned {removed} legacy tool state artifact(s)");
+        eprintln!("Cleaned {removed} legacy tool state artifact(s)");
     }
     Ok(())
 }

@@ -90,12 +90,8 @@ impl<'a> DownloadFeedback<'a> {
         self.shows_progress() || self.reporter.is_some()
     }
 
-    fn interactive(self) -> bool {
-        self.shows_progress() && io::stderr().is_terminal()
-    }
-
     fn progress_bar(self, total_bytes: Option<u64>) -> Option<ProgressBar> {
-        if !self.interactive() {
+        if !self.shows_progress() || !io::stderr().is_terminal() {
             return None;
         }
         new_download_progress_bar(ProgressDrawTarget::stderr(), total_bytes)
@@ -885,12 +881,7 @@ fn report_retry(message: String) -> bool {
     }
 }
 
-fn retry_transient_http_operation<T, F>(
-    interactive: bool,
-    stage: &str,
-    subject: &str,
-    mut operation: F,
-) -> Result<T>
+fn retry_transient_http_operation<T, F>(stage: &str, subject: &str, mut operation: F) -> Result<T>
 where
     F: FnMut() -> Result<T>,
 {
@@ -910,14 +901,10 @@ where
                     HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS
                 );
                 if !report_retry(retry_status) {
-                    print_download_stage(
-                        interactive,
-                        stage,
-                        format!(
-                            "retry {}/{} for {subject} after {reason}",
-                            attempt + 1,
-                            HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS
-                        ),
+                    eprintln!(
+                        "{stage}: retry {}/{} for {subject} after {reason}",
+                        attempt + 1,
+                        HTTP_TRANSIENT_RETRY_MAX_ATTEMPTS
                     );
                 }
                 wait_before_http_retry(attempt)?;
@@ -1085,10 +1072,7 @@ fn fetch_github_json_with_client<T: DeserializeOwned>(
     path: &str,
     github_token: Option<&str>,
 ) -> Result<T> {
-    let interactive = io::stderr().is_terminal();
-
     retry_transient_http_operation(
-        interactive,
         "source",
         &format!("{project_label} release metadata"),
         || {
@@ -1215,16 +1199,10 @@ fn download_from_url(
         let url_parts = parse_url_parts(url)?;
         let asset_name = url_parts.file_name.clone();
         let asset_path = download_root.join(&asset_name);
-        let interactive = feedback.interactive();
-
         let client = build_http_client(&url_parts.base_url, "za-tool-manager", true, proxy_scope)
             .context("build HTTP client")?;
         if feedback.is_detailed() {
-            print_download_stage(
-                interactive,
-                "download",
-                format!("probing server capabilities for `{asset_name}`"),
-            );
+            eprintln!("download: probing server capabilities for `{asset_name}`");
         }
         let probe = probe_parallel_download_support(&client, &url_parts.path_and_query).unwrap_or(
             DownloadProbe {
@@ -1236,14 +1214,10 @@ fn download_from_url(
 
         if let Some(plan) = build_parallel_download_plan(probe.total_bytes, probe.range_supported) {
             if feedback.is_detailed() {
-                print_download_stage(
-                    interactive,
-                    "download",
-                    format!(
-                        "parallel transfer ({} parts, {})",
-                        plan.parts,
-                        format_bytes_u64(plan.total_bytes)
-                    ),
+                eprintln!(
+                    "download: parallel transfer ({} parts, {})",
+                    plan.parts,
+                    format_bytes_u64(plan.total_bytes)
                 );
             }
             match download_to_path_parallel(
@@ -1257,7 +1231,6 @@ fn download_from_url(
                 Ok(()) => {}
                 Err(ParallelDownloadError::Unsupported) => {
                     retry_single_stream_after_parallel_failure(
-                        interactive,
                         format!(
                             "range transfer unavailable for `{asset_name}`; falling back to single stream"
                         ),
@@ -1275,7 +1248,7 @@ fn download_from_url(
             }
         } else {
             if feedback.is_detailed() {
-                print_download_stage(interactive, "download", "single-stream transfer");
+                eprintln!("download: single-stream transfer");
             }
             download_to_path_single(
                 &client,
@@ -1291,7 +1264,7 @@ fn download_from_url(
         if let Some(expected_sha256) = expected_sha256 {
             verify_sha256_file(&asset_path, expected_sha256)?;
             if feedback.is_detailed() {
-                print_download_stage(interactive, "verify", "sha256 ok");
+                eprintln!("verify: sha256 ok");
             }
         }
 
@@ -1305,7 +1278,7 @@ fn download_from_url(
             DownloadExtractionMode::PrimaryEntry(tool) => {
                 let resolved_path = if detect_archive_kind(&asset_name).is_some() {
                     if feedback.is_detailed() {
-                        print_download_stage(interactive, "extract", &asset_name);
+                        eprintln!("extract: {asset_name}");
                     }
                     extract_archive_primary_entry(tool, &asset_path, &download_root)?
                 } else {
@@ -1336,16 +1309,15 @@ fn download_from_url(
 }
 
 fn retry_single_stream_after_parallel_failure(
-    interactive: bool,
     reason: String,
     request: SingleStreamDownload<'_>,
     feedback: DownloadFeedback<'_>,
 ) -> Result<()> {
     if !report_retry(reason.clone()) && feedback.shows_progress() {
-        print_download_stage(interactive, "download", reason);
+        eprintln!("download: {reason}");
     }
     if feedback.is_detailed() {
-        print_download_stage(interactive, "download", "single-stream transfer");
+        eprintln!("download: single-stream transfer");
     }
     download_to_path_single(
         request.client,
@@ -1444,14 +1416,13 @@ fn download_to_path_single(
     known_total_bytes: Option<u64>,
     feedback: DownloadFeedback<'_>,
 ) -> Result<()> {
-    let interactive = feedback.interactive();
     let asset_label = asset_path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("asset")
         .to_string();
 
-    retry_transient_http_operation(interactive, "download", &format!("`{asset_label}`"), || {
+    retry_transient_http_operation("download", &format!("`{asset_label}`"), || {
         download_to_path_single_once(
             client,
             path_and_query,
@@ -1926,27 +1897,6 @@ fn format_bytes_f64(bytes: f64) -> String {
     }
 }
 
-fn print_download_stage(interactive: bool, stage: &str, message: impl AsRef<str>) {
-    if interactive {
-        eprintln!(
-            "{} {stage}: {}",
-            download_stage_icon(stage),
-            message.as_ref()
-        );
-    } else {
-        eprintln!("{stage}: {}", message.as_ref());
-    }
-}
-
-fn download_stage_icon(stage: &str) -> &'static str {
-    match stage {
-        "download" => "⬇️",
-        "verify" => "🔐",
-        "extract" => "📦",
-        _ => "•",
-    }
-}
-
 fn new_download_progress_bar(
     target: ProgressDrawTarget,
     total_bytes: Option<u64>,
@@ -2010,6 +1960,20 @@ struct DownloadProgressReport<'a> {
     progress_reporter: Option<&'a DownloadProgressReporter>,
 }
 
+impl DownloadProgressReport<'_> {
+    fn write_line(&self, mut output: impl Write) -> io::Result<()> {
+        let line = render_download_progress(self.downloaded, self.total_bytes, self.elapsed);
+        if let Some(bar) = self.progress_bar {
+            if !self.finished {
+                bar.set_message(line);
+                return Ok(());
+            }
+            bar.finish_and_clear();
+        }
+        writeln!(output, "{line}")
+    }
+}
+
 fn report_download_progress(last_report: &mut Instant, report: DownloadProgressReport<'_>) {
     let now = Instant::now();
     if !report.finished && now.duration_since(*last_report) < Duration::from_secs(1) {
@@ -2022,19 +1986,8 @@ fn report_download_progress(last_report: &mut Instant, report: DownloadProgressR
         report.elapsed,
         report.finished,
     );
-    if !report.print_line {
-        *last_report = now;
-        return;
-    }
-    let line = render_download_progress(report.downloaded, report.total_bytes, report.elapsed);
-    if let Some(bar) = report.progress_bar {
-        if report.finished {
-            bar.finish_with_message(line);
-        } else {
-            bar.set_message(line);
-        }
-    } else {
-        eprintln!("{line}");
+    if report.print_line {
+        let _ = report.write_line(io::stderr());
     }
     *last_report = now;
 }
@@ -2560,7 +2513,7 @@ mod tests {
             });
             assert!(result.is_err());
             let mut attempts = 0;
-            let value = retry_transient_http_operation(false, "source", "metadata", || {
+            let value = retry_transient_http_operation("source", "metadata", || {
                 attempts += 1;
                 if attempts < 3 {
                     Err(anyhow::Error::new(io::Error::new(
@@ -2585,7 +2538,7 @@ mod tests {
     #[test]
     fn retry_transient_http_operation_retries_unexpected_eof_once() {
         let attempts = AtomicUsize::new(0);
-        let value = retry_transient_http_operation(false, "source", "test metadata", || {
+        let value = retry_transient_http_operation("source", "test metadata", || {
             let attempt = attempts.fetch_add(1, Ordering::SeqCst);
             if attempt == 0 {
                 return Err(anyhow::Error::new(io::Error::new(
@@ -2602,7 +2555,7 @@ mod tests {
     }
 
     #[test]
-    fn narrow_download_progress_clears_abandoned_attempts_and_replaces_the_final_line() {
+    fn narrow_download_progress_clears_attempts_and_writes_the_full_final_line() {
         let term = indicatif::InMemoryTerm::new(8, 35);
         let start = || {
             super::new_download_progress_bar(
@@ -2616,21 +2569,24 @@ mod tests {
         drop(first);
         assert!(term.contents().trim().is_empty());
         let retry = start();
-        super::report_download_progress(
-            &mut std::time::Instant::now(),
-            super::DownloadProgressReport {
-                downloaded: 524_288,
-                total_bytes: Some(524_288),
-                elapsed: Duration::from_secs(2),
-                finished: true,
-                progress_bar: Some(&retry),
-                print_line: true,
-                progress_reporter: None,
-            },
+        let mut output = Vec::new();
+        super::DownloadProgressReport {
+            downloaded: 524_288,
+            total_bytes: Some(524_288),
+            elapsed: Duration::from_secs(2),
+            finished: true,
+            progress_bar: Some(&retry),
+            print_line: true,
+            progress_reporter: None,
+        }
+        .write_line(&mut output)
+        .unwrap();
+        drop(retry);
+        assert!(term.contents().trim().is_empty());
+        assert_eq!(
+            output,
+            b"download: 512.0 KiB / 512.0 KiB (100.0%, 256.0 KiB/s)\n"
         );
-        let screen = term.contents();
-        assert_eq!(screen.lines().count(), 1, "{screen}");
-        assert!(screen.starts_with("download: 512.0 KiB"));
     }
 
     #[test]

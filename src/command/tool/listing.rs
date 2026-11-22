@@ -8,6 +8,16 @@ pub(super) enum LatestCheck {
     Error(String),
 }
 
+impl LatestCheck {
+    fn progress_label(&self) -> (&'static str, String) {
+        match self {
+            Self::Latest(version) => ("✔", format!("latest {version}")),
+            Self::Unsupported => ("-", "unsupported".into()),
+            Self::Error(_) => ("✘", "check failed".into()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LatestResolutionMode {
     Exact,
@@ -1085,11 +1095,7 @@ impl LatestProgressUi {
 
     fn finish(&self, name: &str, result: &LatestCheck) {
         if let Some(row) = self.rows.get(name) {
-            let (symbol, message) = match result {
-                LatestCheck::Latest(version) => ("✔", format!("latest {version}")),
-                LatestCheck::Unsupported => ("-", "unsupported".to_string()),
-                LatestCheck::Error(_) => ("✘", "check failed".to_string()),
-            };
+            let (symbol, message) = result.progress_label();
             row.set_style(
                 ProgressStyle::with_template(&format!(" {symbol} {{prefix:<16}} {{wide_msg}}"))
                     .expect("finished row template"),
@@ -1104,17 +1110,41 @@ impl LatestProgressUi {
         }
     }
 
-    fn finish_all(&self) {
+    fn finish_all(
+        &self,
+        policies: &[ToolPolicy],
+        results: &HashMap<&'static str, LatestCheck>,
+        mut output: impl Write,
+    ) -> io::Result<()> {
         self.header.disable_steady_tick();
-        if is_interrupt_requested() {
-            for row in self.rows.values() {
-                row.disable_steady_tick();
-            }
-            let _ = self.multi.clear();
-            self.multi.set_draw_target(ProgressDrawTarget::hidden());
-        } else {
-            self.header.finish();
+        for row in self.rows.values() {
+            row.disable_steady_tick();
         }
+        let visible = !self.multi.is_hidden();
+        let cleared = self.multi.clear();
+        self.multi.set_draw_target(ProgressDrawTarget::hidden());
+        cleared?;
+        if !visible || is_interrupt_requested() {
+            return Ok(());
+        }
+
+        // Keep hard line breaks in scrollback, independent of the progress panel's width.
+        self.header.finish();
+        writeln!(
+            output,
+            "[+] Checking tools {}/{} [{:#}]",
+            results.len(),
+            policies.len(),
+            indicatif::HumanDuration(self.header.elapsed())
+        )?;
+        for policy in policies {
+            let name = policy.canonical_name;
+            if let Some(check) = results.get(name) {
+                let (symbol, message) = check.progress_label();
+                writeln!(output, " {symbol} {name:<16} {message}")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1132,18 +1162,18 @@ fn fetch_latest_checks_parallel(
 ) -> HashMap<&'static str, LatestCheck> {
     let worker_count = normalize_tool_update_jobs(default_tool_update_jobs(), policies.len());
     let progress = LatestProgressUi::new(&policies);
-    let queue = Arc::new(Mutex::new(VecDeque::from(policies)));
-    let out: Arc<Mutex<HashMap<&'static str, LatestCheck>>> = Arc::new(Mutex::new(HashMap::new()));
+    let queue = Mutex::new(policies.iter().copied());
+    let out = Mutex::new(HashMap::new());
 
     thread::scope(|scope| {
         for _ in 0..worker_count {
-            let queue = Arc::clone(&queue);
-            let out = Arc::clone(&out);
+            let queue = &queue;
+            let out = &out;
             let progress = progress.clone();
             scope.spawn(move || {
                 while !is_interrupt_requested() {
                     let task = match queue.lock() {
-                        Ok(mut guard) => guard.pop_front(),
+                        Ok(mut guard) => guard.next(),
                         Err(_) => None,
                     };
                     let Some(policy) = task else {
@@ -1174,13 +1204,11 @@ fn fetch_latest_checks_parallel(
         }
     });
 
+    let results = out.into_inner().unwrap_or_default();
     if let Some(progress) = progress {
-        progress.finish_all();
+        let _ = progress.finish_all(&policies, &results, io::stderr());
     }
-
-    out.lock()
-        .map(|guard| guard.clone())
-        .unwrap_or_else(|_| HashMap::new())
+    results
 }
 
 fn resolve_latest_for_policy(policy: ToolPolicy, mode: LatestResolutionMode) -> LatestCheck {
@@ -1309,24 +1337,36 @@ mod tests {
         ui.retry_reporter("codex").unwrap()("retry 2/3 · request timed out".into());
         assert_eq!(ui.rows["codex"].message(), "retry 2/3 · request timed out");
         assert_eq!(ui.rows["fd"].message(), "checking");
-        ui.finish("fd", &LatestCheck::Latest("10.5.0".into()));
+        let version = "10.5.0-nightly.20261122+abcdef0123456789";
+        let results = HashMap::from([
+            ("fd", LatestCheck::Latest(version.into())),
+            ("codex", LatestCheck::Error("timeout".into())),
+        ]);
+        ui.finish("fd", &results["fd"]);
         assert_eq!(ui.header.position(), 1);
         assert_eq!(ui.header.message(), "waiting for codex");
-        assert_eq!(ui.rows["fd"].message(), "latest 10.5.0");
+        assert_eq!(ui.rows["fd"].message(), format!("latest {version}"));
         assert!(ui.rows["fd"].is_finished());
         assert!(!ui.rows["codex"].is_finished());
-        ui.finish("codex", &LatestCheck::Error("timeout".into()));
-        ui.finish_all();
+        ui.finish("codex", &results["codex"]);
+        let mut output = Vec::new();
+        ui.finish_all(&policies, &results, &mut output).unwrap();
         assert_eq!(ui.header.position(), 2);
         assert!(ui.header.is_finished());
         assert!(ui.header.message().is_empty());
         assert_eq!(ui.rows["codex"].message(), "check failed");
-        let screen = term.contents();
-        assert_eq!(screen.lines().count(), 3, "{screen}");
-        assert_eq!(screen.matches("Checking tools").count(), 1);
-        assert_eq!(screen.matches("codex").count(), 1);
-        assert_eq!(screen.matches("fd").count(), 1);
-        assert!(!screen.contains("retry"));
+        drop(ui);
+        assert!(term.contents().trim().is_empty());
+        let output = String::from_utf8(output).unwrap();
+        let (header, rows) = output.split_once('\n').unwrap();
+        assert!(header.starts_with("[+] Checking tools 2/2 [") && header.ends_with(']'));
+        assert_eq!(
+            rows,
+            format!(
+                " ✘ {:<16} check failed\n ✔ {:<16} latest {version}\n",
+                "codex", "fd"
+            )
+        );
     }
 
     #[test]
