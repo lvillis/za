@@ -1,8 +1,18 @@
+## [0.1.110] - 2026-11-22
+
+### 🐛 Bug Fixes
+
+- Suppress terminal key echo during progress and monitoring
+- *(tool)* Preserve line breaks in final results after terminal resize
 ## [0.1.109] - 2026-11-19
 
 ### 🐛 Bug Fixes
 
 - *(tool)* Prevent duplicate progress lines during updates and retries
+
+### ⚙️ Miscellaneous Tasks
+
+- Release za version 0.1.109
 ## [0.1.108] - 2026-11-18
 
 ### 🚀 Features
